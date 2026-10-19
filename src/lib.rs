@@ -165,6 +165,25 @@ pub struct Place {
     pub label: String,
 }
 
+/// Sidebar token with a one-line checkout header, referenced as
+/// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
+pub const TREE_HEADER_TOKEN: &str = "tree_header";
+
+/// One header per checkout, on the first agent of each, for a flat two-level
+/// list: every header is an entry's first row, so they all line up, and the
+/// project is named on worktrees too. Agents without a place get none.
+pub fn checkout_headers(places: &[Option<Place>]) -> Vec<Option<String>> {
+    let mut seen = std::collections::HashSet::new();
+    places
+        .iter()
+        .map(|place| {
+            let place = place.as_ref()?;
+            seen.insert(place.checkout.clone())
+                .then(|| format!("\u{f401} {}  \u{f418} {}", place.project, place.label))
+        })
+        .collect()
+}
+
 /// Tree header tokens for agents listed in sidebar order, like Orca's project
 /// list: the project name on the first agent of each project, and
 /// `<branch icon> <branch>` on the first agent of each checkout (main checkout
@@ -1044,6 +1063,32 @@ mod tests {
                 (some("│"), some("\u{f418} fix-x")),
                 (None, None),
                 (some("\u{f401} dotfiles"), some("\u{f418} main")),
+            ]
+        );
+    }
+
+    #[test]
+    fn checkout_headers_mark_each_checkouts_first_agent() {
+        let at = |project: &str, checkout: &str, label: &str| {
+            Some(Place {
+                project: project.into(),
+                checkout: checkout.into(),
+                label: label.into(),
+            })
+        };
+        let headers = checkout_headers(&[
+            at("search", "/s", "main"),
+            at("search", "/s", "main"),
+            at("search", "/s/wt", "fix-x"),
+            None,
+        ]);
+        assert_eq!(
+            headers,
+            [
+                Some("\u{f401} search  \u{f418} main".to_string()),
+                None,
+                Some("\u{f401} search  \u{f418} fix-x".to_string()),
+                None,
             ]
         );
     }
