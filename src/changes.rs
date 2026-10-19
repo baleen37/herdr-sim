@@ -11,7 +11,9 @@ use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use herdr_sim::{Cache, Session, claude_session, codex_session, parse_utc, resolve_claude_session};
+use herdr_sim::{
+    Cache, Session, claude_session, codex_session, diff_value, parse_utc, resolve_claude_session,
+};
 use serde_json::{Value, json};
 
 /// How often the pane looks at focus and the session again.
@@ -36,7 +38,8 @@ struct Pr {
     additions: u64,
     deletions: u64,
     comments: usize,
-    checks: Option<(usize, usize)>,
+    /// Checks passed, failed, and in all.
+    checks: Option<(usize, usize, usize)>,
 }
 
 /// Opens the Changes pane to the right of the focused pane, or closes it if it
@@ -230,7 +233,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         let _ = done.send((stale, got));
                     });
                 }
-                render(session.and_then(|s| s.title), &list, &prs)
+                // With no PR yet, what the checkout has changed instead.
+                let diff = if list.is_empty() {
+                    agent["cwd"].as_str().and_then(local_diff)
+                } else {
+                    None
+                };
+                render(&list, &prs, diff)
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -282,7 +291,8 @@ fn load_prs(path: &Path) -> Prs {
                 deletions: p["deletions"].as_u64().unwrap_or(0),
                 comments: p["comments"].as_u64().unwrap_or(0) as usize,
                 checks: p["checks"].as_array().and_then(|c| {
-                    Some((c.first()?.as_u64()? as usize, c.get(1)?.as_u64()? as usize))
+                    let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
+                    Some((n(0)?, n(1)?, n(2)?))
                 }),
             };
             (url.clone(), (None, Some(pr)))
@@ -303,7 +313,7 @@ fn save_prs(path: &Path, prs: &Prs) {
                     "repo": p.repo, "number": p.number, "title": p.title,
                     "state": p.state, "draft": p.draft, "additions": p.additions,
                     "deletions": p.deletions, "comments": p.comments,
-                    "checks": p.checks.map(|(ok, total)| [ok, total]),
+                    "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
                 }),
             ))
         })
@@ -399,13 +409,18 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
             let title = pr["title"].as_str()?.to_string();
             // Counts per state, not every check: a small answer on busy PRs.
             let contexts = &pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"];
-            let (mut passed, mut total) = (0, 0);
+            let (mut passed, mut failed, mut total) = (0, 0, 0);
             for kind in ["checkRunCountsByState", "statusContextCountsByState"] {
                 for c in contexts[kind].as_array().into_iter().flatten() {
                     let n = c["count"].as_u64().unwrap_or(0) as usize;
                     total += n;
-                    if matches!(c["state"].as_str(), Some("SUCCESS" | "NEUTRAL" | "SKIPPED")) {
-                        passed += n;
+                    match c["state"].as_str() {
+                        Some("SUCCESS" | "NEUTRAL" | "SKIPPED") => passed += n,
+                        Some(
+                            "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+                            | "STARTUP_FAILURE",
+                        ) => failed += n,
+                        _ => {}
                     }
                 }
             }
@@ -418,7 +433,7 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
                 additions: pr["additions"].as_u64().unwrap_or(0),
                 deletions: pr["deletions"].as_u64().unwrap_or(0),
                 comments: pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize,
-                checks: (total > 0).then_some((passed, total)),
+                checks: (total > 0).then_some((passed, failed, total)),
                 url: url.clone(),
             };
             Some((url, parsed))
@@ -427,60 +442,97 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
 }
 
 const GREEN: &str = "\x1b[38;2;166;227;161m";
-const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
+const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-fn render(title: Option<String>, urls: &[String], prs: &Prs) -> String {
+/// Laid out like Claude Code's Changes panel: per PR, its state icon and
+/// title, then repo and number with lines changed, and comments and a checks
+/// dot on the right.
+fn render(urls: &[String], prs: &Prs, diff: Option<String>) -> String {
     let width = columns().saturating_sub(1).max(20);
-    let mut s = format!("{BOLD}Changes{RESET}\n");
-    if let Some(title) = title {
-        s += &format!("{DIM}{}{RESET}\n", cut(&title, width));
-    }
-    s += "\n";
+    let mut s = format!("{BOLD}Changes{RESET}\n\n");
     if urls.is_empty() {
-        s += &format!("{DIM}No PRs in this session.{RESET}\n");
+        s += &match diff {
+            Some(diff) => {
+                let lines: Vec<String> = diff
+                    .split(' ')
+                    .map(|n| {
+                        let c = if n.starts_with('+') { GREEN } else { RED };
+                        format!("{c}{n}{RESET}")
+                    })
+                    .collect();
+                format!("{DIM}\u{f4d2}{RESET} {}\n", lines.join(" "))
+            }
+            None => format!("{DIM}No changes.{RESET}\n"),
+        };
     }
     for url in urls {
         let Some((_, Some(pr))) = prs.get(url) else {
-            // Not asked yet: just the link until its details arrive.
-            s += &format!("{DIM}{}{RESET}\n", cut(url, width));
-            if prs.contains_key(url) {
-                s += &format!("{DIM}  (could not load){RESET}\n");
-            }
-            s += "\n";
+            // Until its details arrive, the PR is its repo and number.
+            let parts: Vec<&str> = url.split('/').collect();
+            let name = match (parts.get(4), parts.get(6)) {
+                (Some(repo), Some(n)) => format!("{repo} #{n}"),
+                _ => url.clone(),
+            };
+            s += &format!("{DIM}\u{f407} {}{RESET}\n\n\n", cut(&name, width - 2));
             continue;
         };
         let (icon, colour) = match (pr.state.as_str(), pr.draft) {
-            ("MERGED", _) => ("\u{f419}", PURPLE),
+            ("MERGED", _) => ("\u{f49e}", GREEN),
             ("CLOSED", _) => ("\u{f4dc}", RED),
-            (_, true) => ("\u{f407}", DIM),
+            (_, true) => ("\u{f4dd}", DIM),
             _ => ("\u{f407}", GREEN),
         };
         // OSC 8 makes the title a link to the PR.
-        let title = cut(&pr.title, width.saturating_sub(2));
+        let title = cut(&pr.title, width - 2);
         s += &format!(
             "{colour}{icon}{RESET} \x1b]8;;{}\x1b\\{title}\x1b]8;;\x1b\\\n",
             pr.url
         );
-        let mut meta = format!("  {DIM}{} #{}{RESET}", pr.repo, pr.number);
-        meta += &format!(
-            "  {GREEN}+{}{RESET} {RED}-{}{RESET}",
-            pr.additions, pr.deletions
-        );
+        let mut left = format!("{DIM}{} #{}{RESET}", pr.repo, pr.number);
+        let mut left_cols = cols(&pr.repo) + 2 + pr.number.len();
+        if pr.additions + pr.deletions > 0 {
+            let lines = format!("+{} -{}", pr.additions, pr.deletions);
+            left += &format!(
+                "  {GREEN}+{}{RESET} {RED}-{}{RESET}",
+                pr.additions, pr.deletions
+            );
+            left_cols += 2 + lines.len();
+        }
+        let mut right = String::new();
+        let mut right_cols = 0;
         if pr.comments > 0 {
-            meta += &format!("  {DIM}\u{f41f} {}{RESET}", pr.comments);
+            let n = pr.comments.to_string();
+            right += &format!("{DIM}\u{f41f} {n}{RESET}");
+            right_cols += 2 + n.len();
         }
-        if let Some((ok, total)) = pr.checks {
-            let c = if ok == total { GREEN } else { DIM };
-            meta += &format!("  {c}{ok}/{total}{RESET}");
+        if let Some((ok, failed, total)) = pr.checks {
+            let c = if failed > 0 {
+                RED
+            } else if ok == total {
+                GREEN
+            } else {
+                YELLOW
+            };
+            right += &format!("  {c}\u{25cf}{RESET}");
+            right_cols += 3;
         }
-        s += &meta;
-        s += "\n\n";
+        let gap = (width - 2).saturating_sub(left_cols + right_cols).max(1);
+        s += &format!("  {left}{}{right}\n\n", " ".repeat(gap));
     }
     s
+}
+
+/// Uncommitted lines changed in the checkout at `cwd`, as `+a -d`.
+fn local_diff(cwd: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", cwd, "diff", "--shortstat", "HEAD"])
+        .output()
+        .ok()?;
+    diff_value(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// The pane's width in columns, from the terminal it runs in.
@@ -495,12 +547,43 @@ fn columns() -> usize {
         .unwrap_or(40)
 }
 
-/// `s` cut to `n` characters, with an ellipsis when cut.
+/// Terminal columns `c` takes: two for Hangul and other East Asian wide
+/// characters, one otherwise.
+fn char_cols(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6 => 2,
+        _ => 1,
+    }
+}
+
+fn cols(s: &str) -> usize {
+    s.chars().map(char_cols).sum()
+}
+
+/// `s` cut to `n` columns, with an ellipsis when cut.
 fn cut(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
+    if cols(s) <= n {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        if used + char_cols(c) > n.saturating_sub(1) {
+            break;
+        }
+        used += char_cols(c);
+        out.push(c);
+    }
     out.push('…');
     out
 }
