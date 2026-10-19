@@ -23,6 +23,15 @@ out, like a branch row in a Git client.
 A Space's PR is the one `gh pr view <branch>` finds for the branch checked out
 in its first pane that is inside a git repository.
 
+## Load
+
+A finished turn only revisits its own pane and workspace: about three short
+process calls when nothing changed (`herdr pane get`, `herdr pane list`,
+`git rev-parse`), and no `report-metadata` call unless a token changed. A
+started turn exits at once. Runs never overlap: one that finds another in
+progress leaves a note, and the running one does a single extra pass. `gh` calls
+are cached as below and killed after 10 seconds.
+
 States come from `gh pr view`. Open PRs are re-checked at most once a minute;
 merged and closed PRs are never re-checked. A branch without a PR is re-checked
 once a minute too. Herdr runs the plugin at server

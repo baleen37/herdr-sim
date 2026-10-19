@@ -80,6 +80,46 @@ pub fn token_value(state: PrState, count: usize) -> Option<String> {
     }
 }
 
+/// What one run has to look at, from the Herdr event that started it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Startup and worktree events: every agent pane and workspace.
+    All,
+    /// A turn ended in one pane: that pane and its workspace.
+    Pane { pane: String, workspace: String },
+    /// A turn started: nothing can have changed yet.
+    Skip,
+}
+
+/// Reads `HERDR_PLUGIN_EVENT` / `HERDR_PLUGIN_EVENT_JSON`. Anything it does
+/// not understand widens to [`Scope::All`] rather than missing an update.
+pub fn scope(event: Option<&str>, event_json: Option<&str>) -> Scope {
+    if event != Some("pane.agent_status_changed") {
+        return Scope::All;
+    }
+    let Some(v) = event_json.and_then(parse) else {
+        return Scope::All;
+    };
+    // The payload may come bare or wrapped in an envelope.
+    let e = if v.get("pane_id").is_some() {
+        &v
+    } else {
+        &v["event"]
+    };
+    match (
+        e["pane_id"].as_str(),
+        e["workspace_id"].as_str(),
+        e["agent_status"].as_str(),
+    ) {
+        (_, _, Some("working")) => Scope::Skip,
+        (Some(pane), Some(workspace), _) => Scope::Pane {
+            pane: pane.to_string(),
+            workspace: workspace.to_string(),
+        },
+        _ => Scope::All,
+    }
+}
+
 /// Sidebar token summarising all PRs, referenced as `$pr`.
 pub const PR_SUMMARY_TOKEN: &str = "pr";
 
@@ -184,6 +224,7 @@ pub struct Cache {
     prs: HashMap<String, (PrState, u64)>,
     branches: HashMap<String, (Option<PrState>, u64)>,
     files: HashMap<String, Scanned>,
+    reported: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -219,10 +260,14 @@ impl Cache {
                 Some((path.clone(), scanned))
             })
             .collect();
+        let reported = object(&v["reported"])
+            .filter_map(|(key, v)| Some((key.clone(), v.as_str()?.to_string())))
+            .collect();
         Self {
             prs,
             branches,
             files,
+            reported,
         }
     }
 
@@ -251,7 +296,8 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files }).to_string(),
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported })
+                .to_string(),
         )?;
         fs::rename(&tmp, path)
     }
@@ -303,6 +349,27 @@ impl Cache {
             }
             None => cached.and_then(|(state, _)| state),
         }
+    }
+
+    /// Whether `value` differs from what was last reported for `key`; records
+    /// it if so. Lets a run skip `report-metadata` calls that change nothing.
+    pub fn changed(&mut self, key: &str, value: &str) -> bool {
+        if self.reported.get(key).is_some_and(|v| v == value) {
+            return false;
+        }
+        self.reported.insert(key.to_string(), value.to_string());
+        true
+    }
+
+    /// Drops the record of `key`'s last report, e.g. after the report failed.
+    pub fn forget_reported(&mut self, key: &str) {
+        self.reported.remove(key);
+    }
+
+    /// Drops every report record. A restarted Herdr server has lost the
+    /// metadata, so startup must send everything again.
+    pub fn forget_all_reported(&mut self) {
+        self.reported.clear();
     }
 
     /// URLs `extract` finds in `path`'s lines, reading only complete lines
@@ -515,6 +582,35 @@ mod tests {
             manifest.lines().any(|l| l == line),
             "herdr-plugin.toml must say {line}"
         );
+    }
+
+    #[test]
+    fn scope_narrows_only_for_understood_turn_events() {
+        let ev = Some("pane.agent_status_changed");
+        let idle = r#"{"type":"pane_agent_status_changed","pane_id":"w:p1","workspace_id":"w","agent_status":"idle"}"#;
+        let pane = Scope::Pane {
+            pane: "w:p1".into(),
+            workspace: "w".into(),
+        };
+        assert_eq!(scope(ev, Some(idle)), pane);
+        let wrapped = format!(r#"{{"event":{idle}}}"#);
+        assert_eq!(scope(ev, Some(&wrapped)), pane);
+        let working = idle.replace("idle", "working");
+        assert_eq!(scope(ev, Some(&working)), Scope::Skip);
+        assert_eq!(scope(ev, Some("not json")), Scope::All);
+        assert_eq!(scope(ev, None), Scope::All);
+        assert_eq!(scope(Some("startup"), None), Scope::All);
+        assert_eq!(scope(Some("worktree.created"), Some(idle)), Scope::All);
+    }
+
+    #[test]
+    fn changed_skips_repeats_until_forgotten() {
+        let mut cache = Cache::default();
+        assert!(cache.changed("pane:a", "x"));
+        assert!(!cache.changed("pane:a", "x"));
+        assert!(cache.changed("pane:a", "y"));
+        cache.forget_all_reported();
+        assert!(cache.changed("pane:a", "y"));
     }
 
     #[test]
