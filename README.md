@@ -107,7 +107,7 @@ rows = [
 | `$sort_rank` | The agent's position in the activity order below; not meant for display. |
 | `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
-| `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
+| `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Until Claude Code titles the session, its first real question (not a slash command or command output, cut to 60 characters) stands in; unset before that. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.

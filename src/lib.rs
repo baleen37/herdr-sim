@@ -664,6 +664,8 @@ enum Hit {
     Pr(String),
     /// A message's time (Unix seconds).
     Activity(u64),
+    /// Something the user asked, a title for a session Claude has not titled.
+    Prompt(String),
     /// `custom`: a title the user gave (`/rename`), which outranks generated ones.
     Title {
         custom: bool,
@@ -705,7 +707,12 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
             // Claude Code also rewrites old records, so the file's mtime is not
             // when the session last did something; its messages' times are.
             if line.contains(r#""type":"user""#) || line.contains(r#""type":"assistant""#) {
-                return message_time(line).map(Hit::Activity).into_iter().collect();
+                let mut hits: Vec<Hit> =
+                    message_time(line).map(Hit::Activity).into_iter().collect();
+                if line.contains(r#""type":"user""#) {
+                    hits.extend(user_prompt(line).map(Hit::Prompt));
+                }
+                return hits;
             }
             let (field, custom) = if line.contains(r#""type":"pr-link""#) {
                 ("prUrl", None)
@@ -725,7 +732,8 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
             }]
         });
         session.prs.extend(found.urls);
-        session.title = session.title.or(found.title);
+        // Until Claude titles the session, its first question stands in.
+        session.title = session.title.or(found.title).or(found.prompt);
         session.last_activity = session.last_activity.max(found.last);
     }
     session.prs = dedup(session.prs);
@@ -783,6 +791,28 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
         title,
         last_activity: last,
     }
+}
+
+/// The text of a user message that is a real question: not a slash command,
+/// command output or tool result (those start with `<` or are not plain
+/// text). Cut to 60 characters on a char boundary.
+fn user_prompt(line: &str) -> Option<String> {
+    let v = parse(line)?;
+    let content = &v["message"]["content"];
+    let text = match content.as_str() {
+        Some(text) => text.to_string(),
+        None => content
+            .as_array()?
+            .iter()
+            .find(|part| part["type"] == "text")?["text"]
+            .as_str()?
+            .to_string(),
+    };
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() || text.starts_with('<') {
+        return None;
+    }
+    Some(text.chars().take(60).collect())
 }
 
 /// The `"timestamp"` of a log line as Unix seconds, read without parsing the
@@ -886,6 +916,8 @@ struct Scanned {
     title: Option<(bool, String)>,
     /// Latest message time so far.
     last: Option<u64>,
+    /// The first thing the user asked.
+    prompt: Option<String>,
 }
 
 /// What [`Cache::scan`] has found in a file so far.
@@ -893,6 +925,7 @@ struct Found {
     urls: Vec<String>,
     title: Option<String>,
     last: Option<u64>,
+    prompt: Option<String>,
 }
 
 impl Cache {
@@ -924,11 +957,14 @@ impl Cache {
                 // Entries from before message times were tracked lack "last";
                 // dropping them rereads those files once from the start.
                 v.get("last")?;
+                // Likewise for "prompt", the untitled-session fallback.
+                v.get("prompt")?;
                 let scanned = Scanned {
                     offset: v["offset"].as_u64()?,
                     urls: urls.map(String::from).collect(),
                     title,
                     last: v["last"].as_u64(),
+                    prompt: v["prompt"].as_str().map(String::from),
                 };
                 Some((path.clone(), scanned))
             })
@@ -992,7 +1028,7 @@ impl Cache {
             .map(|(path, s)| {
                 let (custom, title) = s.title.clone().unzip();
                 let entry =
-                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom, "last": s.last });
+                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom, "last": s.last, "prompt": s.prompt });
                 (path.clone(), entry)
             })
             .collect();
@@ -1130,6 +1166,7 @@ impl Cache {
                 urls: Vec::new(),
                 title: None,
                 last: None,
+                prompt: None,
             };
         };
         let key = path.to_string_lossy().into_owned();
@@ -1149,6 +1186,9 @@ impl Cache {
                     match hit {
                         Hit::Pr(url) => scanned.urls.push(url),
                         Hit::Activity(t) => scanned.last = scanned.last.max(Some(t)),
+                        Hit::Prompt(p) => {
+                            scanned.prompt.get_or_insert(p);
+                        }
                         // A generated title never replaces one the user chose.
                         Hit::Title { custom, text } => {
                             if custom || !scanned.title.as_ref().is_some_and(|(c, _)| *c) {
@@ -1164,6 +1204,7 @@ impl Cache {
             urls: scanned.urls.clone(),
             title: scanned.title.as_ref().map(|(_, t)| t.clone()),
             last: scanned.last,
+            prompt: scanned.prompt.clone(),
         }
     }
 }
@@ -1731,6 +1772,34 @@ mod tests {
         );
         let session = claude_session(home.path(), "s1", &mut Cache::default());
         assert_eq!(session.last_activity, parse_utc("2026-10-19T05:50:46"));
+    }
+
+    #[test]
+    fn untitled_claude_session_takes_its_first_real_question() {
+        let home = TempDir::new().unwrap();
+        let user = |c: Value| json!({ "type": "user", "message": { "content": c } });
+        let path = home.path().join(".claude/projects/p/s1.jsonl");
+        write(
+            &path,
+            &[
+                user(json!("<command-name>/plan</command-name>")),
+                user(json!([{ "type": "tool_result", "content": "x" }])),
+                user(json!([{ "type": "text", "text": "  fix the\n login   bug " }])),
+                user(json!("second question")),
+            ],
+        );
+        let mut cache = Cache::default();
+        let title = |cache: &mut Cache| claude_session(home.path(), "s1", cache).title;
+        assert_eq!(title(&mut cache).as_deref(), Some("fix the login bug"));
+
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({ "type": "ai-title", "aiTitle": "Login fix" })
+        )
+        .unwrap();
+        assert_eq!(title(&mut cache).as_deref(), Some("Login fix"));
     }
 
     #[test]
