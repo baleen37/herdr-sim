@@ -23,12 +23,13 @@ use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
     SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
-    agent_icon, checkout_headers, claude_session, codex_session, diff_value, group_rows,
-    header_value, heading_value, held_status, indent, project_name, resolve_claude_session, scope,
-    split_marks, state_heading_token, state_heading_value, summary_value, token_value,
-    tree_headers, workspace_agent_token,
+    TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN, TREE_GROUP_STALE_TOKEN,
+    TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
+    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon,
+    checkout_headers, claude_session, codex_session, diff_value, group_rows, header_value,
+    heading_value, held_status, indent, project_name, resolve_claude_session, scope, split_marks,
+    state_heading_token, state_heading_value, summary_value, token_value, tree_headers,
+    workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -194,11 +195,15 @@ impl Run {
             let split = marks[pos].map(|mark| format!("{}{mark}", indent(row.depth)));
             self.cache
                 .set_depth(pane, if split.is_some() { 0 } else { row.depth });
-            let (group, group_stale) = if row.stale {
-                (None, row.group)
-            } else {
-                (row.group, None)
+            let fade = |stale: bool, header: Option<String>| {
+                if stale {
+                    (None, header)
+                } else {
+                    (header, None)
+                }
             };
+            let (group_project, group_project_stale) = fade(row.project_stale, row.project);
+            let (group, group_stale) = fade(row.stale, row.group);
             // The branch PR rides on the checkout's card, from the same cache
             // the Space pass fills, so it costs no extra gh call.
             let card_pr = match (&worktree, &places[pos]) {
@@ -217,6 +222,11 @@ impl Run {
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
                 (TREE_PR_TOKEN.to_string(), card_pr),
                 (TREE_HEADER_TOKEN.to_string(), header),
+                (TREE_GROUP_PROJECT_TOKEN.to_string(), group_project),
+                (
+                    TREE_GROUP_PROJECT_STALE_TOKEN.to_string(),
+                    group_project_stale,
+                ),
                 (TREE_GROUP_TOKEN.to_string(), group),
                 (TREE_GROUP_STALE_TOKEN.to_string(), group_stale),
                 (TREE_GAP_TOKEN.to_string(), row.gap),
