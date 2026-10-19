@@ -310,6 +310,53 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
         .collect()
 }
 
+/// Sidebar tokens for herdr-radar's one-header-per-group layout, referenced as
+/// `$tree_group` and `$tree_gap`: the project (and its branch, when it has
+/// several checkouts) over its first checkout,
+/// `└─ <branch>` over each later one, and a blank row after the project.
+pub const TREE_GROUP_TOKEN: &str = "tree_group";
+pub const TREE_GAP_TOKEN: &str = "tree_gap";
+
+/// Herdr trims leading whitespace off token values, so the indent and the
+/// blank gap row both lean on a zero-width space.
+const ZWSP: &str = "\u{200b}";
+
+/// `($tree_group, $tree_gap)` for agents listed in sidebar order. The gap goes
+/// on a project's last agent: one above a header would make the header a
+/// continuation row, which Herdr indents. Agents without a place get neither.
+pub fn group_rows(places: &[Option<Place>]) -> Vec<(Option<String>, Option<String>)> {
+    let mut seen_projects = std::collections::HashSet::new();
+    let mut seen_checkouts = std::collections::HashSet::new();
+    places
+        .iter()
+        .enumerate()
+        .map(|(i, place)| {
+            let Some(place) = place else {
+                return (None, None);
+            };
+            let first_of_project = seen_projects.insert(place.project.clone());
+            let first_of_checkout = seen_checkouts.insert(place.checkout.clone());
+            // A project with one checkout is named alone, as in herdr-radar;
+            // with more, its first header names the branch too.
+            let several = places
+                .iter()
+                .flatten()
+                .any(|other| other.project == place.project && other.checkout != place.checkout);
+            let group = match (first_of_project, first_of_checkout) {
+                (true, _) if several => Some(header_value(&place.project, Some(&place.label))),
+                (true, _) => Some(place.project.clone()),
+                (false, true) => Some(format!("{ZWSP}  └─ \u{f418} {}", place.label)),
+                (false, false) => None,
+            };
+            let last_of_project = !places[i + 1..]
+                .iter()
+                .flatten()
+                .any(|next| next.project == place.project);
+            (group, last_of_project.then(|| ZWSP.to_string()))
+        })
+        .collect()
+}
+
 /// Sidebar token marking the second and later agents of a split tab, referenced
 /// as `$tree_split`: `├─`, and `└─` on the last, so a split screen reads as one
 /// unit under its first agent.
@@ -1329,6 +1376,35 @@ mod tests {
                 (some("│"), some("\u{f418} fix-x")),
                 (None, None),
                 (some("dotfiles"), some("\u{f418} main")),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_rows_head_each_project_and_close_it_with_a_gap() {
+        let at = |project: &str, checkout: &str, label: &str| {
+            Some(Place {
+                project: project.into(),
+                checkout: checkout.into(),
+                label: label.into(),
+            })
+        };
+        let rows = group_rows(&[
+            at("search", "/s", "main"),
+            at("search", "/s", "main"),
+            at("search", "/s/wt", "fix-x"),
+            None,
+            at("dotfiles", "/d", "main"),
+        ]);
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            rows,
+            [
+                (some("search  \u{f418} main"), None),
+                (None, None),
+                (some("\u{200b}  └─ \u{f418} fix-x"), some("\u{200b}")),
+                (None, None),
+                (some("dotfiles"), some("\u{200b}")),
             ]
         );
     }
