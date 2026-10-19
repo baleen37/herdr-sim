@@ -23,10 +23,10 @@ use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
     SORT_RANK_TOKEN, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
-    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon, agent_name,
-    checkout_headers, claude_session, codex_session, diff_value, heading_value, project_name,
-    resolve_claude_session, scope, session_files, split_marks, summary_value, token_value,
-    tree_headers, workspace_agent_token,
+    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon,
+    checkout_headers, claude_session, codex_session, diff_value, header_value, heading_value,
+    project_name, resolve_claude_session, scope, session_files, split_marks, summary_value,
+    token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -198,6 +198,7 @@ impl Run {
         let mut cis: HashMap<String, Ci> = HashMap::new();
         let mut diffs: HashMap<String, String> = HashMap::new();
         let mut projects: HashMap<String, String> = HashMap::new();
+        let mut headers: HashMap<String, String> = HashMap::new();
         let mut order = Vec::new();
         for pane in panes["result"]["panes"].as_array().into_iter().flatten() {
             let (Some(workspace), Some(cwd)) =
@@ -219,7 +220,12 @@ impl Run {
             let Some(repo) = git_repo(cwd) else {
                 continue;
             };
-            projects.insert(workspace.to_string(), repo.project);
+            let place = repo.place();
+            headers.insert(
+                workspace.to_string(),
+                header_value(&place.project, Some(&place.label)),
+            );
+            projects.insert(workspace.to_string(), place.project);
             if let Some(diff) = git_diff(&repo.top) {
                 diffs.insert(workspace.to_string(), diff);
             }
@@ -250,7 +256,13 @@ impl Run {
                     (workspace_agent_token(kind), agent_count_value(kind, count))
                 })
                 .collect();
-            tokens.push((PROJECT_TOKEN.into(), projects.remove(&workspace)));
+            let project = projects.remove(&workspace);
+            // Same header as the Agents list, so both panels read alike.
+            let header = headers
+                .remove(&workspace)
+                .or_else(|| project.as_deref().map(|p| header_value(p, None)));
+            tokens.push((TREE_HEADER_TOKEN.into(), header));
+            tokens.push((PROJECT_TOKEN.into(), project));
             tokens.push((DIFF_TOKEN.into(), diffs.remove(&workspace)));
             let ci = cis.remove(&workspace).map(|ci| ci.icon().to_string());
             tokens.push((CI_TOKEN.into(), ci));
@@ -281,10 +293,7 @@ impl Run {
         ];
         // The logo needs no session; the PRs and title do, so leave those be.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
-            tokens.push((
-                HEADING_TOKEN.to_string(),
-                Some(heading_value(icon, None, agent_name(kind))),
-            ));
+            tokens.push((HEADING_TOKEN.to_string(), Some(heading_value(icon, None))));
             self.report("pane", pane, "agent", None, &tokens);
             return;
         };
@@ -300,7 +309,7 @@ impl Run {
                 *counts.entry(state).or_default() += 1;
             }
         }
-        let heading = heading_value(icon, session.title.as_deref(), agent_name(kind));
+        let heading = heading_value(icon, session.title.as_deref());
         tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
         tokens.push((TITLE_TOKEN.to_string(), session.title));
         self.report("pane", pane, "agent", Some(&counts), &tokens);
