@@ -425,6 +425,18 @@ mod tests {
         );
     }
 
+    /// herdr/install.sh downloads the release tagged with the manifest's
+    /// version, which dist cuts from Cargo.toml's.
+    #[test]
+    fn plugin_manifest_version_matches_crate() {
+        let manifest = include_str!("../herdr-plugin.toml");
+        let line = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
+        assert!(
+            manifest.lines().any(|l| l == line),
+            "herdr-plugin.toml must say {line}"
+        );
+    }
+
     #[test]
     fn token_value_shows_count_only_above_one() {
         assert_eq!(token_value(PrState::Open, 0), None);

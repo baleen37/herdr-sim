@@ -29,6 +29,13 @@ Requires Herdr 0.9.0+, its Claude Code / Codex integrations
 (`herdr integration install claude`, `... codex`), `gh` signed in, and a
 [Nerd Font](https://www.nerdfonts.com/) for the icons.
 
+```sh
+herdr plugin install baleen37/herdr-sim
+```
+
+The install step downloads the prebuilt binary for the manifest's version from
+GitHub Releases (macOS arm64, Linux x86_64/arm64) and checks its sha256.
+
 With Nix:
 
 ```sh

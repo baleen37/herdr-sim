@@ -7,8 +7,12 @@ min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
 description = "Show the PRs each Claude Code / Codex pane touched as sidebar icons."
 
-# The binary is expected at $HERDR_PLUGIN_ROOT/bin/herdr-sim. The Nix package
-# lays it out that way, so `herdr plugin link <package>` works as is.
+# The binary is expected at $HERDR_PLUGIN_ROOT/bin/herdr-sim. On
+# `herdr plugin install` the build step downloads it from the matching GitHub
+# Release; the Nix package lays it out the same way for `herdr plugin link`.
+[[build]]
+command = ["sh", "herdr/install.sh"]
+
 [[startup]]
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 
