@@ -64,8 +64,10 @@ fn main() -> Result<()> {
             fs::write(&order_off, b"")?;
         }
     }
-    // The view dies with the server, so startup sets it again.
-    if toggle || event.as_deref() == Some("startup") {
+    // Every run sets the view while the order is on: it dies with the server,
+    // and a plugin linked into a running server gets no startup hook. It is
+    // cleared only by the toggle, so the view of another plugin stays.
+    if toggle || !order_off.exists() {
         set_agent_view(!order_off.exists());
     }
     let pending = state_dir.join("pending");
