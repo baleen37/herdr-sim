@@ -22,14 +22,14 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN,
-    TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN, TREE_GROUP_STALE_TOKEN,
-    TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
-    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon,
-    checkout_headers, claude_session, codex_session, diff_value, group_rows, header_value,
-    heading_value, held_status, indent, project_name, resolve_claude_session, scope, split_marks,
-    state_heading_token, state_heading_value, summary_value, token_value, tree_headers,
-    workspace_agent_token,
+    SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN,
+    TREE_GAP_TOKEN, TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
+    agent_icon, checkout_headers, claude_session, codex_session, diff_value, group_rows,
+    header_value, heading_value, held_status, indent, project_name, resolve_claude_session, scope,
+    split_marks, state_heading_token, state_heading_value, summary_value, token_value,
+    tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -450,7 +450,16 @@ impl Run {
             ) else {
                 continue;
             };
-            let heading = self.cache.heading(pane).unwrap_or_else(|| icon.to_string());
+            // Read the title now rather than reuse the last pass's: Claude
+            // titles a session during its first turn, before that turn ends.
+            let heading = match self.session_of(agent) {
+                Some(session) => {
+                    let heading = heading_value(icon, session.title.as_deref());
+                    self.cache.set_heading(pane, heading.clone());
+                    heading
+                }
+                None => self.cache.heading(pane).unwrap_or_else(|| icon.to_string()),
+            };
             let value = state_heading_value(&heading, status, self.cache.depth(pane));
             let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
@@ -460,16 +469,22 @@ impl Run {
         }
     }
 
-    /// Seconds since the agent's session last had a message.
-    fn age_secs(&mut self, agent: &Value) -> Option<u64> {
+    /// The agent's session as of now; reading it again only reads what was
+    /// appended since.
+    fn session_of(&mut self, agent: &Value) -> Option<Session> {
         let kind = agent["agent"].as_str()?;
         let session = agent["agent_session"]["value"].as_str()?;
-        let last = if kind == "claude" {
+        Some(if kind == "claude" {
             let session = resolve_claude_session(&self.home, session);
-            claude_session(&self.home, &session, &mut self.cache).last_activity
+            claude_session(&self.home, &session, &mut self.cache)
         } else {
-            codex_session(&self.home, session, &mut self.cache).last_activity
-        }?;
+            codex_session(&self.home, session, &mut self.cache)
+        })
+    }
+
+    /// Seconds since the agent's session last had a message.
+    fn age_secs(&mut self, agent: &Value) -> Option<u64> {
+        let last = self.session_of(agent)?.last_activity?;
         Some(self.now.saturating_sub(last))
     }
 
