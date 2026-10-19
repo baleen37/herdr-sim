@@ -28,8 +28,7 @@ in its first pane that is inside a git repository.
 A finished turn only revisits its own pane and workspace: five short process
 calls when nothing changed (`herdr agent list`, `herdr pane list`, one
 `git rev-parse` each for the pane and its Space, and `git diff --shortstat` for
-the Space), and no `report-metadata` call unless a token changed. A
-started turn exits at once. Runs never overlap: one that finds another in
+the Space), and no `report-metadata` call unless a token changed. A started turn only recolours headings by state (one `herdr agent list`). Runs never overlap: one that finds another in
 progress leaves a note, and the running one does a single extra pass. `gh` calls
 are cached as below and killed after 10 seconds.
 
@@ -76,14 +75,14 @@ agent_panel_sort = "spaces"
 
 [ui.sidebar.agents]
 rows = [
-  [{ token = "$tree_header", fg = "#cdd6f4", bold = true }],
-  [{ token = "$tree_split", dim = true }, "state_icon", { token = "$heading", fg = "#cdd6f4" }],
+  [{ token = "$tree_header", fg = "#9399b2", bold = true }],
+  [{ token = "$tree_split", dim = true }, "state_icon", { token = "$heading_working", fg = "#fab387", bold = true }, { token = "$heading_blocked", fg = "#f38ba8", bold = true }, { token = "$heading_done", fg = "#a6e3a1" }, { token = "$heading_idle_fresh", fg = "#cdd6f4" }, { token = "$heading_idle", fg = "#a6adc8" }, { token = "$heading_idle_stale", fg = "#6c7086" }, { token = "$heading_unknown", fg = "#cba6f7" }],
   [{ token = "$age", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
 rows = [
-  ["state_icon", { token = "$tree_header", fg = "#cdd6f4", bold = true }, { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
+  ["state_icon", { token = "$tree_header", fg = "#9399b2", bold = true }, { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
   ["git_status", { token = "$diff", dim = true }, { token = "$ci", rules = [{ starts_with = "\uF42E", fg = "#a6e3a1" }, { starts_with = "\uF467", fg = "#f38ba8" }, { starts_with = "\uF444", fg = "#f9e2af" }] }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
@@ -97,9 +96,10 @@ rows = [
 | `$project` | The repository the pane or Space works in. A linked worktree names its main repository (`search`, not `search-14527-status`); a directory outside git is named after itself, `~` for home. |
 | `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
 | `$branch` | On agent panes: the branch checked out where the agent works (Herdr's own `branch` token is for Space rows only). Unset outside git or on a detached HEAD. |
-| `$tree_header` | A one-line header: `<repo icon> <project>  <branch icon> <branch>`. On the first agent of each checkout, and on every workspace, so the Agents list and the Spaces panel read alike. Use `agent_panel_sort = "spaces"`. |
+| `$tree_header` | A one-line header: `<project>  <branch icon> <branch>`. On the first agent of each checkout, and on every workspace, so the Agents list and the Spaces panel read alike. Use `agent_panel_sort = "spaces"`. |
 | `$tree_project`, `$tree_worktree` | A project → checkout tree over the Agents list (structure after [herdr-radar](https://github.com/hhdebb/herdr-radar), layout after Orca): the repo icon and project name on the first agent of each project, `<branch icon> <branch>` on the first agent of each checkout, main checkout included. A project's later checkouts get `│` in `$tree_project` so every branch header sits at the same indent; style it with an `equals = "│"` rule. Use `agent_panel_sort = "spaces"`. |
 | `$age` | On agent panes: how long ago the session's transcript (Claude) or rollout (Codex) last changed — `now`, `10m`…`50m`, `1h`…, `1d`…. Coarse so it changes at most six times an hour; refreshed on every pass, so it pauses while no agent has events. |
+| `$heading_working`, `$heading_blocked`, `$heading_done`, `$heading_idle_fresh`, `$heading_idle`, `$heading_idle_stale`, `$heading_unknown` | `$heading` in the one token matching the agent's state, so titles can be coloured by state as in herdr-radar. Idle splits by session age: under 15 minutes fresh, over 2 hours stale. Updated on every status change, including a turn's start (one `herdr agent list`, then only changed tokens). |
 | `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the logo alone before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$tree_split` | `├─` on the second and later agents of a split tab, `└─` on the last, so a split screen reads as one unit under its first agent. |
 | `$sort_rank` | The agent's position in the activity order below; not meant for display. |

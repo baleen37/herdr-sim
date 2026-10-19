@@ -170,8 +170,8 @@ pub enum Scope {
     All,
     /// A turn ended in one pane: that pane and its workspace.
     Pane { pane: String, workspace: String },
-    /// A turn started: nothing can have changed yet.
-    Skip,
+    /// A turn started: only state colours can have changed.
+    Status,
 }
 
 /// Reads `HERDR_PLUGIN_EVENT` / `HERDR_PLUGIN_EVENT_JSON`. Anything it does
@@ -194,7 +194,7 @@ pub fn scope(event: Option<&str>, event_json: Option<&str>) -> Scope {
         e["workspace_id"].as_str(),
         e["agent_status"].as_str(),
     ) {
-        (_, _, Some("working")) => Scope::Skip,
+        (_, _, Some("working")) => Scope::Status,
         (Some(pane), Some(workspace), _) => Scope::Pane {
             pane: pane.to_string(),
             workspace: workspace.to_string(),
@@ -252,12 +252,12 @@ pub struct Place {
 /// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
 pub const TREE_HEADER_TOKEN: &str = "tree_header";
 
-/// The header text shared by Agent and Space rows: repo icon and project,
-/// then branch icon and branch when there is one.
+/// The header text shared by Agent and Space rows: the project, then branch
+/// icon and branch when there is one.
 pub fn header_value(project: &str, branch: Option<&str>) -> String {
     match branch {
-        Some(branch) => format!("\u{f401} {project}  \u{f418} {branch}"),
-        None => format!("\u{f401} {project}"),
+        Some(branch) => format!("{project}  \u{f418} {branch}"),
+        None => project.to_string(),
     }
 }
 
@@ -465,6 +465,35 @@ pub fn heading_value(icon: &str, title: Option<&str>) -> String {
     }
 }
 
+/// `$heading` again, but in one of these tokens by the agent's state, so the
+/// sidebar can colour titles the way herdr-radar does. Exactly one is set.
+pub const STATE_HEADING_TOKENS: [&str; 7] = [
+    "heading_working",
+    "heading_blocked",
+    "heading_done",
+    "heading_idle_fresh",
+    "heading_idle",
+    "heading_idle_stale",
+    "heading_unknown",
+];
+
+/// Which of [`STATE_HEADING_TOKENS`] holds an agent's heading: by Herdr's
+/// agent status, and for idle agents by how long ago the session last changed
+/// (under 15 minutes fresh, over 2 hours stale, as in herdr-radar).
+pub fn state_heading_token(status: &str, idle_secs: Option<u64>) -> &'static str {
+    match status {
+        "working" => "heading_working",
+        "blocked" => "heading_blocked",
+        "done" => "heading_done",
+        "idle" => match idle_secs {
+            Some(s) if s < 15 * 60 => "heading_idle_fresh",
+            Some(s) if s > 2 * 3600 => "heading_idle_stale",
+            _ => "heading_idle",
+        },
+        _ => "heading_unknown",
+    }
+}
+
 /// What herdr-sim knows about one agent session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Session {
@@ -637,6 +666,9 @@ pub struct Cache {
     /// Where each directory sits in the tree; a checkout's project and
     /// worktree do not change, so this saves a `git` call per agent per run.
     places: HashMap<String, Place>,
+    /// Each pane's latest `$heading`, so a turn start can recolour it without
+    /// rereading the session.
+    headings: HashMap<String, String>,
 }
 
 /// The PR of a checked-out branch (`state` is `None` when there is none) and
@@ -708,12 +740,16 @@ impl Cache {
                 Some((cwd.clone(), place))
             })
             .collect();
+        let headings = object(&v["headings"])
+            .filter_map(|(pane, v)| Some((pane.clone(), v.as_str()?.to_string())))
+            .collect();
         Self {
             prs,
             branches,
             files,
             reported,
             places,
+            headings,
         }
     }
 
@@ -759,7 +795,7 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -811,6 +847,15 @@ impl Cache {
             }
             None => cached.map(|(pr, _)| pr).unwrap_or_default(),
         }
+    }
+
+    /// The pane's latest heading, if one was computed.
+    pub fn heading(&self, pane: &str) -> Option<String> {
+        self.headings.get(pane).cloned()
+    }
+
+    pub fn set_heading(&mut self, pane: &str, heading: String) {
+        self.headings.insert(pane.to_string(), heading);
     }
 
     /// The cached tree place of `cwd`, if any.
@@ -1151,7 +1196,7 @@ mod tests {
         let wrapped = format!(r#"{{"event":{idle}}}"#);
         assert_eq!(scope(ev, Some(&wrapped)), pane);
         let working = idle.replace("idle", "working");
-        assert_eq!(scope(ev, Some(&working)), Scope::Skip);
+        assert_eq!(scope(ev, Some(&working)), Scope::Status);
         assert_eq!(scope(ev, Some("not json")), Scope::All);
         assert_eq!(scope(ev, None), Scope::All);
         assert_eq!(scope(Some("startup"), None), Scope::All);
@@ -1258,9 +1303,9 @@ mod tests {
         assert_eq!(
             headers,
             [
-                Some("\u{f401} search  \u{f418} main".to_string()),
+                Some("search  \u{f418} main".to_string()),
                 None,
-                Some("\u{f401} search  \u{f418} fix-x".to_string()),
+                Some("search  \u{f418} fix-x".to_string()),
                 None,
             ]
         );
@@ -1298,6 +1343,25 @@ mod tests {
         // checkout (1); dotfiles (5); the two idle projects and their tabs by
         // name; last the agent without a place.
         assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9, 3]);
+    }
+
+    #[test]
+    fn state_heading_follows_status_then_idle_age() {
+        assert_eq!(state_heading_token("working", None), "heading_working");
+        assert_eq!(
+            state_heading_token("blocked", Some(9_999)),
+            "heading_blocked"
+        );
+        assert_eq!(state_heading_token("done", None), "heading_done");
+        assert_eq!(state_heading_token("idle", Some(60)), "heading_idle_fresh");
+        assert_eq!(state_heading_token("idle", Some(3600)), "heading_idle");
+        assert_eq!(state_heading_token("idle", None), "heading_idle");
+        assert_eq!(
+            state_heading_token("idle", Some(3 * 3600)),
+            "heading_idle_stale"
+        );
+        assert_eq!(state_heading_token("unknown", None), "heading_unknown");
+        assert!(STATE_HEADING_TOKENS.contains(&state_heading_token("idle", Some(60))));
     }
 
     #[test]
