@@ -137,26 +137,6 @@ pub fn diff_value(shortstat: &str) -> Option<String> {
     }
 }
 
-/// Sidebar token for how long an idle agent has been idle, referenced as
-/// `$idle`: `20m`, `3h`, `2d`. Unset while it works, waits, or is done and
-/// unseen, and for its first [`IDLE_AFTER_SECS`].
-pub const IDLE_TOKEN: &str = "idle";
-
-/// Idle time below which `$idle` stays unset.
-pub const IDLE_AFTER_SECS: u64 = 15 * 60;
-
-pub fn idle_value(status: &str, idle_secs: u64) -> Option<String> {
-    if status != "idle" || idle_secs < IDLE_AFTER_SECS {
-        return None;
-    }
-    let minutes = idle_secs / 60;
-    Some(match minutes {
-        m if m < 60 => format!("{m}m"),
-        m if m < 48 * 60 => format!("{}h", m / 60),
-        m => format!("{}d", m / (24 * 60)),
-    })
-}
-
 /// Sidebar token holding the agent's logo, referenced as `$agent_icon`.
 pub const AGENT_ICON_TOKEN: &str = "agent_icon";
 
@@ -250,17 +230,47 @@ pub fn project_name(toplevel: &str, common_dir: &str) -> String {
 pub const TREE_PROJECT_TOKEN: &str = "tree_project";
 pub const TREE_WORKTREE_TOKEN: &str = "tree_worktree";
 
+/// What `$tree_project` holds above a project's second and later checkouts;
+/// style it apart with an `equals` rule.
+pub const TREE_SPINE: &str = "│";
+
 /// Where an agent works, for the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
     pub project: String,
-    /// The linked worktree's directory name; `None` in the main checkout.
-    pub worktree: Option<String>,
+    /// The checkout's top-level directory: one per main checkout or worktree.
+    pub checkout: String,
+    /// What the checkout header shows: its branch, or its directory name on a
+    /// detached HEAD.
+    pub label: String,
 }
 
-/// Tree header tokens for agents listed in sidebar order: the project name on
-/// the first agent of each project, `└─ <worktree>` on the first agent of
-/// each worktree. Agents without a place get neither.
+/// Sidebar token with a one-line checkout header, referenced as
+/// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
+pub const TREE_HEADER_TOKEN: &str = "tree_header";
+
+/// One header per checkout, on the first agent of each, for a flat two-level
+/// list: every header is an entry's first row, so they all line up, and the
+/// project is named on worktrees too. Agents without a place get none.
+pub fn checkout_headers(places: &[Option<Place>]) -> Vec<Option<String>> {
+    let mut seen = std::collections::HashSet::new();
+    places
+        .iter()
+        .map(|place| {
+            let place = place.as_ref()?;
+            seen.insert(place.checkout.clone())
+                .then(|| format!("\u{f401} {}  \u{f418} {}", place.project, place.label))
+        })
+        .collect()
+}
+
+/// Tree header tokens for agents listed in sidebar order, like Orca's project
+/// list: the project name on the first agent of each project, and
+/// `<branch icon> <branch>` on the first agent of each checkout (main checkout
+/// and worktrees alike). A later checkout of the same project gets a `│` in
+/// the project slot: Herdr indents every row but an entry's first, so this
+/// keeps all branch headers at one indent and marks them as one project.
+/// Agents without a place get neither.
 pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<String>)> {
     let mut seen_projects = std::collections::HashSet::new();
     let mut seen_worktrees = std::collections::HashSet::new();
@@ -270,15 +280,15 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             let Some(place) = place else {
                 return (None, None);
             };
-            let project = seen_projects
-                .insert(place.project.clone())
-                .then(|| place.project.clone());
-            let worktree = place.worktree.as_ref().and_then(|w| {
-                seen_worktrees
-                    .insert((place.project.clone(), w.clone()))
-                    .then(|| format!("└─ {w}"))
-            });
-            (project, worktree)
+            let first_of_project = seen_projects.insert(place.project.clone());
+            let first_of_checkout = seen_worktrees.insert(place.checkout.clone());
+            let project = match (first_of_project, first_of_checkout) {
+                (true, _) => Some(format!("\u{f401} {}", place.project)),
+                (false, true) => Some(TREE_SPINE.to_string()),
+                (false, false) => None,
+            };
+            let checkout = first_of_checkout.then(|| format!("\u{f418} {}", place.label));
+            (project, checkout)
         })
         .collect()
 }
@@ -304,10 +314,11 @@ pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
 }
 
 /// Pane tokens the activity order sorts on, most recent first: the project,
-/// the worktree within it, the tab within that. The Agents view sorts tokens
+/// the checkout within it (main checkout and worktrees alike), the tab within
+/// that. The Agents view sorts tokens
 /// as strings, so each key is a zero-padded sequence number then a name that
 /// keeps groups with equal numbers apart.
-pub const SORT_TOKENS: [&str; 3] = ["sort_project", "sort_worktree", "sort_tab"];
+pub const SORT_TOKENS: [&str; 3] = ["sort_project", "sort_checkout", "sort_tab"];
 
 /// One agent as the activity order sees it.
 pub struct Activity {
@@ -318,9 +329,7 @@ pub struct Activity {
 }
 
 /// Sort keys for each agent; `None` for agents without a place, which the
-/// view then lists last. Each group ranks by its most recent agent. A
-/// project's main checkout always comes before its linked worktrees, so its
-/// agents never sit under a worktree header.
+/// view then lists last. Each group ranks by its most recent agent.
 pub fn sort_keys(agents: &[Activity]) -> Vec<Option<[String; 3]>> {
     let mut latest: HashMap<String, u64> = HashMap::new();
     let mut bump = |key: String, seq: u64| {
@@ -330,9 +339,7 @@ pub fn sort_keys(agents: &[Activity]) -> Vec<Option<[String; 3]>> {
     for agent in agents {
         if let Some(place) = &agent.place {
             bump(format!("p/{}", place.project), agent.seq);
-            if let Some(worktree) = &place.worktree {
-                bump(format!("w/{}/{worktree}", place.project), agent.seq);
-            }
+            bump(format!("c/{}", place.checkout), agent.seq);
             bump(format!("t/{}", agent.tab), agent.seq);
         }
     }
@@ -342,13 +349,9 @@ pub fn sort_keys(agents: &[Activity]) -> Vec<Option<[String; 3]>> {
             let place = agent.place.as_ref()?;
             let key = |seq: u64, name: &str| format!("{seq:020}/{name}");
             let project = key(latest[&format!("p/{}", place.project)], &place.project);
-            let worktree = match &place.worktree {
-                Some(w) => key(latest[&format!("w/{}/{w}", place.project)], w),
-                // Above any u64, so it sorts first in descending order.
-                None => "9".repeat(21),
-            };
+            let checkout = key(latest[&format!("c/{}", place.checkout)], &place.checkout);
             let tab = key(latest[&format!("t/{}", agent.tab)], &agent.tab);
-            Some([project, worktree, tab])
+            Some([project, checkout, tab])
         })
         .collect()
 }
@@ -364,6 +367,44 @@ pub fn activity_order(keys: &[Option<[String; 3]>]) -> Vec<usize> {
         (None, None) => std::cmp::Ordering::Equal,
     });
     order
+}
+
+/// Sidebar token with how long ago an agent's session last changed,
+/// referenced as `$age`.
+pub const AGE_TOKEN: &str = "age";
+
+/// A short age like Orca's: `now` under 5 minutes, then 10-minute steps,
+/// hours, days. Coarse on purpose: the value, and so a `report-metadata` call,
+/// changes at most six times an hour.
+pub fn age_value(secs: u64) -> String {
+    match secs {
+        0..300 => "now".into(),
+        300..3600 => format!("{}m", (secs / 600).max(1) * 10),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// The files an agent session writes as it works: a Claude Code transcript or
+/// Codex rollout.
+pub fn session_files(home: &Path, kind: &str, session_id: &str) -> Vec<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    if kind == "claude" {
+        return subdirs(&home.join(".claude/projects"))
+            .into_iter()
+            .map(|project| project.join(&name))
+            .filter(|path| path.is_file())
+            .collect();
+    }
+    let mut files = Vec::new();
+    for year in subdirs(&home.join(".codex/sessions")) {
+        for month in subdirs(&year) {
+            for day in subdirs(&month) {
+                files.extend(files_ending_with(&day, &name));
+            }
+        }
+    }
+    files
 }
 
 /// The agents herdr-sim knows, as Herdr agent ids.
@@ -414,11 +455,16 @@ pub const BRANCH_TOKEN: &str = "branch";
 /// Claude Code's own session list. The cost is a single colour for both.
 pub const HEADING_TOKEN: &str = "heading";
 
-/// The logo followed by the title, or the logo alone before there is a title.
-pub fn heading_value(icon: &str, title: Option<&str>) -> String {
-    match title {
-        Some(title) => format!("{icon} {title}"),
-        None => icon.to_string(),
+/// The logo followed by the title, or by the agent's name before there is one.
+pub fn heading_value(icon: &str, title: Option<&str>, agent: &str) -> String {
+    format!("{icon} {}", title.unwrap_or(agent))
+}
+
+/// The name shown for an agent whose session has no title yet.
+pub fn agent_name(kind: &str) -> &'static str {
+    match kind {
+        "codex" => "Codex",
+        _ => "Claude",
     }
 }
 
@@ -594,9 +640,6 @@ pub struct Cache {
     /// Where each directory sits in the tree; a checkout's project and
     /// worktree do not change, so this saves a `git` call per agent per run.
     places: HashMap<String, Place>,
-    /// Each agent pane's last `state_change_seq` and when this plugin first
-    /// saw it, for `$idle`.
-    changes: HashMap<String, (u64, u64)>,
 }
 
 /// The PR of a checked-out branch (`state` is `None` when there is none) and
@@ -662,7 +705,8 @@ impl Cache {
             .filter_map(|(cwd, v)| {
                 let place = Place {
                     project: v["project"].as_str()?.to_string(),
-                    worktree: v["worktree"].as_str().map(String::from),
+                    checkout: v["checkout"].as_str()?.to_string(),
+                    label: v["label"].as_str()?.to_string(),
                 };
                 Some((cwd.clone(), place))
             })
@@ -670,9 +714,6 @@ impl Cache {
         Self {
             prs,
             branches,
-            changes: object(&v["changes"])
-                .filter_map(|(pane, v)| Some((pane.clone(), (v[0].as_u64()?, v[1].as_u64()?))))
-                .collect(),
             files,
             reported,
             places,
@@ -714,14 +755,14 @@ impl Cache {
             .map(|(cwd, p)| {
                 (
                     cwd.clone(),
-                    json!({ "project": p.project, "worktree": p.worktree }),
+                    json!({ "project": p.project, "checkout": p.checkout, "label": p.label }),
                 )
             })
             .collect();
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "changes": self.changes })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -773,22 +814,6 @@ impl Cache {
             }
             None => cached.map(|(pr, _)| pr).unwrap_or_default(),
         }
-    }
-
-    /// Seconds since `pane`'s state last changed, as far as this plugin has
-    /// seen: a `seq` it has not seen before starts the clock at `now`.
-    pub fn since_change(&mut self, pane: &str, seq: u64, now: u64) -> u64 {
-        let entry = self.changes.entry(pane.to_string()).or_insert((seq, now));
-        if entry.0 != seq {
-            *entry = (seq, now);
-        }
-        now.saturating_sub(entry.1)
-    }
-
-    /// Forgets the change records of panes not in `panes`.
-    pub fn keep_changes<'a>(&mut self, panes: impl IntoIterator<Item = &'a str>) {
-        let panes: std::collections::HashSet<&str> = panes.into_iter().collect();
-        self.changes.retain(|pane, _| panes.contains(pane.as_str()));
     }
 
     /// The cached tree place of `cwd`, if any.
@@ -1175,38 +1200,37 @@ mod tests {
     #[test]
     fn heading_is_the_logo_then_the_title() {
         assert_eq!(
-            heading_value("\u{ec82}", Some("Fix login")),
+            heading_value("\u{ec82}", Some("Fix login"), "Claude"),
             "\u{ec82} Fix login"
         );
-        assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
+        assert_eq!(heading_value("\u{ec81}", None, "Codex"), "\u{ec81} Codex");
     }
 
     #[test]
     fn tree_headers_mark_the_first_agent_of_each_group() {
-        let at = |project: &str, worktree: Option<&str>| {
+        let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
                 project: project.into(),
-                worktree: worktree.map(String::from),
+                checkout: checkout.into(),
+                label: label.into(),
             })
         };
         let headers = tree_headers(&[
-            at("search", None),
-            at("search", None),
-            at("search", Some("status")),
-            at("search", Some("status")),
+            at("search", "/s", "main"),
+            at("search", "/s", "main"),
+            at("search", "/s/wt", "fix-x"),
             None,
-            at("dotfiles", Some("deploy")),
+            at("dotfiles", "/d", "main"),
         ]);
         let some = |s: &str| Some(s.to_string());
         assert_eq!(
             headers,
             [
-                (some("search"), None),
+                (some("\u{f401} search"), some("\u{f418} main")),
                 (None, None),
-                (None, some("└─ status")),
+                (some("│"), some("\u{f418} fix-x")),
                 (None, None),
-                (None, None),
-                (some("dotfiles"), some("└─ deploy")),
+                (some("\u{f401} dotfiles"), some("\u{f418} main")),
             ]
         );
     }
@@ -1220,37 +1244,77 @@ mod tests {
     }
 
     #[test]
-    fn activity_order_puts_recent_groups_first_and_main_checkouts_on_top() {
-        let at = |project: &str, worktree: Option<&str>, tab: &str, seq: u64| Activity {
+    fn checkout_headers_mark_each_checkouts_first_agent() {
+        let at = |project: &str, checkout: &str, label: &str| {
+            Some(Place {
+                project: project.into(),
+                checkout: checkout.into(),
+                label: label.into(),
+            })
+        };
+        let headers = checkout_headers(&[
+            at("search", "/s", "main"),
+            at("search", "/s", "main"),
+            at("search", "/s/wt", "fix-x"),
+            None,
+        ]);
+        assert_eq!(
+            headers,
+            [
+                Some("\u{f401} search  \u{f418} main".to_string()),
+                None,
+                Some("\u{f401} search  \u{f418} fix-x".to_string()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_order_puts_recent_groups_first() {
+        let at = |project: &str, checkout: &str, tab: &str, seq: u64| Activity {
             place: Some(Place {
                 project: project.into(),
-                worktree: worktree.map(String::from),
+                checkout: checkout.into(),
+                label: "main".into(),
             }),
             tab: tab.into(),
             seq,
         };
         let agents = [
-            at("search", None, "t1", 1),
-            at("search", Some("status"), "t2", 9),
-            at("dotfiles", None, "t3", 5),
+            at("search", "/s", "t1", 1),
+            at("search", "/s/status", "t2", 9),
+            at("dotfiles", "/d", "t3", 5),
             Activity {
                 place: None,
                 tab: "t4".into(),
                 seq: 20,
             },
-            at("search", Some("batch"), "t5", 3),
-            at("search", Some("status"), "t6", 2),
-            at("search", Some("status"), "t2", 0),
+            at("search", "/s/batch", "t5", 3),
+            at("search", "/s/status", "t6", 2),
+            at("search", "/s/status", "t2", 0),
             // Two idle projects keep apart despite equal keys.
-            at("infra", None, "t7", 0),
-            at("api", None, "t8", 0),
-            at("infra", None, "t9", 0),
+            at("infra", "/i", "t7", 0),
+            at("api", "/a", "t8", 0),
+            at("infra", "/i", "t9", 0),
         ];
         let order = activity_order(&sort_keys(&agents));
-        // search (latest 9): main, then status (9: tab t2 then t6), then batch;
-        // dotfiles (5); the two idle projects, whose equal keys fall back to
-        // names; the agent without a place.
-        assert_eq!(order, [0, 1, 6, 5, 4, 2, 9, 7, 8, 3]);
+        // search (latest 9): status (9: tab t2 then t6), batch (3), the main
+        // checkout (1); dotfiles (5); the two idle projects, whose equal keys
+        // fall back to names; the agent without a place.
+        assert_eq!(order, [1, 6, 5, 4, 0, 2, 9, 7, 8, 3]);
+    }
+
+    #[test]
+    fn age_value_is_coarse() {
+        assert_eq!(age_value(0), "now");
+        assert_eq!(age_value(299), "now");
+        assert_eq!(age_value(300), "10m");
+        assert_eq!(age_value(1199), "10m");
+        assert_eq!(age_value(1200), "20m");
+        assert_eq!(age_value(3599), "50m");
+        assert_eq!(age_value(3600), "1h");
+        assert_eq!(age_value(5 * 3600 + 59), "5h");
+        assert_eq!(age_value(2 * 86400), "2d");
     }
 
     #[test]
@@ -1340,26 +1404,6 @@ mod tests {
     }
 
     #[test]
-    fn idle_shows_only_for_long_idle_agents() {
-        assert_eq!(idle_value("idle", 14 * 60), None);
-        assert_eq!(idle_value("idle", 15 * 60).unwrap(), "15m");
-        assert_eq!(idle_value("idle", 3 * 3600 + 59).unwrap(), "3h");
-        assert_eq!(idle_value("idle", 3 * 86400).unwrap(), "3d");
-        assert_eq!(idle_value("done", 3 * 86400), None);
-        assert_eq!(idle_value("working", 3 * 86400), None);
-    }
-
-    #[test]
-    fn since_change_restarts_the_clock_on_a_new_seq() {
-        let mut cache = Cache::default();
-        assert_eq!(cache.since_change("p", 4, 100), 0);
-        assert_eq!(cache.since_change("p", 4, 160), 60);
-        assert_eq!(cache.since_change("p", 5, 200), 0);
-        cache.keep_changes(["q"]);
-        assert_eq!(cache.since_change("p", 5, 300), 0);
-    }
-
-    #[test]
     fn cache_round_trips_through_disk() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("cache.json");
@@ -1370,14 +1414,12 @@ mod tests {
             ci: Some(Ci::Fail),
         };
         cache.branch_state("r#b", 5, || Some(merged));
-        cache.since_change("p", 7, 5);
         cache.save(&path).unwrap();
         let mut loaded = Cache::load(&path);
         assert_eq!(
             loaded.branch_state("r#b", 1_000, || panic!("not cached")),
             merged
         );
-        assert_eq!(loaded.since_change("p", 7, 65), 60);
         assert_eq!(
             loaded.state("u", 1_000, |_| panic!("not cached")),
             Some(PrState::Closed)

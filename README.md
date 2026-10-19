@@ -76,10 +76,9 @@ agent_panel_sort = "spaces"
 
 [ui.sidebar.agents]
 rows = [
-  [{ token = "$tree_project", bold = true }],
-  [{ token = "$tree_worktree", dim = true }],
-  [{ token = "$tree_split", dim = true }, "state_icon", "$heading", { token = "$idle", dim = true }],
-  [{ token = "$branch", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+  [{ token = "$tree_header", fg = "#cdd6f4", bold = true }],
+  [{ token = "$tree_split", dim = true }, "state_icon", { token = "$heading", fg = "#cdd6f4" }],
+  [{ token = "$age", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
@@ -98,13 +97,14 @@ rows = [
 | `$project` | The repository the pane or Space works in. A linked worktree names its main repository (`search`, not `search-14527-status`); a directory outside git is named after itself, `~` for home. |
 | `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
 | `$branch` | On agent panes: the branch checked out where the agent works (Herdr's own `branch` token is for Space rows only). Unset outside git or on a detached HEAD. |
-| `$tree_project`, `$tree_worktree` | A project → worktree tree over the Agents list (the structure follows [herdr-radar](https://github.com/hhdebb/herdr-radar)): the project name on the first agent of each project, `└─ <worktree dir>` on the first agent of each linked worktree. Use `agent_panel_sort = "spaces"` so groups stay together. |
+| `$tree_header` | A one-line header per checkout, on its first agent: `<repo icon> <project>  <branch icon> <branch>`. Every header is an entry's first row, so a flat two-level list lines up without spacer rows. Use `agent_panel_sort = "spaces"`. |
+| `$tree_project`, `$tree_worktree` | A project → checkout tree over the Agents list (structure after [herdr-radar](https://github.com/hhdebb/herdr-radar), layout after Orca): the repo icon and project name on the first agent of each project, `<branch icon> <branch>` on the first agent of each checkout, main checkout included. A project's later checkouts get `│` in `$tree_project` so every branch header sits at the same indent; style it with an `equals = "│"` rule. Use `agent_panel_sort = "spaces"`. |
+| `$age` | On agent panes: how long ago the session's transcript (Claude) or rollout (Codex) last changed — `now`, `10m`…`50m`, `1h`…, `1d`…. Coarse so it changes at most six times an hour; refreshed on every pass, so it pauses while no agent has events. |
+| `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the agent's name (Claude, Codex) before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$tree_split` | `├─` on the second and later agents of a split tab, `└─` on the last, so a split screen reads as one unit under its first agent. |
-| `$sort_project`, `$sort_worktree`, `$sort_tab` | Keys for the activity order below; not meant for display. |
-| `$idle` | On agent panes: how long the agent has been idle, once it is 15 minutes or more (`20m`, `3h`, `2d`). Unset while it works or waits, and while Herdr shows it as done (finished, not yet looked at). It is updated whenever the plugin runs, so after the next agent event anywhere rather than on the minute. |
+| `$sort_project`, `$sort_checkout`, `$sort_tab` | Keys for the activity order below; not meant for display. |
 | `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
-| `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the logo alone before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
@@ -114,8 +114,9 @@ A token with no PRs is cleared, so its separator disappears too.
 
 By default the plugin orders the Agents list by activity, the way
 [herdr-radar](https://github.com/hhdebb/herdr-radar) does: the project whose
-agent changed state most recently comes first, then within it the main checkout,
-then its worktrees and their split tabs, each by their latest change. The tree
+agent changed state most recently comes first, then within it its checkouts
+(main checkout and worktrees alike) and their split tabs, each by their latest
+change. The tree
 headers follow that order. Agents move when a turn ends or asks for input, not
 when one starts.
 
