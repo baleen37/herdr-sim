@@ -19,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGENT_ICON_TOKEN, AGENT_KINDS, Cache, PR_SUMMARY_TOKEN, PROJECT_TOKEN, PrState, Scope,
-    agent_count_value, agent_icon, claude_prs, codex_prs, project_name, scope, summary_value,
-    token_value, workspace_agent_token,
+    TITLE_TOKEN, agent_count_value, agent_icon, claude_session, codex_session, project_name, scope,
+    summary_value, token_value, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -193,18 +193,20 @@ impl Run {
             self.report("pane", pane, None, &icon);
             return;
         };
-        let urls = if kind == "claude" {
-            claude_prs(&self.home, session, &mut self.cache)
+        let session = if kind == "claude" {
+            claude_session(&self.home, session, &mut self.cache)
         } else {
-            codex_prs(&self.home, session, &mut self.cache)
+            codex_session(&self.home, session, &mut self.cache)
         };
         let mut counts: HashMap<PrState, usize> = HashMap::new();
-        for url in &urls {
+        for url in &session.prs {
             if let Some(state) = self.cache.state(url, self.now, gh_pr_state) {
                 *counts.entry(state).or_default() += 1;
             }
         }
-        self.report("pane", pane, Some(&counts), &icon);
+        let mut tokens = icon.to_vec();
+        tokens.push((TITLE_TOKEN.to_string(), session.title));
+        self.report("pane", pane, Some(&counts), &tokens);
     }
 
     /// Sets `tokens` on a pane or workspace (clearing those that are `None`),

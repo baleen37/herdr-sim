@@ -74,7 +74,7 @@ Agent and Space rows in Herdr's `config.toml`:
 [ui.sidebar.agents]
 rows = [
   ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "$project", bold = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
-  ["terminal_title_stripped"],
+  ["$title"],
 ]
 
 [ui.sidebar.spaces]
@@ -92,6 +92,7 @@ rows = [
 | `$pr_closed` | `` (git-pull-request-closed) |
 | `$project` | The repository the pane or Space works in. A linked worktree names its main repository (`search`, not `search-14527-status`); a directory outside git is named after itself, `~` for home. |
 | `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
+| `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
