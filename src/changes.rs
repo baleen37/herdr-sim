@@ -4,7 +4,6 @@
 //! agent panes. `--toggle-changes` opens it on the right or closes it.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -40,26 +39,31 @@ struct Pr {
 }
 
 /// Opens the Changes pane to the right of the focused pane, or closes it if it
-/// is already open in this workspace.
+/// is already open in this workspace. The panel is found by its process, so
+/// panes closed by hand or opened before an upgrade are handled too.
 pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
-    // One marker per workspace, so the key in one workspace never closes the
-    // panel open in another.
-    let workspace = std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
-    let marker = state_dir.join(format!(
-        "changes-pane-{}",
-        workspace.replace(['/', ':'], "_")
-    ));
-    if let Ok(pane) = fs::read_to_string(&marker) {
-        let pane = pane.trim();
-        let closed = Command::new(herdr)
-            .args(["plugin", "pane", "close", pane])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        let _ = fs::remove_file(&marker);
-        if closed {
-            return Ok(());
+    let workspace = workspace_id();
+    let mut open_now = changes_panes(herdr, workspace.as_deref());
+    // The panel's own note of its pane id, in case its process list was busy
+    // with a gh child when we looked.
+    if let Some(ws) = workspace.as_deref() {
+        let path = marker(state_dir, ws);
+        if let Ok(pane) = std::fs::read_to_string(&path) {
+            let _ = std::fs::remove_file(&path);
+            let exists = Command::new(herdr)
+                .args(["pane", "get", pane.trim()])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if exists && !open_now.iter().any(|p| p == pane.trim()) {
+                open_now.push(pane.trim().to_string());
+            }
         }
-        // The pane was already gone (closed by hand): open a new one.
+    }
+    if !open_now.is_empty() {
+        for pane in open_now {
+            let _ = Command::new(herdr).args(["pane", "close", &pane]).output();
+        }
+        return Ok(());
     }
     let mut open = Command::new(herdr);
     open.args(["plugin", "pane", "open", "--plugin", PLUGIN])
@@ -69,32 +73,77 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
     }
-    let out = open.output()?;
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    let pane = v
-        .pointer("/result/pane/pane_id")
-        .or_else(|| v.pointer("/result/pane_id"))
-        .and_then(Value::as_str);
-    if let Some(pane) = pane {
-        fs::write(&marker, pane)?;
-        // A side panel, not half the screen: move its edge right until it is
-        // about PANEL_COLS wide.
-        if let Some(amount) = shrink_amount(herdr, pane) {
-            let _ = Command::new(herdr)
-                .args([
-                    "pane",
-                    "resize",
-                    "--pane",
-                    pane,
-                    "--direction",
-                    "right",
-                    "--amount",
-                ])
-                .arg(format!("{amount:.3}"))
-                .output();
+    open.output()?;
+    // The panel's process starts just after the open returns; find it to size
+    // it as a side panel, not half the screen.
+    for _ in 0..20 {
+        if let Some(pane) = changes_panes(herdr, workspace.as_deref()).first() {
+            if let Some(amount) = shrink_amount(herdr, pane) {
+                let _ = Command::new(herdr)
+                    .args([
+                        "pane",
+                        "resize",
+                        "--pane",
+                        pane,
+                        "--direction",
+                        "right",
+                        "--amount",
+                    ])
+                    .arg(format!("{amount:.3}"))
+                    .output();
+            }
+            break;
         }
+        sleep(Duration::from_millis(50));
     }
     Ok(())
+}
+
+/// The workspace this run belongs to. Plugin panes and actions get it only
+/// inside `HERDR_PLUGIN_CONTEXT_JSON`; ordinary panes have `HERDR_WORKSPACE_ID`.
+fn workspace_id() -> Option<String> {
+    std::env::var("HERDR_WORKSPACE_ID").ok().or_else(|| {
+        let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+        let ctx: Value = serde_json::from_str(&ctx).ok()?;
+        ctx["workspace_id"].as_str().map(String::from)
+    })
+}
+
+/// Where the panel open in `workspace` notes its pane id.
+fn marker(state_dir: &Path, workspace: &str) -> std::path::PathBuf {
+    state_dir.join(format!(
+        "changes-pane-{}",
+        workspace.replace(['/', ':'], "_")
+    ))
+}
+
+/// Panes in `workspace` (or everywhere) running the Changes panel.
+fn changes_panes(herdr: &str, workspace: Option<&str>) -> Vec<String> {
+    let mut list = Command::new(herdr);
+    list.args(["pane", "list"]);
+    if let Some(ws) = workspace {
+        list.args(["--workspace", ws]);
+    }
+    let Some(v) = list
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+    else {
+        return Vec::new();
+    };
+    v["result"]["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["pane_id"].as_str())
+        .filter(|pane| {
+            Command::new(herdr)
+                .args(["pane", "process-info", "--pane", pane])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--changes-pane"))
+        })
+        .map(String::from)
+        .collect()
 }
 
 /// Width the panel aims for, in columns.
@@ -125,6 +174,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // write it back, so this pane cannot race the plugin's own runs.
     let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
     let mut prs: HashMap<String, (Instant, Option<Pr>)> = HashMap::new();
+    // Tell the toggle which pane is the panel in this workspace.
+    if let (Some(ws), Ok(pane)) = (workspace_id(), std::env::var("HERDR_PANE_ID")) {
+        let _ = std::fs::write(marker(state_dir, &ws), pane);
+    }
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -140,21 +193,28 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         let frame = match &last_agent {
             Some(agent) => {
                 let session = session_of(agent, home, &mut cache);
-                let mut list = Vec::new();
                 // Newest first, as in Claude Code's Changes panel.
-                for url in session
+                let list: Vec<String> = session
                     .as_ref()
-                    .map(|s| s.prs.iter().rev().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default()
-                {
-                    let fresh = prs.get(&url).is_some_and(|(at, pr)| {
-                        let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
-                        at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
-                    });
-                    if !fresh {
-                        prs.insert(url.clone(), (Instant::now(), fetch(&url)));
+                    .map(|s| s.prs.iter().rev().cloned().collect())
+                    .unwrap_or_default();
+                let stale: Vec<String> = list
+                    .iter()
+                    .filter(|url| {
+                        !prs.get(*url).is_some_and(|(at, pr)| {
+                            let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
+                            at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if !stale.is_empty() {
+                    let mut fetched = fetch_all(&stale);
+                    let now = Instant::now();
+                    for url in stale {
+                        let pr = fetched.remove(&url);
+                        prs.insert(url, (now, pr));
                     }
-                    list.push(url);
                 }
                 render(session.and_then(|s| s.title), &list, &prs)
             }
@@ -189,38 +249,84 @@ fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> 
     })
 }
 
-fn fetch(url: &str) -> Option<Pr> {
-    let fields = "title,number,state,isDraft,additions,deletions,comments,statusCheckRollup";
-    // The same 10 s deadline as the plugin's other gh calls: a stalled
-    // network must not freeze the panel.
-    let out = crate::gh(&["pr", "view", url, "--json", fields], None)?;
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let rollup = v["statusCheckRollup"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let passed = rollup
-        .iter()
-        .filter(|c| {
-            let r = c["conclusion"]
-                .as_str()
-                .or(c["state"].as_str())
-                .unwrap_or("");
-            matches!(r, "SUCCESS" | "NEUTRAL" | "SKIPPED")
+/// What the panel asks GitHub for each PR.
+const PR_FIELDS: &str = "title number state isDraft additions deletions \
+    comments { totalCount } \
+    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) \
+    { nodes { ... on CheckRun { conclusion } ... on StatusContext { state } } } } } } }";
+
+/// Details of every PR in `urls` in one GraphQL request (a PR per alias),
+/// instead of a `gh pr view` each. A repository the token cannot read only
+/// loses its own entries.
+fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
+    let safe = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+    };
+    let mut query = String::from("query {");
+    let mut asked = Vec::new();
+    for url in urls {
+        let parts: Vec<&str> = url.split('/').collect();
+        let (Some(owner), Some(repo), Some(number)) = (parts.get(3), parts.get(4), parts.get(6))
+        else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u64>() else {
+            continue;
+        };
+        if !safe(owner) || !safe(repo) {
+            continue;
+        }
+        query += &format!(
+            " p{}: repository(owner: \"{owner}\", name: \"{repo}\") {{ pullRequest(number: {number}) {{ {PR_FIELDS} }} }}",
+            asked.len()
+        );
+        asked.push(url.clone());
+    }
+    query += " }";
+    if asked.is_empty() {
+        return HashMap::new();
+    }
+    // The plugin's 10 s gh deadline: a stalled network must not freeze the panel.
+    let Some(out) = crate::gh(&["api", "graphql", "-f", &format!("query={query}")], None) else {
+        return HashMap::new();
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else {
+        return HashMap::new();
+    };
+    asked
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, url)| {
+            let pr = &v["data"][format!("p{i}")]["pullRequest"];
+            let title = pr["title"].as_str()?.to_string();
+            let checks: Vec<&str> =
+                pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| c["conclusion"].as_str().or(c["state"].as_str()))
+                    .collect();
+            let passed = checks
+                .iter()
+                .filter(|r| matches!(**r, "SUCCESS" | "NEUTRAL" | "SKIPPED"))
+                .count();
+            let parsed = Pr {
+                repo: url.split('/').nth(4).unwrap_or("").to_string(),
+                number: pr["number"].to_string(),
+                title,
+                state: pr["state"].as_str().unwrap_or("").to_string(),
+                draft: pr["isDraft"].as_bool().unwrap_or(false),
+                additions: pr["additions"].as_u64().unwrap_or(0),
+                deletions: pr["deletions"].as_u64().unwrap_or(0),
+                comments: pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize,
+                checks: (!checks.is_empty()).then_some((passed, checks.len())),
+                url: url.clone(),
+            };
+            Some((url, parsed))
         })
-        .count();
-    Some(Pr {
-        url: url.to_string(),
-        repo: url.split('/').nth(4).unwrap_or("").to_string(),
-        number: v["number"].to_string(),
-        title: v["title"].as_str().unwrap_or("").to_string(),
-        state: v["state"].as_str().unwrap_or("").to_string(),
-        draft: v["isDraft"].as_bool().unwrap_or(false),
-        additions: v["additions"].as_u64().unwrap_or(0),
-        deletions: v["deletions"].as_u64().unwrap_or(0),
-        comments: v["comments"].as_array().map_or(0, Vec::len),
-        checks: (!rollup.is_empty()).then_some((passed, rollup.len())),
-    })
+        .collect()
 }
 
 const GREEN: &str = "\x1b[38;2;166;227;161m";
