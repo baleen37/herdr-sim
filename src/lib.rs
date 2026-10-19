@@ -295,7 +295,7 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             let first_of_project = seen_projects.insert(place.project.clone());
             let first_of_checkout = seen_worktrees.insert(place.checkout.clone());
             let project = match (first_of_project, first_of_checkout) {
-                (true, _) => Some(format!("\u{f401} {}", place.project)),
+                (true, _) => Some(place.project.clone()),
                 (false, true) => Some(TREE_SPINE.to_string()),
                 (false, false) => None,
             };
@@ -1319,11 +1319,11 @@ mod tests {
         assert_eq!(
             headers,
             [
-                (some("\u{f401} search"), some("\u{f418} main")),
+                (some("search"), some("\u{f418} main")),
                 (None, None),
                 (some("│"), some("\u{f418} fix-x")),
                 (None, None),
-                (some("\u{f401} dotfiles"), some("\u{f418} main")),
+                (some("dotfiles"), some("\u{f418} main")),
             ]
         );
     }
