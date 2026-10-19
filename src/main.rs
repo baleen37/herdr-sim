@@ -49,10 +49,17 @@ fn main() -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     let pending = state_dir.join("pending");
     let lock = File::create(state_dir.join("lock"))?;
-    if lock.try_lock().is_err() {
-        // The running pass will pick this up when it finishes.
+    let startup = event.as_deref() == Some("startup");
+    if startup {
+        // A restarted server lost the metadata; this run must resend it itself.
+        lock.lock()?;
+    } else {
+        // Leave the note before trying the lock, so a holder that is about to
+        // release it still sees the note afterwards.
         fs::write(&pending, b"")?;
-        return Ok(());
+        if lock.try_lock().is_err() {
+            return Ok(());
+        }
     }
 
     let cache_path = state_dir.join("pr-cache.json");
@@ -62,7 +69,7 @@ fn main() -> Result<()> {
         now: 0,
         cache: Cache::load(&cache_path),
     };
-    if event.as_deref() == Some("startup") {
+    if startup {
         run.cache.forget_all_reported();
     }
     loop {
@@ -70,10 +77,13 @@ fn main() -> Result<()> {
         run.now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         run.pass(&scope);
         run.cache.save(&cache_path)?;
-        // Events that arrived meanwhile did not say which pane they were for.
-        if !pending.exists() {
+        lock.unlock()?;
+        // Notes left meanwhile do not say which pane they were for. If another
+        // run took the lock first, it handles them.
+        if !pending.exists() || lock.try_lock().is_err() {
             return Ok(());
         }
+        run.cache = Cache::load(&cache_path);
         scope = Scope::All;
     }
 }
