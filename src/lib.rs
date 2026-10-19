@@ -170,13 +170,17 @@ pub enum Scope {
     All,
     /// A turn ended in one pane: that pane and its workspace.
     Pane { pane: String, workspace: String },
-    /// A turn started: only state colours can have changed.
+    /// A turn started or a pane got focus: only state colours can have changed.
     Status,
 }
 
 /// Reads `HERDR_PLUGIN_EVENT` / `HERDR_PLUGIN_EVENT_JSON`. Anything it does
 /// not understand widens to [`Scope::All`] rather than missing an update.
 pub fn scope(event: Option<&str>, event_json: Option<&str>) -> Scope {
+    // Focus can only release a held tick.
+    if event == Some("pane.focused") {
+        return Scope::Status;
+    }
     if event != Some("pane.agent_status_changed") {
         return Scope::All;
     }
@@ -546,6 +550,25 @@ pub fn state_heading_token(status: &str, idle_secs: Option<u64>) -> &'static str
     }
 }
 
+/// The status a pane shows, and what it keeps holding, given Herdr's status,
+/// what it held before, and whether it has focus. As in herdr-radar, a
+/// finished turn keeps its tick until the pane is looked at (Herdr turns
+/// `done` into `idle` within seconds), and a question keeps its mark until the
+/// agent works again.
+pub fn held_status<'a>(
+    status: &'a str,
+    held: Option<&'a str>,
+    focused: bool,
+) -> (&'a str, Option<&'a str>) {
+    match (status, held) {
+        ("working", _) => ("working", None),
+        ("blocked", _) | ("idle", Some("blocked")) => ("blocked", Some("blocked")),
+        ("done" | "idle", _) if focused => ("idle", None),
+        ("done", _) | ("idle", Some("done")) => ("done", Some("done")),
+        _ => (status, None),
+    }
+}
+
 /// What herdr-sim knows about one agent session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Session {
@@ -762,6 +785,8 @@ pub struct Cache {
     /// Each pane's latest `$heading`, so a turn start can recolour it without
     /// rereading the session.
     headings: HashMap<String, String>,
+    /// The `done` or `blocked` each pane holds past Herdr's own status.
+    held: HashMap<String, String>,
 }
 
 /// The PR of a checked-out branch (`state` is `None` when there is none) and
@@ -843,6 +868,9 @@ impl Cache {
         let headings = object(&v["headings"])
             .filter_map(|(pane, v)| Some((pane.clone(), v.as_str()?.to_string())))
             .collect();
+        let held = object(&v["held"])
+            .filter_map(|(pane, v)| Some((pane.clone(), v.as_str()?.to_string())))
+            .collect();
         Self {
             prs,
             branches,
@@ -850,6 +878,7 @@ impl Cache {
             reported,
             places,
             headings,
+            held,
         }
     }
 
@@ -895,7 +924,7 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings, "held": self.held })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -952,6 +981,17 @@ impl Cache {
     /// The pane's latest heading, if one was computed.
     pub fn heading(&self, pane: &str) -> Option<String> {
         self.headings.get(pane).cloned()
+    }
+
+    pub fn held(&self, pane: &str) -> Option<&str> {
+        self.held.get(pane).map(String::as_str)
+    }
+
+    pub fn set_held(&mut self, pane: &str, held: Option<&str>) {
+        match held {
+            Some(held) => self.held.insert(pane.to_string(), held.to_string()),
+            None => self.held.remove(pane),
+        };
     }
 
     pub fn set_heading(&mut self, pane: &str, heading: String) {
@@ -1295,6 +1335,7 @@ mod tests {
             pane: "w:p1".into(),
             workspace: "w".into(),
         };
+        assert_eq!(scope(Some("pane.focused"), None), Scope::Status);
         assert_eq!(scope(ev, Some(idle)), pane);
         let wrapped = format!(r#"{{"event":{idle}}}"#);
         assert_eq!(scope(ev, Some(&wrapped)), pane);
@@ -1377,6 +1418,30 @@ mod tests {
                 (None, None),
                 (some("dotfiles"), some("\u{f418} main")),
             ]
+        );
+    }
+
+    #[test]
+    fn held_status_keeps_done_until_seen_and_blocked_until_working() {
+        assert_eq!(held_status("done", None, false), ("done", Some("done")));
+        assert_eq!(
+            held_status("idle", Some("done"), false),
+            ("done", Some("done"))
+        );
+        assert_eq!(held_status("idle", Some("done"), true), ("idle", None));
+        assert_eq!(held_status("done", None, true), ("idle", None));
+        assert_eq!(
+            held_status("idle", Some("blocked"), true),
+            ("blocked", Some("blocked"))
+        );
+        assert_eq!(
+            held_status("working", Some("blocked"), false),
+            ("working", None)
+        );
+        assert_eq!(held_status("idle", None, false), ("idle", None));
+        assert_eq!(
+            held_status("unknown", Some("done"), false),
+            ("unknown", None)
         );
     }
 
