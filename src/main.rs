@@ -17,6 +17,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +38,14 @@ use serde_json::{Value, json};
 
 /// Longest a single `gh` call may take before the run gives up on it.
 const GH_TIMEOUT: Duration = Duration::from_secs(10);
+/// GraphQL points per hour left to the user's own `gh` and agents: below
+/// this, the plugin stops asking until GitHub's budget resets.
+pub const GH_RESERVE: u64 = 1000;
+/// How long to stop after GitHub refuses a call for its rate limit.
+const GH_BACKOFF_SECS: u64 = 300;
+/// File holding the Unix time `gh` may be called again, shared by every run
+/// and the Changes pane.
+static GH_PAUSE: OnceLock<PathBuf> = OnceLock::new();
 
 struct Run {
     herdr: String,
@@ -57,6 +66,7 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
     fs::create_dir_all(&state_dir)?;
+    let _ = GH_PAUSE.set(state_dir.join("gh-pause"));
     // Present while the order is off; the toggle action flips it.
     let order_off = state_dir.join("order-off");
     let herdr_bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
@@ -667,7 +677,13 @@ fn gh_pr_state(url: &str) -> Option<PrState> {
 
 /// Runs `gh`, killing it after [`GH_TIMEOUT`] so a stalled network cannot hold
 /// the lock. Its output is a few hundred bytes, well under the pipe buffer.
+///
+/// While GitHub's rate limit is near, it returns `None` without calling, and
+/// callers keep what they cached.
 fn gh(args: &[&str], cwd: Option<&Path>) -> Option<Output> {
+    if gh_paused_until().is_some_and(|t| t > unix_now()) {
+        return None;
+    }
     let mut cmd = Command::new("gh");
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = cwd {
@@ -683,7 +699,36 @@ fn gh(args: &[&str], cwd: Option<&Path>) -> Option<Output> {
         }
         sleep(Duration::from_millis(20));
     }
-    child.wait_with_output().ok()
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success()
+        && String::from_utf8_lossy(&out.stderr)
+            .to_ascii_lowercase()
+            .contains("rate limit")
+    {
+        pause_gh(unix_now() + GH_BACKOFF_SECS);
+    }
+    Some(out)
+}
+
+/// Stops every `gh` call until Unix time `until`.
+pub fn pause_gh(until: u64) {
+    if let Some(path) = GH_PAUSE.get() {
+        let _ = fs::write(path, until.to_string());
+    }
+}
+
+fn gh_paused_until() -> Option<u64> {
+    fs::read_to_string(GH_PAUSE.get()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn run(program: &str, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) -> Result<Vec<u8>> {
