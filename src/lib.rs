@@ -147,11 +147,13 @@ fn pr_urls(text: &str) -> Vec<String> {
     urls
 }
 
-/// What one run learned, persisted for the next: PR states keyed by URL, and
-/// how far each session file has been read with the URLs found so far.
+/// What one run learned, persisted for the next: PR states keyed by URL, the
+/// PR state of each checked-out branch (`None`: the branch has no PR), and how
+/// far each session file has been read with the URLs found so far.
 #[derive(Default)]
 pub struct Cache {
     prs: HashMap<String, (PrState, u64)>,
+    branches: HashMap<String, (Option<PrState>, u64)>,
     files: HashMap<String, Scanned>,
 }
 
@@ -172,6 +174,12 @@ impl Cache {
                 Some((url.clone(), (state, v["at"].as_u64()?)))
             })
             .collect();
+        let branches = object(&v["branches"])
+            .filter_map(|(key, v)| {
+                let state = v["state"].as_str().and_then(PrState::parse);
+                Some((key.clone(), (state, v["at"].as_u64()?)))
+            })
+            .collect();
         let files = object(&v["files"])
             .filter_map(|(path, v)| {
                 let urls = v["urls"].as_array()?.iter().filter_map(|u| u.as_str());
@@ -182,7 +190,11 @@ impl Cache {
                 Some((path.clone(), scanned))
             })
             .collect();
-        Self { prs, files }
+        Self {
+            prs,
+            branches,
+            files,
+        }
     }
 
     /// Writes through a temporary file so a concurrent run never reads half of it.
@@ -192,13 +204,26 @@ impl Cache {
             .iter()
             .map(|(url, (state, at))| (url.clone(), json!({ "state": state.name(), "at": at })))
             .collect();
+        let branches: serde_json::Map<String, Value> = self
+            .branches
+            .iter()
+            .map(|(key, (state, at))| {
+                (
+                    key.clone(),
+                    json!({ "state": state.map(PrState::name), "at": at }),
+                )
+            })
+            .collect();
         let files: serde_json::Map<String, Value> = self
             .files
             .iter()
             .map(|(path, s)| (path.clone(), json!({ "offset": s.offset, "urls": s.urls })))
             .collect();
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        fs::write(&tmp, json!({ "prs": prs, "files": files }).to_string())?;
+        fs::write(
+            &tmp,
+            json!({ "prs": prs, "branches": branches, "files": files }).to_string(),
+        )?;
         fs::rename(&tmp, path)
     }
 
@@ -222,6 +247,32 @@ impl Cache {
                 Some(state)
             }
             None => cached.map(|(state, _)| state),
+        }
+    }
+
+    /// State of the PR for a checked-out branch, keyed by `key` (repo + branch).
+    /// Like [`Cache::state`], but a branch may have no PR yet, which is
+    /// re-checked as often as an open one. `fetch` returns `None` on failure,
+    /// `Some(None)` when the branch has no PR.
+    pub fn branch_state(
+        &mut self,
+        key: &str,
+        now: u64,
+        fetch: impl FnOnce() -> Option<Option<PrState>>,
+    ) -> Option<PrState> {
+        let cached = self.branches.get(key).copied();
+        if let Some((state, at)) = cached
+            && (matches!(state, Some(PrState::Merged | PrState::Closed))
+                || now.saturating_sub(at) < OPEN_TTL_SECS)
+        {
+            return state;
+        }
+        match fetch() {
+            Some(state) => {
+                self.branches.insert(key.to_string(), (state, now));
+                state
+            }
+            None => cached.and_then(|(state, _)| state),
         }
     }
 
@@ -467,13 +518,41 @@ mod tests {
     }
 
     #[test]
+    fn branch_state_rechecks_missing_and_open_prs_only() {
+        let mut cache = Cache::default();
+        assert_eq!(cache.branch_state("r#b", 0, || Some(None)), None);
+        assert_eq!(
+            cache.branch_state("r#b", 59, || panic!("fresh entry refetched")),
+            None
+        );
+        assert_eq!(
+            cache.branch_state("r#b", 60, || Some(Some(PrState::Open))),
+            Some(PrState::Open)
+        );
+        assert_eq!(cache.branch_state("r#b", 120, || None), Some(PrState::Open));
+        assert_eq!(
+            cache.branch_state("r#b", 180, || Some(Some(PrState::Merged))),
+            Some(PrState::Merged)
+        );
+        assert_eq!(
+            cache.branch_state("r#b", 99_999, || panic!("merged refetched")),
+            Some(PrState::Merged)
+        );
+    }
+
+    #[test]
     fn cache_round_trips_through_disk() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("cache.json");
         let mut cache = Cache::default();
         cache.state("u", 5, |_| Some(PrState::Closed));
+        cache.branch_state("r#b", 5, || Some(Some(PrState::Merged)));
         cache.save(&path).unwrap();
         let mut loaded = Cache::load(&path);
+        assert_eq!(
+            loaded.branch_state("r#b", 1_000, || panic!("not cached")),
+            Some(PrState::Merged)
+        );
         assert_eq!(
             loaded.state("u", 1_000, |_| panic!("not cached")),
             Some(PrState::Closed)

@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.1.0"
+version = "0.2.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -19,4 +19,13 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 # A finished turn is when a session may have created or pushed to a PR.
 [[events]]
 on = "pane.agent_status_changed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+
+# A new worktree workspace is a new branch row; show its PR right away.
+[[events]]
+on = "worktree.created"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+
+[[events]]
+on = "worktree.opened"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
