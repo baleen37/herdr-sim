@@ -18,11 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
+    AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
     PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN,
-    agent_count_value, agent_icon, agent_name, claude_session, codex_session, heading_value,
-    project_name, resolve_claude_session, scope, summary_value, token_value, tree_headers,
-    workspace_agent_token,
+    age_value, agent_count_value, agent_icon, agent_name, claude_session, codex_session,
+    heading_value, project_name, resolve_claude_session, scope, session_files, summary_value,
+    token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -133,6 +133,7 @@ impl Run {
                 let tokens = [
                     (TREE_PROJECT_TOKEN.to_string(), project),
                     (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                    (AGE_TOKEN.to_string(), self.age(agent)),
                 ];
                 self.report("pane", pane, "tree", None, &tokens);
             }
@@ -287,6 +288,21 @@ impl Run {
             self.cache.forget_reported(&key);
             eprintln!("herdr-sim: {id}: {err:#}");
         }
+    }
+
+    /// How long ago the agent's session file last changed.
+    fn age(&self, agent: &Value) -> Option<String> {
+        let kind = agent["agent"].as_str()?;
+        let mut session = agent["agent_session"]["value"].as_str()?.to_string();
+        if kind == "claude" {
+            session = resolve_claude_session(&self.home, &session);
+        }
+        let last = session_files(&self.home, kind, &session)
+            .iter()
+            .filter_map(|f| f.metadata().ok()?.modified().ok())
+            .max()?;
+        let secs = last.duration_since(UNIX_EPOCH).ok()?.as_secs();
+        Some(age_value(self.now.saturating_sub(secs)))
     }
 
     /// Where `cwd` sits in the tree, from the cache or one `git` call.
