@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.7.0"
+version = "0.8.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -15,6 +15,14 @@ command = ["sh", "herdr/install.sh"]
 
 [[startup]]
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+
+# Herdr disables its own Agents order toggle while a plugin's order is on, so
+# the plugin owns the way back. Bind it with a `plugin_action` key command.
+[[actions]]
+id = "toggle-order"
+title = "Agents: activity order on/off"
+description = "Switch the Agents list between activity order and Herdr's own."
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --toggle-order"]
 
 # A finished turn is when a session may have created or pushed to a PR.
 [[events]]

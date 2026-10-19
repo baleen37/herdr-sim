@@ -183,6 +183,89 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
         .collect()
 }
 
+/// Sidebar token marking the second and later agents of a split tab, referenced
+/// as `$tree_split`: `├─`, and `└─` on the last, so a split screen reads as one
+/// unit under its first agent.
+pub const TREE_SPLIT_TOKEN: &str = "tree_split";
+
+/// Split marks for agents listed in sidebar order, given each agent's tab.
+pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
+    (0..tabs.len())
+        .map(|i| {
+            if i == 0 || tabs[i - 1] != tabs[i] {
+                None
+            } else if tabs.get(i + 1) == Some(&tabs[i]) {
+                Some("├─")
+            } else {
+                Some("└─")
+            }
+        })
+        .collect()
+}
+
+/// Pane tokens the activity order sorts on, most recent first: the project,
+/// the worktree within it, the tab within that. The Agents view sorts tokens
+/// as strings, so each key is a zero-padded sequence number then a name that
+/// keeps groups with equal numbers apart.
+pub const SORT_TOKENS: [&str; 3] = ["sort_project", "sort_worktree", "sort_tab"];
+
+/// One agent as the activity order sees it.
+pub struct Activity {
+    pub place: Option<Place>,
+    pub tab: String,
+    /// Herdr's `state_change_seq`: higher changed state more recently.
+    pub seq: u64,
+}
+
+/// Sort keys for each agent; `None` for agents without a place, which the
+/// view then lists last. Each group ranks by its most recent agent. A
+/// project's main checkout always comes before its linked worktrees, so its
+/// agents never sit under a worktree header.
+pub fn sort_keys(agents: &[Activity]) -> Vec<Option<[String; 3]>> {
+    let mut latest: HashMap<String, u64> = HashMap::new();
+    let mut bump = |key: String, seq: u64| {
+        let latest = latest.entry(key).or_default();
+        *latest = (*latest).max(seq);
+    };
+    for agent in agents {
+        if let Some(place) = &agent.place {
+            bump(format!("p/{}", place.project), agent.seq);
+            if let Some(worktree) = &place.worktree {
+                bump(format!("w/{}/{worktree}", place.project), agent.seq);
+            }
+            bump(format!("t/{}", agent.tab), agent.seq);
+        }
+    }
+    agents
+        .iter()
+        .map(|agent| {
+            let place = agent.place.as_ref()?;
+            let key = |seq: u64, name: &str| format!("{seq:020}/{name}");
+            let project = key(latest[&format!("p/{}", place.project)], &place.project);
+            let worktree = match &place.worktree {
+                Some(w) => key(latest[&format!("w/{}/{w}", place.project)], w),
+                // Above any u64, so it sorts first in descending order.
+                None => "9".repeat(21),
+            };
+            let tab = key(latest[&format!("t/{}", agent.tab)], &agent.tab);
+            Some([project, worktree, tab])
+        })
+        .collect()
+}
+
+/// Indices of the agents in the order the view shows them: by the keys,
+/// descending, agents without keys last, ties in list order.
+pub fn activity_order(keys: &[Option<[String; 3]>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by(|&a, &b| match (&keys[a], &keys[b]) {
+        (Some(a), Some(b)) => b.cmp(a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    order
+}
+
 /// The agents herdr-sim knows, as Herdr agent ids.
 pub const AGENT_KINDS: [&str; 2] = ["claude", "codex"];
 
@@ -992,6 +1075,48 @@ mod tests {
                 (some("dotfiles"), some("└─ deploy")),
             ]
         );
+    }
+
+    #[test]
+    fn split_marks_branch_off_the_first_agent_of_a_tab() {
+        assert_eq!(
+            split_marks(&["t1", "t2", "t2", "t2", "t3", "t3"]),
+            [None, None, Some("├─"), Some("└─"), None, Some("└─")]
+        );
+    }
+
+    #[test]
+    fn activity_order_puts_recent_groups_first_and_main_checkouts_on_top() {
+        let at = |project: &str, worktree: Option<&str>, tab: &str, seq: u64| Activity {
+            place: Some(Place {
+                project: project.into(),
+                worktree: worktree.map(String::from),
+            }),
+            tab: tab.into(),
+            seq,
+        };
+        let agents = [
+            at("search", None, "t1", 1),
+            at("search", Some("status"), "t2", 9),
+            at("dotfiles", None, "t3", 5),
+            Activity {
+                place: None,
+                tab: "t4".into(),
+                seq: 20,
+            },
+            at("search", Some("batch"), "t5", 3),
+            at("search", Some("status"), "t6", 2),
+            at("search", Some("status"), "t2", 0),
+            // Two idle projects keep apart despite equal keys.
+            at("infra", None, "t7", 0),
+            at("api", None, "t8", 0),
+            at("infra", None, "t9", 0),
+        ];
+        let order = activity_order(&sort_keys(&agents));
+        // search (latest 9): main, then status (9: tab t2 then t6), then batch;
+        // dotfiles (5); the two idle projects, whose equal keys fall back to
+        // names; the agent without a place.
+        assert_eq!(order, [0, 1, 6, 5, 4, 2, 9, 7, 8, 3]);
     }
 
     #[test]

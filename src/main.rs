@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
@@ -18,12 +20,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
-    PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN,
-    agent_count_value, agent_icon, claude_session, codex_session, heading_value, project_name,
-    resolve_claude_session, scope, summary_value, token_value, tree_headers, workspace_agent_token,
+    AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
+    PROJECT_TOKEN, Place, PrState, SORT_TOKENS, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, agent_count_value, agent_icon,
+    claude_session, codex_session, heading_value, project_name, resolve_claude_session, scope,
+    sort_keys, split_marks, summary_value, token_value, tree_headers, workspace_agent_token,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Longest a single `gh` call may take before the run gives up on it.
 const GH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -31,6 +34,9 @@ const GH_TIMEOUT: Duration = Duration::from_secs(10);
 struct Run {
     herdr: String,
     home: PathBuf,
+    /// Present while the Agents list is in activity order; the
+    /// `--toggle-order` action removes and recreates it.
+    order_off: PathBuf,
     now: u64,
     cache: Cache,
 }
@@ -49,6 +55,19 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
     fs::create_dir_all(&state_dir)?;
+    let order_off = state_dir.join("order-off");
+    let toggle = env::args().any(|a| a == "--toggle-order");
+    if toggle {
+        if order_off.exists() {
+            fs::remove_file(&order_off)?;
+        } else {
+            fs::write(&order_off, b"")?;
+        }
+    }
+    // The view dies with the server, so startup sets it again.
+    if toggle || event.as_deref() == Some("startup") {
+        set_agent_view(!order_off.exists());
+    }
     let pending = state_dir.join("pending");
     let lock = File::create(state_dir.join("lock"))?;
     let startup = event.as_deref() == Some("startup");
@@ -68,6 +87,7 @@ fn main() -> Result<()> {
     let mut run = Run {
         herdr: env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()),
         home: PathBuf::from(env::var("HOME").context("HOME is not set")?),
+        order_off,
         now: 0,
         cache: Cache::load(&cache_path),
     };
@@ -121,20 +141,47 @@ impl Run {
             }
         }
 
-        // Project and worktree headers over the Agents list, which Herdr shows
-        // in the same order as `agent list` when sorted by Space.
-        let places: Vec<Option<Place>> = agents
+        // Project and worktree headers over the Agents list. Herdr shows it in
+        // the same order as `agent list` when sorted by Space; in activity
+        // order the view sorts on the keys set here, so the headers follow
+        // the same order.
+        let activity: Vec<Activity> = agents
             .iter()
-            .map(|agent| agent["cwd"].as_str().map(|cwd| self.place(cwd)))
+            .map(|agent| Activity {
+                place: agent["cwd"].as_str().map(|cwd| self.place(cwd)),
+                tab: agent["tab_id"].as_str().unwrap_or_default().to_string(),
+                seq: agent["state_change_seq"].as_u64().unwrap_or(0),
+            })
             .collect();
-        for (agent, (project, worktree)) in agents.iter().zip(tree_headers(&places)) {
-            if let Some(pane) = agent["pane_id"].as_str() {
-                let tokens = [
-                    (TREE_PROJECT_TOKEN.to_string(), project),
-                    (TREE_WORKTREE_TOKEN.to_string(), worktree),
-                ];
-                self.report("pane", pane, "tree", None, &tokens);
+        let ordered = !self.order_off.exists();
+        let keys = if ordered {
+            sort_keys(&activity)
+        } else {
+            vec![None; agents.len()]
+        };
+        let order = if ordered {
+            activity_order(&keys)
+        } else {
+            (0..agents.len()).collect()
+        };
+        let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
+        let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
+        let marks = split_marks(&tabs);
+        for (pos, (project, worktree)) in tree_headers(&places).into_iter().enumerate() {
+            let i = order[pos];
+            let Some(pane) = agents[i]["pane_id"].as_str() else {
+                continue;
+            };
+            let mut tokens = vec![
+                (TREE_PROJECT_TOKEN.to_string(), project),
+                (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
+            ];
+            for (n, name) in SORT_TOKENS.iter().enumerate() {
+                let value = keys[i].as_ref().map(|k| k[n].clone());
+                tokens.push((name.to_string(), value));
             }
+            self.report("pane", pane, "tree", None, &tokens);
         }
 
         // A workspace shows the PR of the branch checked out in its first pane
@@ -316,6 +363,46 @@ impl Run {
             .and_then(|out| serde_json::from_slice(&out).ok())
             .unwrap_or_default()
     }
+}
+
+/// Puts the Agents list in activity order (`on`), or back in Herdr's own.
+/// A failure only costs the order, so it is logged and the run goes on.
+fn set_agent_view(on: bool) {
+    let source = format!(
+        "plugin:{}",
+        env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| "baleen37.herdr-sim".into())
+    );
+    let (method, params) = if on {
+        let mut sort: Vec<Value> = SORT_TOKENS
+            .iter()
+            .map(|t| json!({"field": {"token": t}, "order": "desc"}))
+            .collect();
+        sort.push(json!({"field": "pane_order", "order": "asc"}));
+        let params = json!({"source": source, "label": "active", "sort": sort});
+        ("agent.view.set", params)
+    } else {
+        ("agent.view.clear", json!({"source": source}))
+    };
+    if let Err(err) = socket_call(method, params) {
+        eprintln!("herdr-sim: {method}: {err:#}");
+    }
+}
+
+/// One request over Herdr's socket, for the calls its CLI does not wrap. The
+/// server answers one newline-terminated JSON line and hangs up.
+fn socket_call(method: &str, params: Value) -> Result<Value> {
+    let path = env::var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set")?;
+    let mut stream = UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+    let request = json!({"id": "herdr-sim", "method": method, "params": params});
+    writeln!(stream, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let reply: Value = serde_json::from_str(&line)?;
+    if !reply["error"].is_null() {
+        bail!("{}", reply["error"]);
+    }
+    Ok(reply)
 }
 
 struct Repo {

@@ -78,7 +78,7 @@ agent_panel_sort = "spaces"
 rows = [
   [{ token = "$tree_project", bold = true }],
   [{ token = "$tree_worktree", dim = true }],
-  ["state_icon", "$heading"],
+  [{ token = "$tree_split", dim = true }, "state_icon", "$heading"],
   [{ token = "$branch", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
@@ -99,11 +99,36 @@ rows = [
 | `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
 | `$branch` | On agent panes: the branch checked out where the agent works (Herdr's own `branch` token is for Space rows only). Unset outside git or on a detached HEAD. |
 | `$tree_project`, `$tree_worktree` | A project → worktree tree over the Agents list (the structure follows [herdr-radar](https://github.com/hhdebb/herdr-radar)): the project name on the first agent of each project, `└─ <worktree dir>` on the first agent of each linked worktree. Use `agent_panel_sort = "spaces"` so groups stay together. |
+| `$tree_split` | `├─` on the second and later agents of a split tab, `└─` on the last, so a split screen reads as one unit under its first agent. |
+| `$sort_project`, `$sort_worktree`, `$sort_tab` | Keys for the activity order below; not meant for display. |
 | `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the logo alone before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
+
+## Activity order
+
+By default the plugin orders the Agents list by activity, the way
+[herdr-radar](https://github.com/hhdebb/herdr-radar) does: the project whose
+agent changed state most recently comes first, then within it the main checkout,
+then its worktrees and their split tabs, each by their latest change. The tree
+headers follow that order. Agents move when a turn ends or asks for input, not
+when one starts.
+
+Herdr turns off its own order toggle while a plugin's order is on. Switch back
+and forth with the `toggle-order` action, for example on a key:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "baleen37.herdr-sim.toggle-order"
+description = "agents: activity order on/off"
+```
+
+Only one plugin can order the Agents list at a time, so turn this off if
+herdr-radar's order is on.
 
 ## Caveats
 
