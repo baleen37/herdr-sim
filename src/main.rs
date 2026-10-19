@@ -20,11 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
-    PROJECT_TOKEN, Place, PrState, SORT_TOKENS, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, agent_count_value, agent_icon,
-    claude_session, codex_session, heading_value, project_name, resolve_claude_session, scope,
-    sort_keys, split_marks, summary_value, token_value, tree_headers, workspace_agent_token,
+    AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
+    DIFF_TOKEN, HEADING_TOKEN, IDLE_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
+    SORT_TOKENS, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN,
+    activity_order, agent_count_value, agent_icon, claude_session, codex_session, diff_value,
+    heading_value, idle_value, project_name, resolve_claude_session, scope, sort_keys, split_marks,
+    summary_value, token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -174,7 +175,11 @@ impl Run {
             let Some(pane) = agents[i]["pane_id"].as_str() else {
                 continue;
             };
+            let seq = activity[i].seq;
+            let idle_secs = self.cache.since_change(pane, seq, self.now);
+            let status = agents[i]["agent_status"].as_str().unwrap_or_default();
             let mut tokens = vec![
+                (IDLE_TOKEN.to_string(), idle_value(status, idle_secs)),
                 (TREE_PROJECT_TOKEN.to_string(), project),
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
@@ -186,10 +191,15 @@ impl Run {
             self.report("pane", pane, "tree", None, &tokens);
         }
 
+        self.cache
+            .keep_changes(agents.iter().filter_map(|a| a["pane_id"].as_str()));
+
         // A workspace shows the PR of the branch checked out in its first pane
         // that sits in a git repository, and the logos of its agents.
         let panes = self.json(&["pane", "list"]);
         let mut branch_prs: HashMap<String, HashMap<PrState, usize>> = HashMap::new();
+        let mut cis: HashMap<String, Ci> = HashMap::new();
+        let mut diffs: HashMap<String, String> = HashMap::new();
         let mut projects: HashMap<String, String> = HashMap::new();
         let mut order = Vec::new();
         for pane in panes["result"]["panes"].as_array().into_iter().flatten() {
@@ -213,15 +223,24 @@ impl Run {
                 continue;
             };
             projects.insert(workspace.to_string(), repo.project);
+            if let Some(diff) = git_diff(&repo.top) {
+                diffs.insert(workspace.to_string(), diff);
+            }
             let Some(branch) = repo.branch else {
                 branch_prs.insert(workspace.to_string(), HashMap::new());
                 continue;
             };
             let repo = repo.top;
             let key = format!("{repo}#{branch}");
-            let counts = self
+            let pr = self
                 .cache
-                .branch_state(&key, self.now, || gh_branch_pr_state(&repo, &branch))
+                .branch_state(&key, self.now, || gh_branch_pr(&repo, &branch));
+            // Checks only matter while the PR is open.
+            if let (Some(PrState::Open), Some(ci)) = (pr.state, pr.ci) {
+                cis.insert(workspace.to_string(), ci);
+            }
+            let counts = pr
+                .state
                 .map(|state| HashMap::from([(state, 1)]))
                 .unwrap_or_default();
             branch_prs.insert(workspace.to_string(), counts);
@@ -236,6 +255,9 @@ impl Run {
                 })
                 .collect();
             tokens.push((PROJECT_TOKEN.into(), projects.remove(&workspace)));
+            tokens.push((DIFF_TOKEN.into(), diffs.remove(&workspace)));
+            let ci = cis.remove(&workspace).map(|ci| ci.icon().to_string());
+            tokens.push((CI_TOKEN.into(), ci));
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
             self.report("workspace", &workspace, "space", Some(&prs), &tokens);
         }
@@ -465,10 +487,11 @@ fn dir_name(cwd: &str, home: &Path) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
-/// `Some(None)` when the branch has no PR; `None` when `gh` fails otherwise.
-fn gh_branch_pr_state(repo: &str, branch: &str) -> Option<Option<PrState>> {
+/// The branch's PR and its checks, empty when the branch has no PR; `None`
+/// when `gh` fails otherwise.
+fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
     let out = gh(
-        &["pr", "view", branch, "--json", "state"],
+        &["pr", "view", branch, "--json", "state,statusCheckRollup"],
         Some(Path::new(repo)),
     )?;
     if !out.status.success() {
@@ -476,10 +499,24 @@ fn gh_branch_pr_state(repo: &str, branch: &str) -> Option<Option<PrState>> {
         return stderr
             .to_ascii_lowercase()
             .contains("no pull requests found")
-            .then_some(None);
+            .then(BranchPr::default);
     }
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(PrState::parse(v["state"].as_str()?))
+    Some(BranchPr {
+        state: Some(PrState::parse(v["state"].as_str()?)?),
+        ci: Ci::from_rollup(&v["statusCheckRollup"]),
+    })
+}
+
+/// Uncommitted changes in the checkout at `top` as `$diff`; `None` when clean
+/// or when `git` fails.
+fn git_diff(top: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", top, "diff", "--shortstat", "HEAD"])
+        .output()
+        .ok()?;
+    out.status.success().then_some(())?;
+    diff_value(&String::from_utf8_lossy(&out.stdout))
 }
 
 fn gh_pr_state(url: &str) -> Option<PrState> {

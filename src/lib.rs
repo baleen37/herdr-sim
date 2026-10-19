@@ -57,6 +57,106 @@ impl PrState {
     }
 }
 
+/// Combined state of a PR's checks, shown as `$ci` on Space rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci {
+    Pass,
+    Fail,
+    Pending,
+}
+
+/// Sidebar token for the CI state of a Space's branch PR, referenced as `$ci`.
+pub const CI_TOKEN: &str = "ci";
+
+impl Ci {
+    /// From `gh pr view --json statusCheckRollup`: any failure fails, else
+    /// anything unfinished is pending; `None` when there are no checks.
+    pub fn from_rollup(rollup: &Value) -> Option<Self> {
+        let checks = rollup.as_array().filter(|c| !c.is_empty())?;
+        let mut pending = false;
+        for check in checks {
+            // Check runs report status + conclusion, commit statuses a state.
+            let result = check["conclusion"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .or_else(|| check["state"].as_str())
+                .unwrap_or_default();
+            match result {
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+                | "STARTUP_FAILURE" => return Some(Self::Fail),
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+                _ => pending = true,
+            }
+        }
+        Some(if pending { Self::Pending } else { Self::Pass })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Pending => "pending",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        [Self::Pass, Self::Fail, Self::Pending]
+            .into_iter()
+            .find(|c| c.name() == s)
+    }
+
+    /// Nerd Font Octicons glyph: check, x, dot-fill.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Pass => "\u{f42e}",
+            Self::Fail => "\u{f467}",
+            Self::Pending => "\u{f444}",
+        }
+    }
+}
+
+/// Sidebar token with uncommitted changes in a Space's checkout, referenced as
+/// `$diff`: `+12 -3`, from `git diff --shortstat HEAD`. Unset when clean.
+pub const DIFF_TOKEN: &str = "diff";
+
+/// `+<insertions> -<deletions>` from `git diff --shortstat` output, leaving
+/// out a zero side; `None` when nothing changed.
+pub fn diff_value(shortstat: &str) -> Option<String> {
+    let count = |word: &str| {
+        shortstat
+            .split(',')
+            .find(|part| part.contains(word))
+            .and_then(|part| part.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    match (count("insertion"), count("deletion")) {
+        (0, 0) => None,
+        (added, 0) => Some(format!("+{added}")),
+        (0, removed) => Some(format!("-{removed}")),
+        (added, removed) => Some(format!("+{added} -{removed}")),
+    }
+}
+
+/// Sidebar token for how long an idle agent has been idle, referenced as
+/// `$idle`: `20m`, `3h`, `2d`. Unset while it works, waits, or is done and
+/// unseen, and for its first [`IDLE_AFTER_SECS`].
+pub const IDLE_TOKEN: &str = "idle";
+
+/// Idle time below which `$idle` stays unset.
+pub const IDLE_AFTER_SECS: u64 = 15 * 60;
+
+pub fn idle_value(status: &str, idle_secs: u64) -> Option<String> {
+    if status != "idle" || idle_secs < IDLE_AFTER_SECS {
+        return None;
+    }
+    let minutes = idle_secs / 60;
+    Some(match minutes {
+        m if m < 60 => format!("{m}m"),
+        m if m < 48 * 60 => format!("{}h", m / 60),
+        m => format!("{}d", m / (24 * 60)),
+    })
+}
+
 /// Sidebar token holding the agent's logo, referenced as `$agent_icon`.
 pub const AGENT_ICON_TOKEN: &str = "agent_icon";
 
@@ -488,12 +588,23 @@ fn pr_urls(text: &str) -> Vec<String> {
 #[derive(Default)]
 pub struct Cache {
     prs: HashMap<String, (PrState, u64)>,
-    branches: HashMap<String, (Option<PrState>, u64)>,
+    branches: HashMap<String, (BranchPr, u64)>,
     files: HashMap<String, Scanned>,
     reported: HashMap<String, String>,
     /// Where each directory sits in the tree; a checkout's project and
     /// worktree do not change, so this saves a `git` call per agent per run.
     places: HashMap<String, Place>,
+    /// Each agent pane's last `state_change_seq` and when this plugin first
+    /// saw it, for `$idle`.
+    changes: HashMap<String, (u64, u64)>,
+}
+
+/// The PR of a checked-out branch (`state` is `None` when there is none) and
+/// its checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BranchPr {
+    pub state: Option<PrState>,
+    pub ci: Option<Ci>,
 }
 
 #[derive(Default)]
@@ -523,8 +634,11 @@ impl Cache {
             .collect();
         let branches = object(&v["branches"])
             .filter_map(|(key, v)| {
-                let state = v["state"].as_str().and_then(PrState::parse);
-                Some((key.clone(), (state, v["at"].as_u64()?)))
+                let pr = BranchPr {
+                    state: v["state"].as_str().and_then(PrState::parse),
+                    ci: v["ci"].as_str().and_then(Ci::parse),
+                };
+                Some((key.clone(), (pr, v["at"].as_u64()?)))
             })
             .collect();
         let files = object(&v["files"])
@@ -556,6 +670,9 @@ impl Cache {
         Self {
             prs,
             branches,
+            changes: object(&v["changes"])
+                .filter_map(|(pane, v)| Some((pane.clone(), (v[0].as_u64()?, v[1].as_u64()?))))
+                .collect(),
             files,
             reported,
             places,
@@ -572,11 +689,13 @@ impl Cache {
         let branches: serde_json::Map<String, Value> = self
             .branches
             .iter()
-            .map(|(key, (state, at))| {
-                (
-                    key.clone(),
-                    json!({ "state": state.map(PrState::name), "at": at }),
-                )
+            .map(|(key, (pr, at))| {
+                let entry = json!({
+                    "state": pr.state.map(PrState::name),
+                    "ci": pr.ci.map(Ci::name),
+                    "at": at,
+                });
+                (key.clone(), entry)
             })
             .collect();
         let files: serde_json::Map<String, Value> = self
@@ -602,7 +721,7 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "changes": self.changes })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -631,30 +750,45 @@ impl Cache {
         }
     }
 
-    /// State of the PR for a checked-out branch, keyed by `key` (repo + branch).
-    /// Like [`Cache::state`], but a branch may have no PR yet, which is
-    /// re-checked as often as an open one. `fetch` returns `None` on failure,
-    /// `Some(None)` when the branch has no PR.
+    /// The PR for a checked-out branch and its checks, keyed by `key` (repo +
+    /// branch). Like [`Cache::state`], but a branch may have no PR yet, which
+    /// is re-checked as often as an open one. `fetch` returns `None` on failure.
     pub fn branch_state(
         &mut self,
         key: &str,
         now: u64,
-        fetch: impl FnOnce() -> Option<Option<PrState>>,
-    ) -> Option<PrState> {
+        fetch: impl FnOnce() -> Option<BranchPr>,
+    ) -> BranchPr {
         let cached = self.branches.get(key).copied();
-        if let Some((state, at)) = cached
-            && (matches!(state, Some(PrState::Merged | PrState::Closed))
+        if let Some((pr, at)) = cached
+            && (matches!(pr.state, Some(PrState::Merged | PrState::Closed))
                 || now.saturating_sub(at) < OPEN_TTL_SECS)
         {
-            return state;
+            return pr;
         }
         match fetch() {
-            Some(state) => {
-                self.branches.insert(key.to_string(), (state, now));
-                state
+            Some(pr) => {
+                self.branches.insert(key.to_string(), (pr, now));
+                pr
             }
-            None => cached.and_then(|(state, _)| state),
+            None => cached.map(|(pr, _)| pr).unwrap_or_default(),
         }
+    }
+
+    /// Seconds since `pane`'s state last changed, as far as this plugin has
+    /// seen: a `seq` it has not seen before starts the clock at `now`.
+    pub fn since_change(&mut self, pane: &str, seq: u64, now: u64) -> u64 {
+        let entry = self.changes.entry(pane.to_string()).or_insert((seq, now));
+        if entry.0 != seq {
+            *entry = (seq, now);
+        }
+        now.saturating_sub(entry.1)
+    }
+
+    /// Forgets the change records of panes not in `panes`.
+    pub fn keep_changes<'a>(&mut self, panes: impl IntoIterator<Item = &'a str>) {
+        let panes: std::collections::HashSet<&str> = panes.into_iter().collect();
+        self.changes.retain(|pane, _| panes.contains(pane.as_str()));
     }
 
     /// The cached tree place of `cwd`, if any.
@@ -1158,25 +1292,71 @@ mod tests {
 
     #[test]
     fn branch_state_rechecks_missing_and_open_prs_only() {
+        let pr = |state, ci| BranchPr { state, ci };
+        let open = pr(Some(PrState::Open), Some(Ci::Pending));
+        let merged = pr(Some(PrState::Merged), Some(Ci::Pass));
         let mut cache = Cache::default();
-        assert_eq!(cache.branch_state("r#b", 0, || Some(None)), None);
         assert_eq!(
-            cache.branch_state("r#b", 59, || panic!("fresh entry refetched")),
+            cache.branch_state("r#b", 0, || Some(pr(None, None))).state,
             None
         );
         assert_eq!(
-            cache.branch_state("r#b", 60, || Some(Some(PrState::Open))),
-            Some(PrState::Open)
+            cache.branch_state("r#b", 59, || panic!("fresh entry refetched")),
+            pr(None, None)
         );
-        assert_eq!(cache.branch_state("r#b", 120, || None), Some(PrState::Open));
-        assert_eq!(
-            cache.branch_state("r#b", 180, || Some(Some(PrState::Merged))),
-            Some(PrState::Merged)
-        );
+        assert_eq!(cache.branch_state("r#b", 60, || Some(open)), open);
+        assert_eq!(cache.branch_state("r#b", 120, || None), open);
+        assert_eq!(cache.branch_state("r#b", 180, || Some(merged)), merged);
         assert_eq!(
             cache.branch_state("r#b", 99_999, || panic!("merged refetched")),
-            Some(PrState::Merged)
+            merged
         );
+    }
+
+    #[test]
+    fn ci_fails_on_any_failure_then_waits_on_unfinished_checks() {
+        let rollup = |items: Value| Ci::from_rollup(&items);
+        assert_eq!(rollup(json!([])), None);
+        assert_eq!(rollup(Value::Null), None);
+        let pass = json!({"status": "COMPLETED", "conclusion": "SUCCESS"});
+        let skipped = json!({"status": "COMPLETED", "conclusion": "SKIPPED"});
+        let running = json!({"status": "IN_PROGRESS", "conclusion": ""});
+        let failed = json!({"status": "COMPLETED", "conclusion": "FAILURE"});
+        let status_ok = json!({"state": "SUCCESS"});
+        let status_pending = json!({"state": "PENDING"});
+        assert_eq!(rollup(json!([pass, skipped, status_ok])), Some(Ci::Pass));
+        assert_eq!(rollup(json!([pass, running])), Some(Ci::Pending));
+        assert_eq!(rollup(json!([pass, status_pending])), Some(Ci::Pending));
+        assert_eq!(rollup(json!([running, failed])), Some(Ci::Fail));
+    }
+
+    #[test]
+    fn diff_value_reads_git_shortstat() {
+        let stat = " 3 files changed, 12 insertions(+), 3 deletions(-)";
+        assert_eq!(diff_value(stat).unwrap(), "+12 -3");
+        assert_eq!(diff_value(" 1 file changed, 1 insertion(+)").unwrap(), "+1");
+        assert_eq!(diff_value(" 1 file changed, 4 deletions(-)").unwrap(), "-4");
+        assert_eq!(diff_value(""), None);
+    }
+
+    #[test]
+    fn idle_shows_only_for_long_idle_agents() {
+        assert_eq!(idle_value("idle", 14 * 60), None);
+        assert_eq!(idle_value("idle", 15 * 60).unwrap(), "15m");
+        assert_eq!(idle_value("idle", 3 * 3600 + 59).unwrap(), "3h");
+        assert_eq!(idle_value("idle", 3 * 86400).unwrap(), "3d");
+        assert_eq!(idle_value("done", 3 * 86400), None);
+        assert_eq!(idle_value("working", 3 * 86400), None);
+    }
+
+    #[test]
+    fn since_change_restarts_the_clock_on_a_new_seq() {
+        let mut cache = Cache::default();
+        assert_eq!(cache.since_change("p", 4, 100), 0);
+        assert_eq!(cache.since_change("p", 4, 160), 60);
+        assert_eq!(cache.since_change("p", 5, 200), 0);
+        cache.keep_changes(["q"]);
+        assert_eq!(cache.since_change("p", 5, 300), 0);
     }
 
     #[test]
@@ -1185,13 +1365,19 @@ mod tests {
         let path = dir.path().join("cache.json");
         let mut cache = Cache::default();
         cache.state("u", 5, |_| Some(PrState::Closed));
-        cache.branch_state("r#b", 5, || Some(Some(PrState::Merged)));
+        let merged = BranchPr {
+            state: Some(PrState::Merged),
+            ci: Some(Ci::Fail),
+        };
+        cache.branch_state("r#b", 5, || Some(merged));
+        cache.since_change("p", 7, 5);
         cache.save(&path).unwrap();
         let mut loaded = Cache::load(&path);
         assert_eq!(
             loaded.branch_state("r#b", 1_000, || panic!("not cached")),
-            Some(PrState::Merged)
+            merged
         );
+        assert_eq!(loaded.since_change("p", 7, 65), 60);
         assert_eq!(
             loaded.state("u", 1_000, |_| panic!("not cached")),
             Some(PrState::Closed)

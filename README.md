@@ -25,10 +25,10 @@ in its first pane that is inside a git repository.
 
 ## Load
 
-A finished turn only revisits its own pane and workspace: four short process
-calls when nothing changed (`herdr agent list`, `herdr pane list`, and one
-`git rev-parse` each for the pane and its Space), and no `report-metadata` call
-unless a token changed. A
+A finished turn only revisits its own pane and workspace: five short process
+calls when nothing changed (`herdr agent list`, `herdr pane list`, one
+`git rev-parse` each for the pane and its Space, and `git diff --shortstat` for
+the Space), and no `report-metadata` call unless a token changed. A
 started turn exits at once. Runs never overlap: one that finds another in
 progress leaves a note, and the running one does a single extra pass. `gh` calls
 are cached as below and killed after 10 seconds.
@@ -78,14 +78,14 @@ agent_panel_sort = "spaces"
 rows = [
   [{ token = "$tree_project", bold = true }],
   [{ token = "$tree_worktree", dim = true }],
-  [{ token = "$tree_split", dim = true }, "state_icon", "$heading"],
+  [{ token = "$tree_split", dim = true }, "state_icon", "$heading", { token = "$idle", dim = true }],
   [{ token = "$branch", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", { token = "$project", bold = true }, { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
-  ["branch", "git_status", { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+  ["branch", "git_status", { token = "$diff", dim = true }, { token = "$ci", rules = [{ starts_with = "\uF42E", fg = "#a6e3a1" }, { starts_with = "\uF467", fg = "#f38ba8" }, { starts_with = "\uF444", fg = "#f9e2af" }] }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
 
@@ -101,6 +101,9 @@ rows = [
 | `$tree_project`, `$tree_worktree` | A project → worktree tree over the Agents list (the structure follows [herdr-radar](https://github.com/hhdebb/herdr-radar)): the project name on the first agent of each project, `└─ <worktree dir>` on the first agent of each linked worktree. Use `agent_panel_sort = "spaces"` so groups stay together. |
 | `$tree_split` | `├─` on the second and later agents of a split tab, `└─` on the last, so a split screen reads as one unit under its first agent. |
 | `$sort_project`, `$sort_worktree`, `$sort_tab` | Keys for the activity order below; not meant for display. |
+| `$idle` | On agent panes: how long the agent has been idle, once it is 15 minutes or more (`20m`, `3h`, `2d`). Unset while it works or waits, and while Herdr shows it as done (finished, not yet looked at). It is updated whenever the plugin runs, so after the next agent event anywhere rather than on the minute. |
+| `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
+| `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the logo alone before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
