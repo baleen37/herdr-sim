@@ -95,8 +95,14 @@ impl Run {
             _ => (None, None),
         };
         // One list serves both the pane pass and each Space's agent count.
-        let agents = self.json(&["agent", "list"])["result"]["agents"].take();
-        let agents = agents.as_array().cloned().unwrap_or_default();
+        // Without the list every Space would look agent-free; change nothing.
+        let Some(agents) = self.json(&["agent", "list"])["result"]["agents"]
+            .take()
+            .as_array()
+            .cloned()
+        else {
+            return;
+        };
         let mut per_workspace: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for agent in &agents {
             if let (Some(workspace), Some(kind)) =
