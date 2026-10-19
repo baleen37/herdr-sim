@@ -63,7 +63,7 @@ Agent and Space rows in Herdr's `config.toml`:
 ```toml
 [ui.sidebar.agents]
 rows = [
-  ["state_icon", { token = "workspace", bold = true }, { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
+  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "workspace", bold = true }, { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
   ["terminal_title_stripped"],
 ]
 
@@ -79,6 +79,7 @@ rows = [
 | `$pr_open` | `` (git-pull-request), followed by a count when more than one (agents only) |
 | `$pr_merged` | `` (git-merge) |
 | `$pr_closed` | `` (git-pull-request-closed) |
+| `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
 
