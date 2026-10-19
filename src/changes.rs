@@ -42,7 +42,13 @@ struct Pr {
 /// Opens the Changes pane to the right of the focused pane, or closes it if it
 /// is already open in this workspace.
 pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
-    let marker = state_dir.join("changes-pane");
+    // One marker per workspace, so the key in one workspace never closes the
+    // panel open in another.
+    let workspace = std::env::var("HERDR_WORKSPACE_ID").unwrap_or_default();
+    let marker = state_dir.join(format!(
+        "changes-pane-{}",
+        workspace.replace(['/', ':'], "_")
+    ));
     if let Ok(pane) = fs::read_to_string(&marker) {
         let pane = pane.trim();
         let closed = Command::new(herdr)
@@ -185,11 +191,9 @@ fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> 
 
 fn fetch(url: &str) -> Option<Pr> {
     let fields = "title,number,state,isDraft,additions,deletions,comments,statusCheckRollup";
-    let out = Command::new("gh")
-        .args(["pr", "view", url, "--json", fields])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    // The same 10 s deadline as the plugin's other gh calls: a stalled
+    // network must not freeze the panel.
+    let out = crate::gh(&["pr", "view", url, "--json", fields], None)?;
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
     let rollup = v["statusCheckRollup"]
         .as_array()
