@@ -234,12 +234,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     });
                 }
                 // With no PR yet, what the checkout has changed instead.
-                let diff = if list.is_empty() {
-                    agent["cwd"].as_str().and_then(local_diff)
-                } else {
-                    None
-                };
-                render(&list, &prs, diff)
+                let cwd = agent["cwd"].as_str().filter(|_| list.is_empty());
+                let diff = cwd.and_then(local_diff);
+                let compare = diff.as_ref().and(cwd).and_then(compare_url);
+                render(&list, &prs, diff, compare)
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -451,9 +449,9 @@ const RESET: &str = "\x1b[0m";
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(urls: &[String], prs: &Prs, diff: Option<String>) -> String {
+fn render(urls: &[String], prs: &Prs, diff: Option<String>, compare: Option<String>) -> String {
     let width = columns().saturating_sub(1).max(20);
-    let mut s = format!("{BOLD}Changes{RESET}\n\n");
+    let mut s = format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n\n");
     if urls.is_empty() {
         s += &match diff {
             Some(diff) => {
@@ -464,7 +462,18 @@ fn render(urls: &[String], prs: &Prs, diff: Option<String>) -> String {
                         format!("{c}{n}{RESET}")
                     })
                     .collect();
-                format!("{DIM}\u{f4d2}{RESET} {}\n", lines.join(" "))
+                // "Create PR" opens GitHub's compare page for the branch.
+                let button = "\u{f407} Create PR";
+                let button = match compare {
+                    Some(url) => format!("\x1b]8;;{url}\x1b\\{button}\x1b]8;;\x1b\\"),
+                    None => button.to_string(),
+                };
+                let gap = width.saturating_sub(2 + cols(&diff) + 11).max(1);
+                format!(
+                    "{DIM}\u{f4d2}{RESET} {}{}{DIM}{button}{RESET}\n",
+                    lines.join(" "),
+                    " ".repeat(gap)
+                )
             }
             None => format!("{DIM}No changes.{RESET}\n"),
         };
@@ -487,10 +496,13 @@ fn render(urls: &[String], prs: &Prs, diff: Option<String>) -> String {
             _ => ("\u{f407}", GREEN),
         };
         // OSC 8 makes the title a link to the PR.
-        let title = cut(&pr.title, width - 2);
+        // Title, then the row's menu mark at the right edge.
+        let title = cut(&pr.title, width - 4);
+        let gap = (width - 3).saturating_sub(cols(&title)).max(1);
         s += &format!(
-            "{colour}{icon}{RESET} \x1b]8;;{}\x1b\\{title}\x1b]8;;\x1b\\\n",
-            pr.url
+            "{colour}{icon}{RESET} \x1b]8;;{}\x1b\\{title}\x1b]8;;\x1b\\{}{DIM}\u{f142}{RESET}\n",
+            pr.url,
+            " ".repeat(gap)
         );
         let mut left = format!("{DIM}{} #{}{RESET}", pr.repo, pr.number);
         let mut left_cols = cols(&pr.repo) + 2 + pr.number.len();
@@ -533,6 +545,29 @@ fn local_diff(cwd: &str) -> Option<String> {
         .output()
         .ok()?;
     diff_value(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// GitHub's page for opening a PR from the branch checked out at `cwd`.
+fn compare_url(cwd: &str) -> Option<String> {
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .ok()?;
+        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!s.is_empty()).then_some(s)
+    };
+    let remote = git(&["remote", "get-url", "origin"])?;
+    let repo = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("https://github.com/"))?
+        .trim_end_matches(".git");
+    let branch = git(&["branch", "--show-current"])?;
+    Some(format!(
+        "https://github.com/{repo}/compare/{branch}?expand=1"
+    ))
 }
 
 /// The pane's width in columns, from the terminal it runs in.
