@@ -18,8 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, Cache, PR_SUMMARY_TOKEN, PrState, Scope, agent_count_value,
-    agent_icon, claude_prs, codex_prs, scope, summary_value, token_value, workspace_agent_token,
+    AGENT_ICON_TOKEN, AGENT_KINDS, Cache, PR_SUMMARY_TOKEN, PROJECT_TOKEN, PrState, Scope,
+    agent_count_value, agent_icon, claude_prs, codex_prs, project_name, scope, summary_value,
+    token_value, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -123,6 +124,7 @@ impl Run {
         // that sits in a git repository, and the logos of its agents.
         let panes = self.json(&["pane", "list"]);
         let mut branch_prs: HashMap<String, HashMap<PrState, usize>> = HashMap::new();
+        let mut projects: HashMap<String, String> = HashMap::new();
         let mut order = Vec::new();
         for pane in panes["result"]["panes"].as_array().into_iter().flatten() {
             let (Some(workspace), Some(cwd)) =
@@ -135,13 +137,21 @@ impl Run {
             }
             if !order.iter().any(|w| w == workspace) {
                 order.push(workspace.to_string());
+                // Until a pane in a repository turns up, name it after the directory.
+                projects.insert(workspace.to_string(), dir_name(cwd, &self.home));
             }
             if branch_prs.contains_key(workspace) {
                 continue;
             }
-            let Some((repo, branch)) = git_branch(cwd) else {
+            let Some(repo) = git_repo(cwd) else {
                 continue;
             };
+            projects.insert(workspace.to_string(), repo.project);
+            let Some(branch) = repo.branch else {
+                branch_prs.insert(workspace.to_string(), HashMap::new());
+                continue;
+            };
+            let repo = repo.top;
             let key = format!("{repo}#{branch}");
             let counts = self
                 .cache
@@ -152,13 +162,14 @@ impl Run {
         }
         for workspace in order {
             let kinds = per_workspace.get(&workspace);
-            let tokens: Vec<(String, Option<String>)> = AGENT_KINDS
+            let mut tokens: Vec<(String, Option<String>)> = AGENT_KINDS
                 .iter()
                 .map(|kind| {
                     let count = kinds.and_then(|k| k.get(*kind)).copied().unwrap_or(0);
                     (workspace_agent_token(kind), agent_count_value(kind, count))
                 })
                 .collect();
+            tokens.push((PROJECT_TOKEN.into(), projects.remove(&workspace)));
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
             self.report("workspace", &workspace, Some(&prs), &tokens);
         }
@@ -169,7 +180,14 @@ impl Run {
         let (Some(pane), Some(icon)) = (agent["pane_id"].as_str(), agent_icon(kind)) else {
             return;
         };
-        let icon = [(AGENT_ICON_TOKEN.to_string(), Some(icon.to_string()))];
+        let project = agent["cwd"].as_str().map(|cwd| match git_repo(cwd) {
+            Some(repo) => repo.project,
+            None => dir_name(cwd, &self.home),
+        });
+        let icon = [
+            (AGENT_ICON_TOKEN.to_string(), Some(icon.to_string())),
+            (PROJECT_TOKEN.to_string(), project),
+        ];
         // The logo needs no session; the PRs do, so leave those as they are.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
             self.report("pane", pane, None, &icon);
@@ -246,15 +264,20 @@ impl Run {
     }
 }
 
-/// Repository root and checked-out branch for `cwd`; `None` outside a
-/// repository or on a detached HEAD.
-fn git_branch(cwd: &str) -> Option<(String, String)> {
+struct Repo {
+    top: String,
+    project: String,
+    /// `None` on a detached HEAD.
+    branch: Option<String>,
+}
+
+/// The repository `cwd` is in, in one `git` call; `None` outside a repository.
+fn git_repo(cwd: &str) -> Option<Repo> {
     let out = Command::new("git")
+        .args(["-C", cwd, "rev-parse", "--show-toplevel"])
         .args([
-            "-C",
-            cwd,
-            "rev-parse",
-            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
             "--abbrev-ref",
             "HEAD",
         ])
@@ -265,8 +288,24 @@ fn git_branch(cwd: &str) -> Option<(String, String)> {
     }
     let text = String::from_utf8(out.stdout).ok()?;
     let mut lines = text.lines();
-    let (repo, branch) = (lines.next()?, lines.next()?);
-    (branch != "HEAD").then(|| (repo.to_string(), branch.to_string()))
+    let (top, common, branch) = (lines.next()?, lines.next()?, lines.next()?);
+    Some(Repo {
+        top: top.to_string(),
+        project: project_name(top, common),
+        branch: (branch != "HEAD").then(|| branch.to_string()),
+    })
+}
+
+/// Project name for a directory outside any repository: `~` for home,
+/// otherwise its last component.
+fn dir_name(cwd: &str, home: &Path) -> String {
+    if Path::new(cwd) == home {
+        return "~".into();
+    }
+    Path::new(cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.to_string())
 }
 
 /// `Some(None)` when the branch has no PR; `None` when `gh` fails otherwise.

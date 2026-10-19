@@ -120,6 +120,30 @@ pub fn scope(event: Option<&str>, event_json: Option<&str>) -> Scope {
     }
 }
 
+/// Sidebar token naming the project a pane or workspace works in, referenced
+/// as `$project`.
+pub const PROJECT_TOKEN: &str = "project";
+
+/// The project a checkout belongs to, from `git rev-parse --show-toplevel` and
+/// an absolute `--git-common-dir`: a linked worktree names its main repository
+/// rather than its own directory, and a bare repository drops its `.git` suffix.
+pub fn project_name(toplevel: &str, common_dir: &str) -> String {
+    let common = Path::new(common_dir);
+    let dir = if common.file_name().is_some_and(|n| n == ".git") {
+        common.parent()
+    } else if common.is_absolute() {
+        Some(common)
+    } else {
+        None
+    };
+    let name = dir
+        .unwrap_or(Path::new(toplevel))
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    name.strip_suffix(".git").map(String::from).unwrap_or(name)
+}
+
 /// The agents herdr-sim knows, as Herdr agent ids.
 pub const AGENT_KINDS: [&str; 2] = ["claude", "codex"];
 
@@ -648,6 +672,14 @@ mod tests {
         assert_eq!(summary_value(&mixed).unwrap(), "\u{f407} 3");
         let done = counts(&[(PrState::Closed, 1), (PrState::Merged, 1)]);
         assert_eq!(summary_value(&done).unwrap(), "\u{f419} 2");
+    }
+
+    #[test]
+    fn project_name_follows_worktrees_to_their_repository() {
+        assert_eq!(project_name("/dev/search", "/dev/search/.git"), "search");
+        let worktree = "/dev/search/.worktrees/search-14527-status";
+        assert_eq!(project_name(worktree, "/dev/search/.git"), "search");
+        assert_eq!(project_name("/srv/infra", "/srv/repos/infra.git"), "infra");
     }
 
     #[test]
