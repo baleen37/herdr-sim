@@ -150,17 +150,28 @@ pub fn project_name(toplevel: &str, common_dir: &str) -> String {
 pub const TREE_PROJECT_TOKEN: &str = "tree_project";
 pub const TREE_WORKTREE_TOKEN: &str = "tree_worktree";
 
+/// What `$tree_project` holds above a project's second and later checkouts;
+/// style it apart with an `equals` rule.
+pub const TREE_SPINE: &str = "│";
+
 /// Where an agent works, for the tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
     pub project: String,
-    /// The linked worktree's directory name; `None` in the main checkout.
-    pub worktree: Option<String>,
+    /// The checkout's top-level directory: one per main checkout or worktree.
+    pub checkout: String,
+    /// What the checkout header shows: its branch, or its directory name on a
+    /// detached HEAD.
+    pub label: String,
 }
 
-/// Tree header tokens for agents listed in sidebar order: the project name on
-/// the first agent of each project, `└─ <worktree>` on the first agent of
-/// each worktree. Agents without a place get neither.
+/// Tree header tokens for agents listed in sidebar order, like Orca's project
+/// list: the project name on the first agent of each project, and
+/// `<branch icon> <branch>` on the first agent of each checkout (main checkout
+/// and worktrees alike). A later checkout of the same project gets a `│` in
+/// the project slot: Herdr indents every row but an entry's first, so this
+/// keeps all branch headers at one indent and marks them as one project.
+/// Agents without a place get neither.
 pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<String>)> {
     let mut seen_projects = std::collections::HashSet::new();
     let mut seen_worktrees = std::collections::HashSet::new();
@@ -170,15 +181,15 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             let Some(place) = place else {
                 return (None, None);
             };
-            let project = seen_projects
-                .insert(place.project.clone())
-                .then(|| place.project.clone());
-            let worktree = place.worktree.as_ref().and_then(|w| {
-                seen_worktrees
-                    .insert((place.project.clone(), w.clone()))
-                    .then(|| format!("└─ {w}"))
-            });
-            (project, worktree)
+            let first_of_project = seen_projects.insert(place.project.clone());
+            let first_of_checkout = seen_worktrees.insert(place.checkout.clone());
+            let project = match (first_of_project, first_of_checkout) {
+                (true, _) => Some(place.project.clone()),
+                (false, true) => Some(TREE_SPINE.to_string()),
+                (false, false) => None,
+            };
+            let checkout = first_of_checkout.then(|| format!("\u{f418} {}", place.label));
+            (project, checkout)
         })
         .collect()
 }
@@ -231,11 +242,16 @@ pub const BRANCH_TOKEN: &str = "branch";
 /// Claude Code's own session list. The cost is a single colour for both.
 pub const HEADING_TOKEN: &str = "heading";
 
-/// The logo followed by the title, or the logo alone before there is a title.
-pub fn heading_value(icon: &str, title: Option<&str>) -> String {
-    match title {
-        Some(title) => format!("{icon} {title}"),
-        None => icon.to_string(),
+/// The logo followed by the title, or by the agent's name before there is one.
+pub fn heading_value(icon: &str, title: Option<&str>, agent: &str) -> String {
+    format!("{icon} {}", title.unwrap_or(agent))
+}
+
+/// The name shown for an agent whose session has no title yet.
+pub fn agent_name(kind: &str) -> &'static str {
+    match kind {
+        "codex" => "Codex",
+        _ => "Claude",
     }
 }
 
@@ -465,7 +481,8 @@ impl Cache {
             .filter_map(|(cwd, v)| {
                 let place = Place {
                     project: v["project"].as_str()?.to_string(),
-                    worktree: v["worktree"].as_str().map(String::from),
+                    checkout: v["checkout"].as_str()?.to_string(),
+                    label: v["label"].as_str()?.to_string(),
                 };
                 Some((cwd.clone(), place))
             })
@@ -512,7 +529,7 @@ impl Cache {
             .map(|(cwd, p)| {
                 (
                     cwd.clone(),
-                    json!({ "project": p.project, "worktree": p.worktree }),
+                    json!({ "project": p.project, "checkout": p.checkout, "label": p.label }),
                 )
             })
             .collect();
@@ -958,38 +975,37 @@ mod tests {
     #[test]
     fn heading_is_the_logo_then_the_title() {
         assert_eq!(
-            heading_value("\u{ec82}", Some("Fix login")),
+            heading_value("\u{ec82}", Some("Fix login"), "Claude"),
             "\u{ec82} Fix login"
         );
-        assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
+        assert_eq!(heading_value("\u{ec81}", None, "Codex"), "\u{ec81} Codex");
     }
 
     #[test]
     fn tree_headers_mark_the_first_agent_of_each_group() {
-        let at = |project: &str, worktree: Option<&str>| {
+        let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
                 project: project.into(),
-                worktree: worktree.map(String::from),
+                checkout: checkout.into(),
+                label: label.into(),
             })
         };
         let headers = tree_headers(&[
-            at("search", None),
-            at("search", None),
-            at("search", Some("status")),
-            at("search", Some("status")),
+            at("search", "/s", "main"),
+            at("search", "/s", "main"),
+            at("search", "/s/wt", "fix-x"),
             None,
-            at("dotfiles", Some("deploy")),
+            at("dotfiles", "/d", "main"),
         ]);
         let some = |s: &str| Some(s.to_string());
         assert_eq!(
             headers,
             [
-                (some("search"), None),
+                (some("search"), some("\u{f418} main")),
                 (None, None),
-                (None, some("└─ status")),
+                (some("│"), some("\u{f418} fix-x")),
                 (None, None),
-                (None, None),
-                (some("dotfiles"), some("└─ deploy")),
+                (some("dotfiles"), some("\u{f418} main")),
             ]
         );
     }
