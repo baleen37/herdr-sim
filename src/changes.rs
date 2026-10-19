@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use herdr_sim::{Cache, Session, claude_session, codex_session, resolve_claude_session};
+use herdr_sim::{Cache, Session, claude_session, codex_session, parse_utc, resolve_claude_session};
 use serde_json::{Value, json};
 
 /// How often the pane looks at focus and the session again.
@@ -230,7 +230,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         let _ = done.send((stale, got));
                     });
                 }
-                render(session.and_then(|s| s.title), &list, &prs, fetching)
+                render(session.and_then(|s| s.title), &list, &prs)
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -371,7 +371,8 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
         );
         asked.push(url.clone());
     }
-    query += " }";
+    // GitHub's budget, read in the same request.
+    query += " rateLimit { remaining resetAt } }";
     if asked.is_empty() {
         return HashMap::new();
     }
@@ -382,6 +383,14 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
     let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else {
         return HashMap::new();
     };
+    let limit = &v["data"]["rateLimit"];
+    if limit["remaining"]
+        .as_u64()
+        .is_some_and(|left| left < crate::GH_RESERVE)
+        && let Some(reset) = limit["resetAt"].as_str().and_then(parse_utc)
+    {
+        crate::pause_gh(reset);
+    }
     asked
         .into_iter()
         .enumerate()
@@ -424,7 +433,7 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-fn render(title: Option<String>, urls: &[String], prs: &Prs, fetching: bool) -> String {
+fn render(title: Option<String>, urls: &[String], prs: &Prs) -> String {
     let width = columns().saturating_sub(1).max(20);
     let mut s = format!("{BOLD}Changes{RESET}\n");
     if let Some(title) = title {
@@ -436,15 +445,12 @@ fn render(title: Option<String>, urls: &[String], prs: &Prs, fetching: bool) -> 
     }
     for url in urls {
         let Some((_, Some(pr))) = prs.get(url) else {
-            let note = if fetching && !prs.contains_key(url) {
-                "loading…"
-            } else {
-                "could not load"
-            };
-            s += &format!(
-                "{DIM}{}{RESET}\n{DIM}  ({note}){RESET}\n\n",
-                cut(url, width)
-            );
+            // Not asked yet: just the link until its details arrive.
+            s += &format!("{DIM}{}{RESET}\n", cut(url, width));
+            if prs.contains_key(url) {
+                s += &format!("{DIM}  (could not load){RESET}\n");
+            }
+            s += "\n";
             continue;
         };
         let (icon, colour) = match (pr.state.as_str(), pr.draft) {
