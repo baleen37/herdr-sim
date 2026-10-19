@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN,
+    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN,
     TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value,
     agent_count_value, agent_icon, checkout_headers, claude_session, codex_session, diff_value,
     header_value, heading_value, project_name, resolve_claude_session, scope, split_marks,
@@ -182,9 +182,23 @@ impl Run {
             let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
             };
+            // The branch PR rides on the checkout's card, from the same cache
+            // the Space pass fills, so it costs no extra gh call.
+            let card_pr = match (&worktree, &places[pos]) {
+                (Some(_), Some(place)) => {
+                    let (repo, branch) = (place.checkout.clone(), place.label.clone());
+                    let key = format!("{repo}#{branch}");
+                    let pr = self
+                        .cache
+                        .branch_state(&key, self.now, || gh_branch_pr(&repo, &branch));
+                    pr.state.and_then(|state| token_value(state, 1))
+                }
+                _ => None,
+            };
             let tokens = [
                 (TREE_PROJECT_TOKEN.to_string(), project),
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                (TREE_PR_TOKEN.to_string(), card_pr),
                 (TREE_HEADER_TOKEN.to_string(), header),
                 (AGE_TOKEN.to_string(), self.age_secs(agent).map(age_value)),
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
