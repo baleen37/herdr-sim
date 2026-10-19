@@ -8,6 +8,8 @@
 //! its own pane and workspace, a started turn does nothing, and runs never
 //! overlap: one that finds another in progress leaves a note for it instead.
 
+mod changes;
+
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -57,6 +59,14 @@ fn main() -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     // Present while the order is off; the toggle action flips it.
     let order_off = state_dir.join("order-off");
+    let herdr_bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    if env::args().any(|a| a == "--changes-pane") {
+        let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
+        return changes::run(&herdr_bin, &home, &state_dir);
+    }
+    if env::args().any(|a| a == "--toggle-changes") {
+        return changes::toggle(&herdr_bin, &state_dir);
+    }
     if env::args().any(|a| a == "--toggle-order") {
         // Turning it on needs no call here: every pass below sets the view.
         if order_off.exists() {

@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.17.1"
+version = "0.18.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -52,3 +52,17 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 [[events]]
 on = "workspace.created"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+
+# Claude Code's "Changes" panel in a right-hand split: the PRs the focused
+# agent's session touched. Bind the action to a key, e.g. cmd+p.
+[[panes]]
+id = "changes"
+title = "Changes"
+placement = "split"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --changes-pane"]
+
+[[actions]]
+id = "toggle-changes"
+title = "Changes: open/close the right panel"
+description = "Open or close the panel of PRs the focused agent's session touched."
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --toggle-changes"]
