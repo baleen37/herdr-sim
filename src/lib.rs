@@ -57,6 +57,89 @@ impl PrState {
     }
 }
 
+/// Combined state of a PR's checks, shown as `$ci` on Space rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ci {
+    Pass,
+    Fail,
+    Pending,
+}
+
+/// Sidebar token for the CI state of a Space's branch PR, referenced as `$ci`.
+pub const CI_TOKEN: &str = "ci";
+
+impl Ci {
+    /// From `gh pr view --json statusCheckRollup`: any failure fails, else
+    /// anything unfinished is pending; `None` when there are no checks.
+    pub fn from_rollup(rollup: &Value) -> Option<Self> {
+        let checks = rollup.as_array().filter(|c| !c.is_empty())?;
+        let mut pending = false;
+        for check in checks {
+            // Check runs report status + conclusion, commit statuses a state.
+            let result = check["conclusion"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .or_else(|| check["state"].as_str())
+                .unwrap_or_default();
+            match result {
+                "FAILURE" | "ERROR" | "TIMED_OUT" | "CANCELLED" | "ACTION_REQUIRED"
+                | "STARTUP_FAILURE" => return Some(Self::Fail),
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+                _ => pending = true,
+            }
+        }
+        Some(if pending { Self::Pending } else { Self::Pass })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Pending => "pending",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+
+    /// Nerd Font Octicons glyph: check, x, dot-fill.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Pass => "\u{f42e}",
+            Self::Fail => "\u{f467}",
+            Self::Pending => "\u{f444}",
+        }
+    }
+}
+
+/// Sidebar token with uncommitted changes in a Space's checkout, referenced as
+/// `$diff`: `+12 -3`, from `git diff --shortstat HEAD`. Unset when clean.
+pub const DIFF_TOKEN: &str = "diff";
+
+/// `+<insertions> -<deletions>` from `git diff --shortstat` output, leaving
+/// out a zero side; `None` when nothing changed.
+pub fn diff_value(shortstat: &str) -> Option<String> {
+    let count = |word: &str| {
+        shortstat
+            .split(',')
+            .find(|part| part.contains(word))
+            .and_then(|part| part.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    match (count("insertion"), count("deletion")) {
+        (0, 0) => None,
+        (added, 0) => Some(format!("+{added}")),
+        (0, removed) => Some(format!("-{removed}")),
+        (added, removed) => Some(format!("+{added} -{removed}")),
+    }
+}
+
 /// Sidebar token holding the agent's logo, referenced as `$agent_icon`.
 pub const AGENT_ICON_TOKEN: &str = "agent_icon";
 
@@ -211,6 +294,71 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             (project, checkout)
         })
         .collect()
+}
+
+/// Sidebar token marking the second and later agents of a split tab, referenced
+/// as `$tree_split`: `├─`, and `└─` on the last, so a split screen reads as one
+/// unit under its first agent.
+pub const TREE_SPLIT_TOKEN: &str = "tree_split";
+
+/// Split marks for agents listed in sidebar order, given each agent's tab.
+pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
+    (0..tabs.len())
+        .map(|i| {
+            if i == 0 || tabs[i - 1] != tabs[i] {
+                None
+            } else if tabs.get(i + 1) == Some(&tabs[i]) {
+                Some("├─")
+            } else {
+                Some("└─")
+            }
+        })
+        .collect()
+}
+
+/// Pane token the activity order sorts on, referenced as `$sort_rank`: the
+/// agent's position in [`activity_order`], zero-padded since the Agents view
+/// sorts tokens as strings. Herdr shows exactly the order computed here, and
+/// the token only changes when the order does.
+pub const SORT_RANK_TOKEN: &str = "sort_rank";
+
+/// One agent as the activity order sees it.
+pub struct Activity {
+    pub place: Option<Place>,
+    pub tab: String,
+    /// Herdr's `state_change_seq`: higher changed state more recently.
+    pub seq: u64,
+}
+
+/// Indices of the agents in activity order: projects by their most recent
+/// agent, then checkouts (main checkout and worktrees alike) and tabs within
+/// them the same way; names break ties, then list order. Agents without a
+/// place come last, in list order.
+pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
+    fn groups(agent: &Activity) -> Option<[&str; 3]> {
+        let place = agent.place.as_ref()?;
+        Some([&place.project, &place.checkout, &agent.tab])
+    }
+    let mut latest: [HashMap<&str, u64>; 3] = Default::default();
+    for agent in agents {
+        for (level, name) in groups(agent).into_iter().flatten().enumerate() {
+            let seq = latest[level].entry(name).or_default();
+            *seq = (*seq).max(agent.seq);
+        }
+    }
+    let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
+    let mut placed: Vec<_> = agents
+        .iter()
+        .enumerate()
+        .filter_map(|(i, agent)| {
+            let [project, checkout, tab] = groups(agent)?;
+            Some((i, [key(0, project), key(1, checkout), key(2, tab)]))
+        })
+        .collect();
+    placed.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut order: Vec<usize> = placed.into_iter().map(|(i, _)| i).collect();
+    order.extend((0..agents.len()).filter(|&i| agents[i].place.is_none()));
+    order
 }
 
 /// Sidebar token with how long ago an agent's session last changed,
@@ -478,12 +626,20 @@ fn pr_urls(text: &str) -> Vec<String> {
 #[derive(Default)]
 pub struct Cache {
     prs: HashMap<String, (PrState, u64)>,
-    branches: HashMap<String, (Option<PrState>, u64)>,
+    branches: HashMap<String, (BranchPr, u64)>,
     files: HashMap<String, Scanned>,
     reported: HashMap<String, String>,
     /// Where each directory sits in the tree; a checkout's project and
     /// worktree do not change, so this saves a `git` call per agent per run.
     places: HashMap<String, Place>,
+}
+
+/// The PR of a checked-out branch (`state` is `None` when there is none) and
+/// its checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BranchPr {
+    pub state: Option<PrState>,
+    pub ci: Option<Ci>,
 }
 
 #[derive(Default)]
@@ -513,8 +669,11 @@ impl Cache {
             .collect();
         let branches = object(&v["branches"])
             .filter_map(|(key, v)| {
-                let state = v["state"].as_str().and_then(PrState::parse);
-                Some((key.clone(), (state, v["at"].as_u64()?)))
+                let pr = BranchPr {
+                    state: v["state"].as_str().and_then(PrState::parse),
+                    ci: v["ci"].as_str().and_then(Ci::parse),
+                };
+                Some((key.clone(), (pr, v["at"].as_u64()?)))
             })
             .collect();
         let files = object(&v["files"])
@@ -563,11 +722,13 @@ impl Cache {
         let branches: serde_json::Map<String, Value> = self
             .branches
             .iter()
-            .map(|(key, (state, at))| {
-                (
-                    key.clone(),
-                    json!({ "state": state.map(PrState::name), "at": at }),
-                )
+            .map(|(key, (pr, at))| {
+                let entry = json!({
+                    "state": pr.state.map(PrState::name),
+                    "ci": pr.ci.map(Ci::name),
+                    "at": at,
+                });
+                (key.clone(), entry)
             })
             .collect();
         let files: serde_json::Map<String, Value> = self
@@ -622,29 +783,28 @@ impl Cache {
         }
     }
 
-    /// State of the PR for a checked-out branch, keyed by `key` (repo + branch).
-    /// Like [`Cache::state`], but a branch may have no PR yet, which is
-    /// re-checked as often as an open one. `fetch` returns `None` on failure,
-    /// `Some(None)` when the branch has no PR.
+    /// The PR for a checked-out branch and its checks, keyed by `key` (repo +
+    /// branch). Like [`Cache::state`], but a branch may have no PR yet, which
+    /// is re-checked as often as an open one. `fetch` returns `None` on failure.
     pub fn branch_state(
         &mut self,
         key: &str,
         now: u64,
-        fetch: impl FnOnce() -> Option<Option<PrState>>,
-    ) -> Option<PrState> {
+        fetch: impl FnOnce() -> Option<BranchPr>,
+    ) -> BranchPr {
         let cached = self.branches.get(key).copied();
-        if let Some((state, at)) = cached
-            && (matches!(state, Some(PrState::Merged | PrState::Closed))
+        if let Some((pr, at)) = cached
+            && (matches!(pr.state, Some(PrState::Merged | PrState::Closed))
                 || now.saturating_sub(at) < OPEN_TTL_SECS)
         {
-            return state;
+            return pr;
         }
         match fetch() {
-            Some(state) => {
-                self.branches.insert(key.to_string(), (state, now));
-                state
+            Some(pr) => {
+                self.branches.insert(key.to_string(), (pr, now));
+                pr
             }
-            None => cached.and_then(|(state, _)| state),
+            None => cached.map(|(pr, _)| pr).unwrap_or_default(),
         }
     }
 
@@ -1068,6 +1228,14 @@ mod tests {
     }
 
     #[test]
+    fn split_marks_branch_off_the_first_agent_of_a_tab() {
+        assert_eq!(
+            split_marks(&["t1", "t2", "t2", "t2", "t3", "t3"]),
+            [None, None, Some("├─"), Some("└─"), None, Some("└─")]
+        );
+    }
+
+    #[test]
     fn checkout_headers_mark_each_checkouts_first_agent() {
         let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
@@ -1091,6 +1259,40 @@ mod tests {
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn activity_order_puts_recent_groups_first() {
+        let at = |project: &str, checkout: &str, tab: &str, seq: u64| Activity {
+            place: Some(Place {
+                project: project.into(),
+                checkout: checkout.into(),
+                label: "main".into(),
+            }),
+            tab: tab.into(),
+            seq,
+        };
+        let agents = [
+            at("search", "/s", "t1", 1),
+            at("search", "/s/status", "t2", 9),
+            at("dotfiles", "/d", "t3", 5),
+            Activity {
+                place: None,
+                tab: "t4".into(),
+                seq: 20,
+            },
+            at("search", "/s/batch", "t5", 3),
+            at("search", "/s/status", "t6", 2),
+            at("search", "/s/status", "t2", 0),
+            // Two idle projects keep apart despite equal seqs.
+            at("infra", "/i", "t7", 0),
+            at("api", "/a", "t8", 0),
+            at("infra", "/i", "t9", 0),
+        ];
+        // search (latest 9): status (9: tab t2 then t6), batch (3), the main
+        // checkout (1); dotfiles (5); the two idle projects and their tabs by
+        // name; last the agent without a place.
+        assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9, 3]);
     }
 
     #[test]
@@ -1145,25 +1347,51 @@ mod tests {
 
     #[test]
     fn branch_state_rechecks_missing_and_open_prs_only() {
+        let pr = |state, ci| BranchPr { state, ci };
+        let open = pr(Some(PrState::Open), Some(Ci::Pending));
+        let merged = pr(Some(PrState::Merged), Some(Ci::Pass));
         let mut cache = Cache::default();
-        assert_eq!(cache.branch_state("r#b", 0, || Some(None)), None);
         assert_eq!(
-            cache.branch_state("r#b", 59, || panic!("fresh entry refetched")),
+            cache.branch_state("r#b", 0, || Some(pr(None, None))).state,
             None
         );
         assert_eq!(
-            cache.branch_state("r#b", 60, || Some(Some(PrState::Open))),
-            Some(PrState::Open)
+            cache.branch_state("r#b", 59, || panic!("fresh entry refetched")),
+            pr(None, None)
         );
-        assert_eq!(cache.branch_state("r#b", 120, || None), Some(PrState::Open));
-        assert_eq!(
-            cache.branch_state("r#b", 180, || Some(Some(PrState::Merged))),
-            Some(PrState::Merged)
-        );
+        assert_eq!(cache.branch_state("r#b", 60, || Some(open)), open);
+        assert_eq!(cache.branch_state("r#b", 120, || None), open);
+        assert_eq!(cache.branch_state("r#b", 180, || Some(merged)), merged);
         assert_eq!(
             cache.branch_state("r#b", 99_999, || panic!("merged refetched")),
-            Some(PrState::Merged)
+            merged
         );
+    }
+
+    #[test]
+    fn ci_fails_on_any_failure_then_waits_on_unfinished_checks() {
+        let rollup = |items: Value| Ci::from_rollup(&items);
+        assert_eq!(rollup(json!([])), None);
+        assert_eq!(rollup(Value::Null), None);
+        let pass = json!({"status": "COMPLETED", "conclusion": "SUCCESS"});
+        let skipped = json!({"status": "COMPLETED", "conclusion": "SKIPPED"});
+        let running = json!({"status": "IN_PROGRESS", "conclusion": ""});
+        let failed = json!({"status": "COMPLETED", "conclusion": "FAILURE"});
+        let status_ok = json!({"state": "SUCCESS"});
+        let status_pending = json!({"state": "PENDING"});
+        assert_eq!(rollup(json!([pass, skipped, status_ok])), Some(Ci::Pass));
+        assert_eq!(rollup(json!([pass, running])), Some(Ci::Pending));
+        assert_eq!(rollup(json!([pass, status_pending])), Some(Ci::Pending));
+        assert_eq!(rollup(json!([running, failed])), Some(Ci::Fail));
+    }
+
+    #[test]
+    fn diff_value_reads_git_shortstat() {
+        let stat = " 3 files changed, 12 insertions(+), 3 deletions(-)";
+        assert_eq!(diff_value(stat).unwrap(), "+12 -3");
+        assert_eq!(diff_value(" 1 file changed, 1 insertion(+)").unwrap(), "+1");
+        assert_eq!(diff_value(" 1 file changed, 4 deletions(-)").unwrap(), "-4");
+        assert_eq!(diff_value(""), None);
     }
 
     #[test]
@@ -1172,12 +1400,16 @@ mod tests {
         let path = dir.path().join("cache.json");
         let mut cache = Cache::default();
         cache.state("u", 5, |_| Some(PrState::Closed));
-        cache.branch_state("r#b", 5, || Some(Some(PrState::Merged)));
+        let merged = BranchPr {
+            state: Some(PrState::Merged),
+            ci: Some(Ci::Fail),
+        };
+        cache.branch_state("r#b", 5, || Some(merged));
         cache.save(&path).unwrap();
         let mut loaded = Cache::load(&path);
         assert_eq!(
             loaded.branch_state("r#b", 1_000, || panic!("not cached")),
-            Some(PrState::Merged)
+            merged
         );
         assert_eq!(
             loaded.state("u", 1_000, |_| panic!("not cached")),

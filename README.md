@@ -25,10 +25,10 @@ in its first pane that is inside a git repository.
 
 ## Load
 
-A finished turn only revisits its own pane and workspace: four short process
-calls when nothing changed (`herdr agent list`, `herdr pane list`, and one
-`git rev-parse` each for the pane and its Space), and no `report-metadata` call
-unless a token changed. A
+A finished turn only revisits its own pane and workspace: five short process
+calls when nothing changed (`herdr agent list`, `herdr pane list`, one
+`git rev-parse` each for the pane and its Space, and `git diff --shortstat` for
+the Space), and no `report-metadata` call unless a token changed. A
 started turn exits at once. Runs never overlap: one that finds another in
 progress leaves a note, and the running one does a single extra pass. `gh` calls
 are cached as below and killed after 10 seconds.
@@ -77,14 +77,14 @@ agent_panel_sort = "spaces"
 [ui.sidebar.agents]
 rows = [
   [{ token = "$tree_header", fg = "#cdd6f4", bold = true }],
-  ["state_icon", { token = "$heading", fg = "#cdd6f4" }],
+  [{ token = "$tree_split", dim = true }, "state_icon", { token = "$heading", fg = "#cdd6f4" }],
   [{ token = "$age", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", { token = "$project", bold = true }, { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
-  ["branch", "git_status", { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+  ["branch", "git_status", { token = "$diff", dim = true }, { token = "$ci", rules = [{ starts_with = "\uF42E", fg = "#a6e3a1" }, { starts_with = "\uF467", fg = "#f38ba8" }, { starts_with = "\uF444", fg = "#f9e2af" }] }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
 
@@ -101,10 +101,38 @@ rows = [
 | `$tree_project`, `$tree_worktree` | A project → checkout tree over the Agents list (structure after [herdr-radar](https://github.com/hhdebb/herdr-radar), layout after Orca): the repo icon and project name on the first agent of each project, `<branch icon> <branch>` on the first agent of each checkout, main checkout included. A project's later checkouts get `│` in `$tree_project` so every branch header sits at the same indent; style it with an `equals = "│"` rule. Use `agent_panel_sort = "spaces"`. |
 | `$age` | On agent panes: how long ago the session's transcript (Claude) or rollout (Codex) last changed — `now`, `10m`…`50m`, `1h`…, `1d`…. Coarse so it changes at most six times an hour; refreshed on every pass, so it pauses while no agent has events. |
 | `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the agent's name (Claude, Codex) before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
+| `$tree_split` | `├─` on the second and later agents of a split tab, `└─` on the last, so a split screen reads as one unit under its first agent. |
+| `$sort_rank` | The agent's position in the activity order below; not meant for display. |
+| `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
+| `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
+
+## Activity order
+
+By default the plugin orders the Agents list by activity, the way
+[herdr-radar](https://github.com/hhdebb/herdr-radar) does: the project whose
+agent changed state most recently comes first, then within it its checkouts
+(main checkout and worktrees alike) and their split tabs, each by their latest
+change. The tree
+headers follow that order. Agents move when a turn ends or asks for input, not
+when one starts.
+
+Herdr turns off its own order toggle while a plugin's order is on. Switch back
+and forth with the `toggle-order` action, for example on a key:
+
+```toml
+[[keys.command]]
+key = "prefix+a"
+type = "plugin_action"
+command = "baleen37.herdr-sim.toggle-order"
+description = "agents: activity order on/off"
+```
+
+Only one plugin can order the Agents list at a time, so turn this off if
+herdr-radar's order is on.
 
 ## Caveats
 

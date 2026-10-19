@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread::sleep;
@@ -18,13 +20,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
-    PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_WORKTREE_TOKEN, age_value, agent_count_value, agent_icon, agent_name, checkout_headers,
-    claude_session, codex_session, heading_value, project_name, resolve_claude_session, scope,
-    session_files, summary_value, token_value, tree_headers, workspace_agent_token,
+    AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
+    Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
+    SORT_RANK_TOKEN, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
+    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon, agent_name,
+    checkout_headers, claude_session, codex_session, diff_value, heading_value, project_name,
+    resolve_claude_session, scope, session_files, split_marks, summary_value, token_value,
+    tree_headers, workspace_agent_token,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Longest a single `gh` call may take before the run gives up on it.
 const GH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,6 +36,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(10);
 struct Run {
     herdr: String,
     home: PathBuf,
+    /// Whether the Agents list is in activity order.
+    ordered: bool,
     now: u64,
     cache: Cache,
 }
@@ -50,6 +56,17 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
     fs::create_dir_all(&state_dir)?;
+    // Present while the order is off; the toggle action flips it.
+    let order_off = state_dir.join("order-off");
+    if env::args().any(|a| a == "--toggle-order") {
+        // Turning it on needs no call here: every pass below sets the view.
+        if order_off.exists() {
+            fs::remove_file(&order_off)?;
+        } else {
+            fs::write(&order_off, b"")?;
+            set_agent_view(false);
+        }
+    }
     let pending = state_dir.join("pending");
     let lock = File::create(state_dir.join("lock"))?;
     let startup = event.as_deref() == Some("startup");
@@ -69,6 +86,7 @@ fn main() -> Result<()> {
     let mut run = Run {
         herdr: env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()),
         home: PathBuf::from(env::var("HOME").context("HOME is not set")?),
+        ordered: false,
         now: 0,
         cache: Cache::load(&cache_path),
     };
@@ -77,6 +95,13 @@ fn main() -> Result<()> {
     }
     loop {
         let _ = fs::remove_file(&pending);
+        // Every pass sets the view while the order is on: it dies with the
+        // server, and a plugin linked into a running server gets no startup
+        // hook. Only the toggle clears it, so another plugin's view stays.
+        run.ordered = !order_off.exists();
+        if run.ordered {
+            set_agent_view(true);
+        }
         run.now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         run.pass(&scope);
         run.cache.save(&cache_path)?;
@@ -122,31 +147,56 @@ impl Run {
             }
         }
 
-        // Project and checkout (branch) headers over the Agents list, which Herdr shows
-        // in the same order as `agent list` when sorted by Space.
-        let places: Vec<Option<Place>> = agents
+        // Project and checkout (branch) headers over the Agents list. Herdr
+        // shows it in the same order as `agent list` when sorted by Space; in
+        // activity order the view sorts on the ranks set here, so the headers
+        // follow the same order.
+        let activity: Vec<Activity> = agents
             .iter()
-            .map(|agent| agent["cwd"].as_str().map(|cwd| self.place(cwd)))
+            .map(|agent| Activity {
+                place: agent["cwd"].as_str().map(|cwd| self.place(cwd)),
+                tab: agent["tab_id"].as_str().unwrap_or_default().to_string(),
+                seq: agent["state_change_seq"].as_u64().unwrap_or(0),
+            })
             .collect();
+        // Agents without a place get no rank, so the view lists them last.
+        let (order, ranked) = if self.ordered {
+            let placed = activity.iter().filter(|a| a.place.is_some()).count();
+            (activity_order(&activity), placed)
+        } else {
+            ((0..agents.len()).collect(), 0)
+        };
+        let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
+        let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
+        let marks = split_marks(&tabs);
         let headers = tree_headers(&places)
             .into_iter()
             .zip(checkout_headers(&places));
-        for (agent, ((project, worktree), header)) in agents.iter().zip(headers) {
-            if let Some(pane) = agent["pane_id"].as_str() {
-                let tokens = [
-                    (TREE_PROJECT_TOKEN.to_string(), project),
-                    (TREE_WORKTREE_TOKEN.to_string(), worktree),
-                    (TREE_HEADER_TOKEN.to_string(), header),
-                    (AGE_TOKEN.to_string(), self.age(agent)),
-                ];
-                self.report("pane", pane, "tree", None, &tokens);
-            }
+        for (pos, ((project, worktree), header)) in headers.enumerate() {
+            let agent = &agents[order[pos]];
+            let Some(pane) = agent["pane_id"].as_str() else {
+                continue;
+            };
+            let tokens = [
+                (TREE_PROJECT_TOKEN.to_string(), project),
+                (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                (TREE_HEADER_TOKEN.to_string(), header),
+                (AGE_TOKEN.to_string(), self.age(agent)),
+                (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
+                (
+                    SORT_RANK_TOKEN.to_string(),
+                    (pos < ranked).then(|| format!("{pos:04}")),
+                ),
+            ];
+            self.report("pane", pane, "tree", None, &tokens);
         }
 
         // A workspace shows the PR of the branch checked out in its first pane
         // that sits in a git repository, and the logos of its agents.
         let panes = self.json(&["pane", "list"]);
         let mut branch_prs: HashMap<String, HashMap<PrState, usize>> = HashMap::new();
+        let mut cis: HashMap<String, Ci> = HashMap::new();
+        let mut diffs: HashMap<String, String> = HashMap::new();
         let mut projects: HashMap<String, String> = HashMap::new();
         let mut order = Vec::new();
         for pane in panes["result"]["panes"].as_array().into_iter().flatten() {
@@ -170,15 +220,23 @@ impl Run {
                 continue;
             };
             projects.insert(workspace.to_string(), repo.project);
+            if let Some(diff) = git_diff(&repo.top) {
+                diffs.insert(workspace.to_string(), diff);
+            }
             let Some(branch) = repo.branch else {
                 branch_prs.insert(workspace.to_string(), HashMap::new());
                 continue;
             };
             let repo = repo.top;
             let key = format!("{repo}#{branch}");
-            let counts = self
+            let pr = self
                 .cache
-                .branch_state(&key, self.now, || gh_branch_pr_state(&repo, &branch))
+                .branch_state(&key, self.now, || gh_branch_pr(&repo, &branch));
+            if let Some(ci) = pr.ci {
+                cis.insert(workspace.to_string(), ci);
+            }
+            let counts = pr
+                .state
                 .map(|state| HashMap::from([(state, 1)]))
                 .unwrap_or_default();
             branch_prs.insert(workspace.to_string(), counts);
@@ -193,6 +251,9 @@ impl Run {
                 })
                 .collect();
             tokens.push((PROJECT_TOKEN.into(), projects.remove(&workspace)));
+            tokens.push((DIFF_TOKEN.into(), diffs.remove(&workspace)));
+            let ci = cis.remove(&workspace).map(|ci| ci.icon().to_string());
+            tokens.push((CI_TOKEN.into(), ci));
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
             self.report("workspace", &workspace, "space", Some(&prs), &tokens);
         }
@@ -336,6 +397,42 @@ impl Run {
     }
 }
 
+/// Puts the Agents list in activity order (`on`), or back in Herdr's own.
+/// A failure only costs the order, so it is logged and the run goes on.
+fn set_agent_view(on: bool) {
+    let source = format!(
+        "plugin:{}",
+        env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| "baleen37.herdr-sim".into())
+    );
+    let (method, params) = if on {
+        let sort = [json!({"field": {"token": SORT_RANK_TOKEN}, "order": "asc"})];
+        let params = json!({"source": source, "label": "active", "sort": sort});
+        ("agent.view.set", params)
+    } else {
+        ("agent.view.clear", json!({"source": source}))
+    };
+    if let Err(err) = socket_call(method, params) {
+        eprintln!("herdr-sim: {method}: {err:#}");
+    }
+}
+
+/// One request over Herdr's socket, for the calls its CLI does not wrap. The
+/// server answers one newline-terminated JSON line and hangs up.
+fn socket_call(method: &str, params: Value) -> Result<()> {
+    let path = env::var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set")?;
+    let mut stream = UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(4)))?;
+    let request = json!({"id": "herdr-sim", "method": method, "params": params});
+    writeln!(stream, "{request}")?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let reply: Value = serde_json::from_str(&line)?;
+    if !reply["error"].is_null() {
+        bail!("{}", reply["error"]);
+    }
+    Ok(())
+}
+
 struct Repo {
     top: String,
     project: String,
@@ -401,10 +498,11 @@ fn dir_name(cwd: &str, home: &Path) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
-/// `Some(None)` when the branch has no PR; `None` when `gh` fails otherwise.
-fn gh_branch_pr_state(repo: &str, branch: &str) -> Option<Option<PrState>> {
+/// The branch's PR and its checks, empty when the branch has no PR; `None`
+/// when `gh` fails otherwise.
+fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
     let out = gh(
-        &["pr", "view", branch, "--json", "state"],
+        &["pr", "view", branch, "--json", "state,statusCheckRollup"],
         Some(Path::new(repo)),
     )?;
     if !out.status.success() {
@@ -412,10 +510,25 @@ fn gh_branch_pr_state(repo: &str, branch: &str) -> Option<Option<PrState>> {
         return stderr
             .to_ascii_lowercase()
             .contains("no pull requests found")
-            .then_some(None);
+            .then(BranchPr::default);
     }
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(PrState::parse(v["state"].as_str()?))
+    let state = PrState::parse(v["state"].as_str()?)?;
+    // Checks only matter while the PR is open.
+    let ci = (state == PrState::Open)
+        .then(|| Ci::from_rollup(&v["statusCheckRollup"]))
+        .flatten();
+    Some(BranchPr {
+        state: Some(state),
+        ci,
+    })
+}
+
+/// Uncommitted changes in the checkout at `top` as `$diff`; `None` when clean
+/// or when `git` fails.
+fn git_diff(top: &str) -> Option<String> {
+    let out = run("git", &["-C", top, "diff", "--shortstat", "HEAD"]).ok()?;
+    diff_value(&String::from_utf8_lossy(&out))
 }
 
 fn gh_pr_state(url: &str) -> Option<PrState> {
