@@ -22,11 +22,12 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN,
-    TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value,
-    agent_count_value, agent_icon, checkout_headers, claude_session, codex_session, diff_value,
-    header_value, heading_value, project_name, resolve_claude_session, scope, split_marks,
-    state_heading_token, summary_value, token_value, tree_headers, workspace_agent_token,
+    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_TOKEN,
+    TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN,
+    activity_order, age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
+    codex_session, diff_value, group_rows, header_value, heading_value, project_name,
+    resolve_claude_session, scope, split_marks, state_heading_token, summary_value, token_value,
+    tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -176,8 +177,9 @@ impl Run {
         let marks = split_marks(&tabs);
         let headers = tree_headers(&places)
             .into_iter()
-            .zip(checkout_headers(&places));
-        for (pos, ((project, worktree), header)) in headers.enumerate() {
+            .zip(checkout_headers(&places))
+            .zip(group_rows(&places));
+        for (pos, (((project, worktree), header), (group, gap))) in headers.enumerate() {
             let agent = &agents[order[pos]];
             let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
@@ -200,6 +202,8 @@ impl Run {
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
                 (TREE_PR_TOKEN.to_string(), card_pr),
                 (TREE_HEADER_TOKEN.to_string(), header),
+                (TREE_GROUP_TOKEN.to_string(), group),
+                (TREE_GAP_TOKEN.to_string(), gap),
                 (AGE_TOKEN.to_string(), self.age_secs(agent).map(age_value)),
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
                 (
