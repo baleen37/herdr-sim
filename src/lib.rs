@@ -314,11 +314,13 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
         .collect()
 }
 
-/// Sidebar tokens for herdr-radar's one-header-per-group layout, referenced as
-/// `$tree_group`, `$tree_group_stale` and `$tree_gap`: the project (and its
-/// branch, when it has several checkouts) over its first checkout,
-/// `└─ <branch>` over each later one, and a blank row after the project. A
-/// header whose sessions have all gone stale moves to `$tree_group_stale`.
+/// Sidebar tokens for a project › branch › session tree after herdr-radar,
+/// referenced as `$tree_group_project`, `$tree_group` and `$tree_gap`: the
+/// project over its first agent, `├─`/`└─ <branch>` over each checkout's
+/// first agent, and a blank row after the project. A header whose sessions
+/// have all gone stale moves to its `_stale` token instead.
+pub const TREE_GROUP_PROJECT_TOKEN: &str = "tree_group_project";
+pub const TREE_GROUP_PROJECT_STALE_TOKEN: &str = "tree_group_project_stale";
 pub const TREE_GROUP_TOKEN: &str = "tree_group";
 pub const TREE_GROUP_STALE_TOKEN: &str = "tree_group_stale";
 pub const TREE_GAP_TOKEN: &str = "tree_gap";
@@ -339,16 +341,20 @@ pub fn indent(depth: usize) -> String {
 /// What [`group_rows`] gives one agent.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GroupRow {
-    /// The group header, if this agent heads a checkout.
+    /// The project header, if this agent heads a project.
+    pub project: Option<String>,
+    /// Whether every session of that project has gone stale.
+    pub project_stale: bool,
+    /// The branch header, if this agent heads a checkout.
     pub group: Option<String>,
     /// Whether every session of that checkout has gone stale.
     pub stale: bool,
     /// The blank row after a project's last agent.
     pub gap: Option<String>,
-    /// How far the agent's own row sits in, on top of Herdr's: Herdr indents
-    /// an entry's continuation rows itself, so a header's agent starts a level
-    /// in and the rest need one of ours; a later checkout's agents go one
-    /// level deeper, under its `└─` header.
+    /// How far the agent's own row sits in, on top of Herdr's. Herdr indents
+    /// an entry's continuation rows one level itself, so a session under a
+    /// header needs one more level of ours to sit under the branch, and a
+    /// session that is its entry's first row needs two.
     pub depth: usize,
 }
 
@@ -359,7 +365,12 @@ pub struct GroupRow {
 pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
     let mut seen_projects = std::collections::HashSet::new();
     let mut seen_checkouts = std::collections::HashSet::new();
-    let mut nested = std::collections::HashSet::new();
+    let all_stale = |same: &dyn Fn(&Place) -> bool| {
+        places
+            .iter()
+            .zip(stale)
+            .all(|(other, &stale)| other.as_ref().is_none_or(|o| !same(o)) || stale)
+    };
     places
         .iter()
         .enumerate()
@@ -367,38 +378,36 @@ pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
             let Some(place) = place else {
                 return GroupRow::default();
             };
+            let later = &places[i + 1..];
             let first_of_project = seen_projects.insert(place.project.clone());
             let first_of_checkout = seen_checkouts.insert(place.checkout.clone());
-            if !first_of_project && first_of_checkout {
-                nested.insert(place.checkout.clone());
-            }
-            // A project with one checkout is named alone, as in herdr-radar;
-            // with more, its first header names the branch too.
-            let several = places
-                .iter()
-                .flatten()
-                .any(|other| other.project == place.project && other.checkout != place.checkout);
-            let group = match (first_of_project, first_of_checkout) {
-                (true, _) if several => Some(header_value(&place.project, Some(&place.label))),
-                (true, _) => Some(place.project.clone()),
-                (false, true) => Some(format!("{}└─ \u{f418} {}", indent(1), place.label)),
-                (false, false) => None,
-            };
-            let stale = group.is_some()
-                && places.iter().zip(stale).all(|(other, &stale)| {
-                    other.as_ref().is_none_or(|o| o.checkout != place.checkout) || stale
-                });
-            let last_of_project = !places[i + 1..]
+            let project = first_of_project.then(|| place.project.clone());
+            // The checkout's header is a continuation row under the project
+            // header on the project's first agent, which Herdr indents itself.
+            let group = first_of_checkout.then(|| {
+                let last = !later
+                    .iter()
+                    .flatten()
+                    .any(|next| next.project == place.project && next.checkout != place.checkout);
+                let corner = if last { "└─" } else { "├─" };
+                let indent = if first_of_project {
+                    String::new()
+                } else {
+                    indent(1)
+                };
+                format!("{indent}{corner} \u{f418} {}", place.label)
+            });
+            let last_of_project = !later
                 .iter()
                 .flatten()
                 .any(|next| next.project == place.project);
-            let depth =
-                usize::from(group.is_none()) + usize::from(nested.contains(&place.checkout));
             GroupRow {
+                project_stale: project.is_some() && all_stale(&|o| o.project == place.project),
+                project,
+                stale: group.is_some() && all_stale(&|o| o.checkout == place.checkout),
+                depth: if group.is_some() { 1 } else { 2 },
                 group,
-                stale,
                 gap: last_of_project.then(|| ZWSP.to_string()),
-                depth,
             }
         })
         .collect()
@@ -1537,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn group_rows_head_each_checkout_indent_members_and_fade_stale_groups() {
+    fn group_rows_draw_project_branch_session_and_fade_stale_groups() {
         let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
                 project: project.into(),
@@ -1556,21 +1565,41 @@ mod tests {
             ],
             &[false, true, true, true, false, true],
         );
-        let row = |group: Option<&str>, stale: bool, gap: bool, depth: usize| GroupRow {
-            group: group.map(String::from),
-            stale,
-            gap: gap.then(|| "\u{200b}".to_string()),
-            depth,
-        };
+        let s = |v: &str| Some(v.to_string());
+        let gap = s("\u{200b}");
         assert_eq!(
             rows,
             [
-                row(Some("search  \u{f418} main"), false, false, 0),
-                row(None, false, false, 1),
-                row(Some("\u{200b}  └─ \u{f418} fix-x"), true, false, 1),
-                row(None, false, true, 2),
+                GroupRow {
+                    project: s("search"),
+                    group: s("├─ \u{f418} main"),
+                    depth: 1,
+                    ..Default::default()
+                },
+                GroupRow {
+                    depth: 2,
+                    ..Default::default()
+                },
+                GroupRow {
+                    group: s("\u{200b}  └─ \u{f418} fix-x"),
+                    stale: true,
+                    depth: 1,
+                    ..Default::default()
+                },
+                GroupRow {
+                    gap: gap.clone(),
+                    depth: 2,
+                    ..Default::default()
+                },
                 GroupRow::default(),
-                row(Some("dotfiles"), true, true, 0),
+                GroupRow {
+                    project: s("dotfiles"),
+                    project_stale: true,
+                    group: s("└─ \u{f418} main"),
+                    stale: true,
+                    gap,
+                    depth: 1,
+                },
             ]
         );
     }
