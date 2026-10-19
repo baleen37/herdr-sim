@@ -18,9 +18,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, PrState,
-    Scope, TITLE_TOKEN, agent_count_value, agent_icon, claude_session, codex_session,
-    heading_value, project_name, scope, summary_value, token_value, workspace_agent_token,
+    AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
+    PROJECT_TOKEN, PrState, Scope, TITLE_TOKEN, agent_count_value, agent_icon, claude_session,
+    codex_session, heading_value, project_name, resolve_claude_session, scope, summary_value,
+    token_value, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -180,13 +181,17 @@ impl Run {
         let (Some(pane), Some(icon)) = (agent["pane_id"].as_str(), agent_icon(kind)) else {
             return;
         };
-        let project = agent["cwd"].as_str().map(|cwd| match git_repo(cwd) {
-            Some(repo) => repo.project,
-            None => dir_name(cwd, &self.home),
-        });
+        let (project, branch) = match agent["cwd"].as_str() {
+            Some(cwd) => match git_repo(cwd) {
+                Some(repo) => (Some(repo.project), repo.branch),
+                None => (Some(dir_name(cwd, &self.home)), None),
+            },
+            None => (None, None),
+        };
         let mut tokens = vec![
             (AGENT_ICON_TOKEN.to_string(), Some(icon.to_string())),
             (PROJECT_TOKEN.to_string(), project),
+            (BRANCH_TOKEN.to_string(), branch),
         ];
         // The logo needs no session; the PRs and title do, so leave those be.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
@@ -195,7 +200,8 @@ impl Run {
             return;
         };
         let session = if kind == "claude" {
-            claude_session(&self.home, session, &mut self.cache)
+            let session = resolve_claude_session(&self.home, session);
+            claude_session(&self.home, &session, &mut self.cache)
         } else {
             codex_session(&self.home, session, &mut self.cache)
         };

@@ -182,6 +182,11 @@ pub fn summary_value(counts: &HashMap<PrState, usize>) -> Option<String> {
 /// Sidebar token holding an agent session's title, referenced as `$title`.
 pub const TITLE_TOKEN: &str = "title";
 
+/// Sidebar token with the branch checked out where an agent pane works,
+/// referenced as `$branch` (Herdr's own `branch` token exists on Space rows
+/// only). Unset outside a repository or on a detached HEAD.
+pub const BRANCH_TOKEN: &str = "branch";
+
 /// Sidebar token with the agent's logo and title in one value, referenced as
 /// `$heading`. Herdr puts ` · ` between tokens; one token reads like a line in
 /// Claude Code's own session list. The cost is a single colour for both.
@@ -212,6 +217,30 @@ enum Hit {
         custom: bool,
         text: String,
     },
+}
+
+/// The session a Claude Code pane is really showing. Herdr reports the id of
+/// the `claude` process in the pane, but that process may have parked its
+/// conversation as a background job (`/background`): its
+/// `~/.claude/sessions/<pid>.json` then names the job, whose
+/// `~/.claude/jobs/<job>/state.json` holds the session the user is in.
+pub fn resolve_claude_session(home: &Path, session_id: &str) -> String {
+    let parked = entries(&home.join(".claude/sessions")).find_map(|path| {
+        if path.extension().is_none_or(|e| e != "json") {
+            return None;
+        }
+        let v = parse(&fs::read_to_string(&path).ok()?)?;
+        if v["sessionId"].as_str() != Some(session_id) {
+            return None;
+        }
+        v["parkedJobId"].as_str().map(String::from)
+    });
+    parked
+        .and_then(|job| {
+            let state = fs::read_to_string(home.join(".claude/jobs").join(job).join("state.json"));
+            parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
+        })
+        .unwrap_or_else(|| session_id.to_string())
 }
 
 /// A Claude Code session: PRs from its `pr-link` records, and its title from
@@ -646,6 +675,31 @@ mod tests {
                 .prs
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn resolve_follows_a_parked_pane_to_its_background_job() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let pane = json!({ "pid": 1, "sessionId": "pane", "parkedJobId": "job1" });
+        fs::write(sessions.join("1.json"), pane.to_string()).unwrap();
+        fs::write(
+            sessions.join("2.json"),
+            json!({ "sessionId": "plain" }).to_string(),
+        )
+        .unwrap();
+        let job = home.path().join(".claude/jobs/job1");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(
+            job.join("state.json"),
+            json!({ "sessionId": "forked" }).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(resolve_claude_session(home.path(), "pane"), "forked");
+        assert_eq!(resolve_claude_session(home.path(), "plain"), "plain");
+        assert_eq!(resolve_claude_session(home.path(), "unknown"), "unknown");
     }
 
     #[test]
