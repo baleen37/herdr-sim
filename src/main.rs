@@ -22,11 +22,12 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_TOKEN,
-    TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN,
-    activity_order, age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
-    codex_session, diff_value, group_rows, header_value, heading_value, held_status, project_name,
-    resolve_claude_session, scope, split_marks, state_heading_token, summary_value, token_value,
+    SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
+    agent_icon, checkout_headers, claude_session, codex_session, diff_value, group_rows,
+    header_value, heading_value, held_status, indent, project_name, resolve_claude_session, scope,
+    split_marks, state_heading_token, state_heading_value, summary_value, token_value,
     tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
@@ -146,10 +147,11 @@ impl Run {
             }
         }
 
-        self.report_states(&agents);
-        // A turn start changes only colours; tree order and headers wait for
-        // its end, as before.
+        let states = self.states(&agents);
+        // A turn start or a focus changes only colours; tree order and
+        // headers wait for a turn's end, as before.
         if scope == &Scope::Status {
+            self.report_states(&agents, &states);
             return;
         }
 
@@ -159,10 +161,12 @@ impl Run {
         // follow the same order.
         let activity: Vec<Activity> = agents
             .iter()
-            .map(|agent| Activity {
+            .zip(&states)
+            .map(|(agent, (_, state))| Activity {
                 place: agent["cwd"].as_str().map(|cwd| self.place(cwd)),
                 tab: agent["tab_id"].as_str().unwrap_or_default().to_string(),
                 seq: agent["state_change_seq"].as_u64().unwrap_or(0),
+                stale: *state == STALE_HEADING_TOKEN,
             })
             .collect();
         // Agents without a place get no rank, so the view lists them last.
@@ -175,14 +179,25 @@ impl Run {
         let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
         let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
         let marks = split_marks(&tabs);
+        let stale: Vec<bool> = order.iter().map(|&i| activity[i].stale).collect();
         let headers = tree_headers(&places)
             .into_iter()
             .zip(checkout_headers(&places))
-            .zip(group_rows(&places));
-        for (pos, (((project, worktree), header), (group, gap))) in headers.enumerate() {
+            .zip(group_rows(&places, &stale));
+        for (pos, (((project, worktree), header), row)) in headers.enumerate() {
             let agent = &agents[order[pos]];
             let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
+            };
+            // The indent goes on the row's first cell: the split mark when
+            // there is one, else the heading.
+            let split = marks[pos].map(|mark| format!("{}{mark}", indent(row.depth)));
+            self.cache
+                .set_depth(pane, if split.is_some() { 0 } else { row.depth });
+            let (group, group_stale) = if row.stale {
+                (None, row.group)
+            } else {
+                (row.group, None)
             };
             // The branch PR rides on the checkout's card, from the same cache
             // the Space pass fills, so it costs no extra gh call.
@@ -203,9 +218,10 @@ impl Run {
                 (TREE_PR_TOKEN.to_string(), card_pr),
                 (TREE_HEADER_TOKEN.to_string(), header),
                 (TREE_GROUP_TOKEN.to_string(), group),
-                (TREE_GAP_TOKEN.to_string(), gap),
+                (TREE_GROUP_STALE_TOKEN.to_string(), group_stale),
+                (TREE_GAP_TOKEN.to_string(), row.gap),
                 (AGE_TOKEN.to_string(), self.age_secs(agent).map(age_value)),
-                (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
+                (TREE_SPLIT_TOKEN.to_string(), split),
                 (
                     SORT_RANK_TOKEN.to_string(),
                     (pos < ranked).then(|| format!("{pos:04}")),
@@ -213,6 +229,7 @@ impl Run {
             ];
             self.report("pane", pane, "tree", None, &tokens);
         }
+        self.report_states(&agents, &states);
 
         // A workspace shows the PR of the branch checked out in its first pane
         // that sits in a git repository, and the logos of its agents.
@@ -394,26 +411,40 @@ impl Run {
     }
 
     /// How long ago the agent's session file last changed.
+    /// Each agent's shown status and state token: Herdr's status, holding
+    /// a finished turn until seen and a question until answered.
+    fn states(&mut self, agents: &[Value]) -> Vec<(String, &'static str)> {
+        agents
+            .iter()
+            .map(|agent| {
+                let status = agent["agent_status"].as_str().unwrap_or("unknown");
+                let focused = agent["focused"].as_bool().unwrap_or(false);
+                let pane = agent["pane_id"].as_str().unwrap_or_default();
+                let held = self.cache.held(pane).map(String::from);
+                let (status, held) = held_status(status, held.as_deref(), focused);
+                let status = status.to_string();
+                self.cache.set_held(pane, held);
+                let token = state_heading_token(&status, self.age_secs(agent));
+                (status, token)
+            })
+            .collect()
+    }
+
     /// Puts each agent's heading in the token for its state (herdr-radar's
     /// colour by state), reusing the heading the last full pass computed.
-    fn report_states(&mut self, agents: &[Value]) {
-        for agent in agents {
+    fn report_states(&mut self, agents: &[Value], states: &[(String, &'static str)]) {
+        for (agent, (status, state)) in agents.iter().zip(states) {
             let (Some(pane), Some(icon)) = (
                 agent["pane_id"].as_str(),
                 agent_icon(agent["agent"].as_str().unwrap_or_default()),
             ) else {
                 continue;
             };
-            let status = agent["agent_status"].as_str().unwrap_or("unknown");
-            let focused = agent["focused"].as_bool().unwrap_or(false);
-            let held = self.cache.held(pane).map(String::from);
-            let (status, held) = held_status(status, held.as_deref(), focused);
-            self.cache.set_held(pane, held);
-            let state = state_heading_token(status, self.age_secs(agent));
             let heading = self.cache.heading(pane).unwrap_or_else(|| icon.to_string());
+            let value = state_heading_value(&heading, status, self.cache.depth(pane));
             let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
-                .map(|t| (t.to_string(), (*t == state).then(|| heading.clone())))
+                .map(|t| (t.to_string(), (t == state).then(|| value.clone())))
                 .collect();
             self.report("pane", pane, "state", None, &tokens);
         }
