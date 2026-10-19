@@ -179,33 +179,82 @@ pub fn summary_value(counts: &HashMap<PrState, usize>) -> Option<String> {
     }
 }
 
-/// PR URLs a Claude Code session linked, in first-seen order.
-pub fn claude_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String> {
-    let file = format!("{session_id}.jsonl");
-    let mut urls = Vec::new();
-    for project in subdirs(&home.join(".claude/projects")) {
-        urls.extend(cache.scan(&project.join(&file), |line| {
-            if !line.contains(r#""type":"pr-link""#) {
-                return Vec::new();
-            }
-            parse(line)
-                .and_then(|v| v["prUrl"].as_str().map(String::from))
-                .into_iter()
-                .collect()
-        }));
+/// Sidebar token holding an agent session's title, referenced as `$title`.
+pub const TITLE_TOKEN: &str = "title";
+
+/// Sidebar token with the agent's logo and title in one value, referenced as
+/// `$heading`. Herdr puts ` · ` between tokens; one token reads like a line in
+/// Claude Code's own session list. The cost is a single colour for both.
+pub const HEADING_TOKEN: &str = "heading";
+
+/// The logo followed by the title, or the logo alone before there is a title.
+pub fn heading_value(icon: &str, title: Option<&str>) -> String {
+    match title {
+        Some(title) => format!("{icon} {title}"),
+        None => icon.to_string(),
     }
-    dedup(urls)
 }
 
-/// PR URLs printed by `gh pr ...` commands in a Codex session, in first-seen order.
-pub fn codex_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String> {
+/// What herdr-sim knows about one agent session.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Session {
+    /// PR URLs the session touched, in first-seen order.
+    pub prs: Vec<String>,
+    /// The session's title, if it has one yet.
+    pub title: Option<String>,
+}
+
+/// One thing found in a session file line.
+enum Hit {
+    Pr(String),
+    /// `custom`: a title the user gave (`/rename`), which outranks generated ones.
+    Title {
+        custom: bool,
+        text: String,
+    },
+}
+
+/// A Claude Code session: PRs from its `pr-link` records, and its title from
+/// the latest `custom-title` record, or else the latest `ai-title` one.
+pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Session {
+    let file = format!("{session_id}.jsonl");
+    let mut session = Session::default();
+    for project in subdirs(&home.join(".claude/projects")) {
+        let found = cache.scan(&project.join(&file), |line| {
+            let (field, custom) = if line.contains(r#""type":"pr-link""#) {
+                ("prUrl", None)
+            } else if line.contains(r#""type":"custom-title""#) {
+                ("customTitle", Some(true))
+            } else if line.contains(r#""type":"ai-title""#) {
+                ("aiTitle", Some(false))
+            } else {
+                return Vec::new();
+            };
+            let Some(text) = parse(line).and_then(|v| v[field].as_str().map(String::from)) else {
+                return Vec::new();
+            };
+            vec![match custom {
+                None => Hit::Pr(text),
+                Some(custom) => Hit::Title { custom, text },
+            }]
+        });
+        session.prs.extend(found.urls);
+        session.title = session.title.or(found.title);
+    }
+    session.prs = dedup(session.prs);
+    session
+}
+
+/// A Codex session: PRs printed by `gh pr ...` commands in its rollout, and
+/// its title from the latest `thread_name` in `~/.codex/session_index.jsonl`.
+pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Session {
     let suffix = format!("{session_id}.jsonl");
     let mut urls = Vec::new();
     for year in subdirs(&home.join(".codex/sessions")) {
         for month in subdirs(&year) {
             for day in subdirs(&month) {
                 for rollout in files_ending_with(&day, &suffix) {
-                    urls.extend(cache.scan(&rollout, |line| {
+                    let found = cache.scan(&rollout, |line| {
                         if !line.contains(r#""CommandExecution""#) || !line.contains("/pull/") {
                             return Vec::new();
                         }
@@ -216,13 +265,36 @@ pub fn codex_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String
                         if !is_gh_pr_command(&item["command"].to_string()) {
                             return Vec::new();
                         }
-                        pr_urls(item["aggregated_output"].as_str().unwrap_or(""))
-                    }));
+                        let output = item["aggregated_output"].as_str().unwrap_or("");
+                        pr_urls(output).into_iter().map(Hit::Pr).collect()
+                    });
+                    urls.extend(found.urls);
                 }
             }
         }
     }
-    dedup(urls)
+    let mut title = None;
+    let index = home.join(".codex/session_index.jsonl");
+    let id = format!(r#""id":"{session_id}""#);
+    for_each_line(&index, |line| {
+        if line.contains(&id)
+            && let Some(name) =
+                parse(line).and_then(|v| v["thread_name"].as_str().map(String::from))
+        {
+            title = Some(name);
+        }
+    });
+    Session {
+        prs: dedup(urls),
+        title,
+    }
+}
+
+fn for_each_line(path: &Path, mut f: impl FnMut(&str)) {
+    let Ok(file) = File::open(path) else { return };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        f(&line);
+    }
 }
 
 fn is_gh_pr_command(command: &str) -> bool {
@@ -274,6 +346,14 @@ pub struct Cache {
 struct Scanned {
     offset: u64,
     urls: Vec<String>,
+    /// Latest title so far, and whether the user set it.
+    title: Option<(bool, String)>,
+}
+
+/// What [`Cache::scan`] has found in a file so far.
+struct Found {
+    urls: Vec<String>,
+    title: Option<String>,
 }
 
 impl Cache {
@@ -296,9 +376,13 @@ impl Cache {
         let files = object(&v["files"])
             .filter_map(|(path, v)| {
                 let urls = v["urls"].as_array()?.iter().filter_map(|u| u.as_str());
+                let title = v["title"]
+                    .as_str()
+                    .map(|t| (v["custom"].as_bool().unwrap_or(false), t.to_string()));
                 let scanned = Scanned {
                     offset: v["offset"].as_u64()?,
                     urls: urls.map(String::from).collect(),
+                    title,
                 };
                 Some((path.clone(), scanned))
             })
@@ -334,7 +418,12 @@ impl Cache {
         let files: serde_json::Map<String, Value> = self
             .files
             .iter()
-            .map(|(path, s)| (path.clone(), json!({ "offset": s.offset, "urls": s.urls })))
+            .map(|(path, s)| {
+                let (custom, title) = s.title.clone().unzip();
+                let entry =
+                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom });
+                (path.clone(), entry)
+            })
             .collect();
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
@@ -415,12 +504,15 @@ impl Cache {
         self.reported.clear();
     }
 
-    /// URLs `extract` finds in `path`'s lines, reading only complete lines
+    /// What `extract` finds in `path`'s lines, reading only complete lines
     /// appended since the previous scan. Session files are append-only; one
     /// that shrank was rewritten and is read again from the start.
-    fn scan(&mut self, path: &Path, mut extract: impl FnMut(&str) -> Vec<String>) -> Vec<String> {
+    fn scan(&mut self, path: &Path, mut extract: impl FnMut(&str) -> Vec<Hit>) -> Found {
         let Ok(file) = File::open(path) else {
-            return Vec::new();
+            return Found {
+                urls: Vec::new(),
+                title: None,
+            };
         };
         let key = path.to_string_lossy().into_owned();
         let scanned = self.files.entry(key).or_default();
@@ -435,13 +527,24 @@ impl Cache {
                 && line.ends_with(b"\n")
             {
                 scanned.offset += line.len() as u64;
-                scanned
-                    .urls
-                    .extend(extract(&String::from_utf8_lossy(&line)));
+                for hit in extract(&String::from_utf8_lossy(&line)) {
+                    match hit {
+                        Hit::Pr(url) => scanned.urls.push(url),
+                        // A generated title never replaces one the user chose.
+                        Hit::Title { custom, text } => {
+                            if custom || !scanned.title.as_ref().is_some_and(|(c, _)| *c) {
+                                scanned.title = Some((custom, text));
+                            }
+                        }
+                    }
+                }
                 line.clear();
             }
         }
-        scanned.urls.clone()
+        Found {
+            urls: scanned.urls.clone(),
+            title: scanned.title.as_ref().map(|(_, t)| t.clone()),
+        }
     }
 }
 
@@ -532,13 +635,58 @@ mod tests {
         );
         let mut cache = Cache::default();
         assert_eq!(
-            claude_prs(home.path(), "s1", &mut cache),
+            claude_session(home.path(), "s1", &mut cache).prs,
             [
                 "https://github.com/o/search/pull/1",
                 "https://github.com/o/batch/pull/2"
             ]
         );
-        assert!(claude_prs(home.path(), "other", &mut cache).is_empty());
+        assert!(
+            claude_session(home.path(), "other", &mut cache)
+                .prs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn claude_title_prefers_the_users_rename_over_generated_ones() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".claude/projects/p/s1.jsonl");
+        let ai = |t: &str| json!({ "type": "ai-title", "aiTitle": t });
+        write(&path, &[ai("first guess"), ai("better guess")]);
+        let mut cache = Cache::default();
+        let title = |cache: &mut Cache| claude_session(home.path(), "s1", cache).title;
+        assert_eq!(title(&mut cache).as_deref(), Some("better guess"));
+
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({ "type": "custom-title", "customTitle": "mine" })
+        )
+        .unwrap();
+        writeln!(f, "{}", ai("later guess")).unwrap();
+        assert_eq!(title(&mut cache).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn codex_title_is_the_latest_thread_name_for_the_session() {
+        let home = TempDir::new().unwrap();
+        let entry = |id: &str, name: &str| json!({ "id": id, "thread_name": name });
+        write(
+            &home.path().join(".codex/session_index.jsonl"),
+            &[
+                entry("c1", "old"),
+                entry("c2", "other"),
+                entry("c1", "renamed"),
+            ],
+        );
+        let session = codex_session(home.path(), "c1", &mut Cache::default());
+        assert_eq!(session.title.as_deref(), Some("renamed"));
+        assert_eq!(
+            codex_session(home.path(), "c9", &mut Cache::default()).title,
+            None
+        );
     }
 
     #[test]
@@ -547,14 +695,14 @@ mod tests {
         let path = home.path().join(".claude/projects/p/s1.jsonl");
         write(&path, &[link(1)]);
         let mut cache = Cache::default();
-        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 1);
+        assert_eq!(claude_session(home.path(), "s1", &mut cache).prs.len(), 1);
 
         // A line still being written (no newline yet) is left for the next run.
         let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
         write!(f, "{}", link(2)).unwrap();
-        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 1);
+        assert_eq!(claude_session(home.path(), "s1", &mut cache).prs.len(), 1);
         writeln!(f).unwrap();
-        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 2);
+        assert_eq!(claude_session(home.path(), "s1", &mut cache).prs.len(), 2);
 
         // The offset survives a save/load, so already-read lines are not read
         // again: editing the first line in place (same length) changes nothing.
@@ -564,7 +712,7 @@ mod tests {
             .unwrap()
             .replacen("pull/1", "pull/9", 1);
         fs::write(&path, text).unwrap();
-        let urls = claude_prs(home.path(), "s1", &mut Cache::load(&saved));
+        let urls = claude_session(home.path(), "s1", &mut Cache::load(&saved)).prs;
         assert_eq!(
             urls,
             [
@@ -607,7 +755,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            codex_prs(home.path(), "c1", &mut Cache::default()),
+            codex_session(home.path(), "c1", &mut Cache::default()).prs,
             [
                 "https://github.com/o/infra/pull/750",
                 "https://github.com/o/infra/pull/751"
@@ -680,6 +828,15 @@ mod tests {
         let worktree = "/dev/search/.worktrees/search-14527-status";
         assert_eq!(project_name(worktree, "/dev/search/.git"), "search");
         assert_eq!(project_name("/srv/infra", "/srv/repos/infra.git"), "infra");
+    }
+
+    #[test]
+    fn heading_is_the_logo_then_the_title() {
+        assert_eq!(
+            heading_value("\u{ec82}", Some("Fix login")),
+            "\u{ec82} Fix login"
+        );
+        assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
     }
 
     #[test]

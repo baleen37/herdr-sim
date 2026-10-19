@@ -18,9 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGENT_ICON_TOKEN, AGENT_KINDS, Cache, PR_SUMMARY_TOKEN, PROJECT_TOKEN, PrState, Scope,
-    agent_count_value, agent_icon, claude_prs, codex_prs, project_name, scope, summary_value,
-    token_value, workspace_agent_token,
+    AGENT_ICON_TOKEN, AGENT_KINDS, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, PrState,
+    Scope, TITLE_TOKEN, agent_count_value, agent_icon, claude_session, codex_session,
+    heading_value, project_name, scope, summary_value, token_value, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -184,27 +184,31 @@ impl Run {
             Some(repo) => repo.project,
             None => dir_name(cwd, &self.home),
         });
-        let icon = [
+        let mut tokens = vec![
             (AGENT_ICON_TOKEN.to_string(), Some(icon.to_string())),
             (PROJECT_TOKEN.to_string(), project),
         ];
-        // The logo needs no session; the PRs do, so leave those as they are.
+        // The logo needs no session; the PRs and title do, so leave those be.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
-            self.report("pane", pane, None, &icon);
+            tokens.push((HEADING_TOKEN.to_string(), Some(heading_value(icon, None))));
+            self.report("pane", pane, None, &tokens);
             return;
         };
-        let urls = if kind == "claude" {
-            claude_prs(&self.home, session, &mut self.cache)
+        let session = if kind == "claude" {
+            claude_session(&self.home, session, &mut self.cache)
         } else {
-            codex_prs(&self.home, session, &mut self.cache)
+            codex_session(&self.home, session, &mut self.cache)
         };
         let mut counts: HashMap<PrState, usize> = HashMap::new();
-        for url in &urls {
+        for url in &session.prs {
             if let Some(state) = self.cache.state(url, self.now, gh_pr_state) {
                 *counts.entry(state).or_default() += 1;
             }
         }
-        self.report("pane", pane, Some(&counts), &icon);
+        let heading = heading_value(icon, session.title.as_deref());
+        tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
+        tokens.push((TITLE_TOKEN.to_string(), session.title));
+        self.report("pane", pane, Some(&counts), &tokens);
     }
 
     /// Sets `tokens` on a pane or workspace (clearing those that are `None`),
