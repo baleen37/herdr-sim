@@ -1,5 +1,6 @@
 //! Herdr plugin entry point: set `$pr_open` / `$pr_merged` / `$pr_closed` on
-//! every Claude Code or Codex pane from the PRs its session touched, and on
+//! every Claude Code or Codex pane from the PRs its session touched, plus
+//! `$agent_icon` with the agent's logo, and on
 //! every workspace from the PR of the branch it has checked out.
 //!
 //! Herdr runs this at server startup, on `pane.agent_status_changed`, and when
@@ -12,7 +13,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use herdr_sim::{Cache, PrState, claude_prs, codex_prs, token_value};
+use herdr_sim::{AGENT_ICON_TOKEN, Cache, PrState, agent_icon, claude_prs, codex_prs, token_value};
 use serde_json::Value;
 
 fn main() -> Result<()> {
@@ -28,16 +29,20 @@ fn main() -> Result<()> {
 
     let list: Value = serde_json::from_slice(&run(&herdr, &["agent", "list"])?)?;
     for agent in list["result"]["agents"].as_array().into_iter().flatten() {
-        let (Some(pane), Some(session)) = (
-            agent["pane_id"].as_str(),
-            agent["agent_session"]["value"].as_str(),
-        ) else {
+        let kind = agent["agent"].as_str().unwrap_or_default();
+        let (Some(pane), Some(icon)) = (agent["pane_id"].as_str(), agent_icon(kind)) else {
             continue;
         };
-        let urls = match agent["agent"].as_str() {
-            Some("claude") => claude_prs(&home, session, &mut cache),
-            Some("codex") => codex_prs(&home, session, &mut cache),
-            _ => continue,
+        let icon = [(AGENT_ICON_TOKEN, icon)];
+        // The logo needs no session; the PRs do, so leave those as they are.
+        let Some(session) = agent["agent_session"]["value"].as_str() else {
+            report(&herdr, "pane", pane, None, &icon);
+            continue;
+        };
+        let urls = if kind == "claude" {
+            claude_prs(&home, session, &mut cache)
+        } else {
+            codex_prs(&home, session, &mut cache)
         };
 
         let mut counts: HashMap<PrState, usize> = HashMap::new();
@@ -47,7 +52,7 @@ fn main() -> Result<()> {
             }
         }
 
-        report(&herdr, "pane", pane, &counts);
+        report(&herdr, "pane", pane, Some(&counts), &icon);
     }
 
     // A workspace shows the PR of the branch checked out in its first pane
@@ -77,25 +82,39 @@ fn main() -> Result<()> {
             .branch_state(&key, now, || gh_branch_pr_state(&repo, &branch))
             .map(|state| HashMap::from([(state, 1)]))
             .unwrap_or_default();
-        report(&herdr, "workspace", workspace, &counts);
+        report(&herdr, "workspace", workspace, Some(&counts), &[]);
     }
     for workspace in workspaces.difference(&done) {
-        report(&herdr, "workspace", workspace, &HashMap::new());
+        report(&herdr, "workspace", workspace, Some(&HashMap::new()), &[]);
     }
 
     cache.save(&cache_path)?;
     Ok(())
 }
 
-/// Sets or clears the three PR tokens on a pane or workspace.
-fn report(herdr: &str, kind: &str, id: &str, counts: &HashMap<PrState, usize>) {
+/// Sets `tokens` on a pane or workspace, and sets or clears the three PR
+/// tokens from `counts` unless it is `None`.
+fn report(
+    herdr: &str,
+    kind: &str,
+    id: &str,
+    counts: Option<&HashMap<PrState, usize>>,
+    tokens: &[(&str, &str)],
+) {
     let mut args: Vec<String> = [kind, "report-metadata", id, "--source", "herdr-sim"]
         .map(String::from)
         .to_vec();
-    for state in PrState::ALL {
-        match token_value(state, counts.get(&state).copied().unwrap_or(0)) {
-            Some(value) => args.extend(["--token".into(), format!("{}={value}", state.token())]),
-            None => args.extend(["--clear-token".into(), state.token().into()]),
+    for (name, value) in tokens {
+        args.extend(["--token".into(), format!("{name}={value}")]);
+    }
+    if let Some(counts) = counts {
+        for state in PrState::ALL {
+            match token_value(state, counts.get(&state).copied().unwrap_or(0)) {
+                Some(value) => {
+                    args.extend(["--token".into(), format!("{}={value}", state.token())])
+                }
+                None => args.extend(["--clear-token".into(), state.token().into()]),
+            }
         }
     }
     // A pane or workspace can close between listing it and here; keep going.

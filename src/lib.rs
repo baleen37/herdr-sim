@@ -57,6 +57,19 @@ impl PrState {
     }
 }
 
+/// Sidebar token holding the agent's logo, referenced as `$agent_icon`.
+pub const AGENT_ICON_TOKEN: &str = "agent_icon";
+
+/// Nerd Font Codicons logo for a Herdr agent id: Claude (`cod-claude`) or
+/// Codex (`cod-openai`).
+pub fn agent_icon(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude" => Some("\u{ec82}"),
+        "codex" => Some("\u{ec81}"),
+        _ => None,
+    }
+}
+
 /// Token value for `count` PRs in one state: the icon, plus the count when
 /// there is more than one. `None` clears the token.
 pub fn token_value(state: PrState, count: usize) -> Option<String> {
