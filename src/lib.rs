@@ -100,9 +100,12 @@ impl Ci {
     }
 
     fn parse(s: &str) -> Option<Self> {
-        [Self::Pass, Self::Fail, Self::Pending]
-            .into_iter()
-            .find(|c| c.name() == s)
+        match s {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
     }
 
     /// Nerd Font Octicons glyph: check, x, dot-fill.
@@ -313,12 +316,15 @@ pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
         .collect()
 }
 
-/// Pane tokens the activity order sorts on, most recent first: the project,
-/// the checkout within it (main checkout and worktrees alike), the tab within
-/// that. The Agents view sorts tokens
-/// as strings, so each key is a zero-padded sequence number then a name that
-/// keeps groups with equal numbers apart.
-pub const SORT_TOKENS: [&str; 3] = ["sort_project", "sort_checkout", "sort_tab"];
+/// Pane token the activity order sorts on, referenced as `$sort_rank`: the
+/// agent's position in [`activity_order`], zero-padded since the Agents view
+/// sorts tokens as strings. Herdr shows exactly the order computed here, and
+/// the token only changes when the order does.
+pub const SORT_RANK_TOKEN: &str = "sort_rank";
+
+pub fn rank_value(position: usize) -> String {
+    format!("{position:04}")
+}
 
 /// One agent as the activity order sees it.
 pub struct Activity {
@@ -328,43 +334,29 @@ pub struct Activity {
     pub seq: u64,
 }
 
-/// Sort keys for each agent; `None` for agents without a place, which the
-/// view then lists last. Each group ranks by its most recent agent.
-pub fn sort_keys(agents: &[Activity]) -> Vec<Option<[String; 3]>> {
-    let mut latest: HashMap<String, u64> = HashMap::new();
-    let mut bump = |key: String, seq: u64| {
-        let latest = latest.entry(key).or_default();
-        *latest = (*latest).max(seq);
-    };
+/// Indices of the agents placed in activity order: projects by their most
+/// recent agent, then checkouts (main checkout and worktrees alike) and tabs
+/// within them the same way; names break ties, then list order. Agents
+/// without a place are left out.
+pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
+    fn groups(agent: &Activity) -> Option<[&str; 3]> {
+        let place = agent.place.as_ref()?;
+        Some([&place.project, &place.checkout, &agent.tab])
+    }
+    let mut latest: [HashMap<&str, u64>; 3] = Default::default();
     for agent in agents {
-        if let Some(place) = &agent.place {
-            bump(format!("p/{}", place.project), agent.seq);
-            bump(format!("c/{}", place.checkout), agent.seq);
-            bump(format!("t/{}", agent.tab), agent.seq);
+        for (level, name) in groups(agent).into_iter().flatten().enumerate() {
+            let seq = latest[level].entry(name).or_default();
+            *seq = (*seq).max(agent.seq);
         }
     }
-    agents
-        .iter()
-        .map(|agent| {
-            let place = agent.place.as_ref()?;
-            let key = |seq: u64, name: &str| format!("{seq:020}/{name}");
-            let project = key(latest[&format!("p/{}", place.project)], &place.project);
-            let checkout = key(latest[&format!("c/{}", place.checkout)], &place.checkout);
-            let tab = key(latest[&format!("t/{}", agent.tab)], &agent.tab);
-            Some([project, checkout, tab])
-        })
-        .collect()
-}
-
-/// Indices of the agents in the order the view shows them: by the keys,
-/// descending, agents without keys last, ties in list order.
-pub fn activity_order(keys: &[Option<[String; 3]>]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|&a, &b| match (&keys[a], &keys[b]) {
-        (Some(a), Some(b)) => b.cmp(a),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+    let mut order: Vec<usize> = (0..agents.len())
+        .filter(|&i| agents[i].place.is_some())
+        .collect();
+    order.sort_by_cached_key(|&i| {
+        let [project, checkout, tab] = groups(&agents[i]).unwrap_or_default();
+        let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
+        [key(0, project), key(1, checkout), key(2, tab)]
     });
     order
 }
@@ -1292,16 +1284,15 @@ mod tests {
             at("search", "/s/batch", "t5", 3),
             at("search", "/s/status", "t6", 2),
             at("search", "/s/status", "t2", 0),
-            // Two idle projects keep apart despite equal keys.
+            // Two idle projects keep apart despite equal seqs.
             at("infra", "/i", "t7", 0),
             at("api", "/a", "t8", 0),
             at("infra", "/i", "t9", 0),
         ];
-        let order = activity_order(&sort_keys(&agents));
         // search (latest 9): status (9: tab t2 then t6), batch (3), the main
-        // checkout (1); dotfiles (5); the two idle projects, whose equal keys
-        // fall back to names; the agent without a place.
-        assert_eq!(order, [1, 6, 5, 4, 0, 2, 9, 7, 8, 3]);
+        // checkout (1); dotfiles (5); the two idle projects and their tabs by
+        // name; the agent without a place is left out.
+        assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9]);
     }
 
     #[test]

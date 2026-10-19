@@ -21,11 +21,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
-    Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState, SORT_TOKENS,
-    Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
+    Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
+    SORT_RANK_TOKEN, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
     TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon, agent_name,
     checkout_headers, claude_session, codex_session, diff_value, heading_value, project_name,
-    resolve_claude_session, scope, session_files, sort_keys, split_marks, summary_value,
+    rank_value, resolve_claude_session, scope, session_files, split_marks, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
@@ -36,9 +36,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(10);
 struct Run {
     herdr: String,
     home: PathBuf,
-    /// Present while the Agents list is in activity order; the
-    /// `--toggle-order` action removes and recreates it.
-    order_off: PathBuf,
+    /// Whether the Agents list is in activity order.
+    ordered: bool,
     now: u64,
     cache: Cache,
 }
@@ -57,20 +56,16 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
     fs::create_dir_all(&state_dir)?;
+    // Present while the order is off; the toggle action flips it.
     let order_off = state_dir.join("order-off");
-    let toggle = env::args().any(|a| a == "--toggle-order");
-    if toggle {
+    if env::args().any(|a| a == "--toggle-order") {
         if order_off.exists() {
             fs::remove_file(&order_off)?;
+            set_agent_view(true);
         } else {
             fs::write(&order_off, b"")?;
+            set_agent_view(false);
         }
-    }
-    // Every run sets the view while the order is on: it dies with the server,
-    // and a plugin linked into a running server gets no startup hook. It is
-    // cleared only by the toggle, so the view of another plugin stays.
-    if toggle || !order_off.exists() {
-        set_agent_view(!order_off.exists());
     }
     let pending = state_dir.join("pending");
     let lock = File::create(state_dir.join("lock"))?;
@@ -91,7 +86,7 @@ fn main() -> Result<()> {
     let mut run = Run {
         herdr: env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()),
         home: PathBuf::from(env::var("HOME").context("HOME is not set")?),
-        order_off,
+        ordered: false,
         now: 0,
         cache: Cache::load(&cache_path),
     };
@@ -100,6 +95,13 @@ fn main() -> Result<()> {
     }
     loop {
         let _ = fs::remove_file(&pending);
+        // Every pass sets the view while the order is on: it dies with the
+        // server, and a plugin linked into a running server gets no startup
+        // hook. Only the toggle clears it, so another plugin's view stays.
+        run.ordered = !order_off.exists();
+        if run.ordered {
+            set_agent_view(true);
+        }
         run.now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         run.pass(&scope);
         run.cache.save(&cache_path)?;
@@ -147,7 +149,7 @@ impl Run {
 
         // Project and checkout (branch) headers over the Agents list. Herdr
         // shows it in the same order as `agent list` when sorted by Space; in
-        // activity order the view sorts on the keys set here, so the headers
+        // activity order the view sorts on the ranks set here, so the headers
         // follow the same order.
         let activity: Vec<Activity> = agents
             .iter()
@@ -157,17 +159,15 @@ impl Run {
                 seq: agent["state_change_seq"].as_u64().unwrap_or(0),
             })
             .collect();
-        let ordered = !self.order_off.exists();
-        let keys = if ordered {
-            sort_keys(&activity)
+        // Agents without a place get no rank, so the view lists them last.
+        let mut order = if self.ordered {
+            activity_order(&activity)
         } else {
-            vec![None; agents.len()]
+            Vec::new()
         };
-        let order = if ordered {
-            activity_order(&keys)
-        } else {
-            (0..agents.len()).collect()
-        };
+        let ranked = order.len();
+        let ordered = self.ordered;
+        order.extend((0..agents.len()).filter(|&i| !ordered || activity[i].place.is_none()));
         let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
         let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
         let marks = split_marks(&tabs);
@@ -179,17 +179,17 @@ impl Run {
             let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
             };
-            let mut tokens = vec![
+            let tokens = [
                 (TREE_PROJECT_TOKEN.to_string(), project),
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
                 (TREE_HEADER_TOKEN.to_string(), header),
                 (AGE_TOKEN.to_string(), self.age(agent)),
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
+                (
+                    SORT_RANK_TOKEN.to_string(),
+                    (pos < ranked).then(|| rank_value(pos)),
+                ),
             ];
-            for (n, name) in SORT_TOKENS.iter().enumerate() {
-                let value = keys[order[pos]].as_ref().map(|k| k[n].clone());
-                tokens.push((name.to_string(), value));
-            }
             self.report("pane", pane, "tree", None, &tokens);
         }
 
@@ -408,11 +408,7 @@ fn set_agent_view(on: bool) {
         env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| "baleen37.herdr-sim".into())
     );
     let (method, params) = if on {
-        let mut sort: Vec<Value> = SORT_TOKENS
-            .iter()
-            .map(|t| json!({"field": {"token": t}, "order": "desc"}))
-            .collect();
-        sort.push(json!({"field": "pane_order", "order": "asc"}));
+        let sort = [json!({"field": {"token": SORT_RANK_TOKEN}, "order": "asc"})];
         let params = json!({"source": source, "label": "active", "sort": sort});
         ("agent.view.set", params)
     } else {
@@ -529,12 +525,8 @@ fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
 /// Uncommitted changes in the checkout at `top` as `$diff`; `None` when clean
 /// or when `git` fails.
 fn git_diff(top: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", top, "diff", "--shortstat", "HEAD"])
-        .output()
-        .ok()?;
-    out.status.success().then_some(())?;
-    diff_value(&String::from_utf8_lossy(&out.stdout))
+    let out = run("git", &["-C", top, "diff", "--shortstat", "HEAD"]).ok()?;
+    diff_value(&String::from_utf8_lossy(&out))
 }
 
 fn gh_pr_state(url: &str) -> Option<PrState> {
