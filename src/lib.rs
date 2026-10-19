@@ -252,6 +252,15 @@ pub struct Place {
 /// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
 pub const TREE_HEADER_TOKEN: &str = "tree_header";
 
+/// The header text shared by Agent and Space rows: repo icon and project,
+/// then branch icon and branch when there is one.
+pub fn header_value(project: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some(branch) => format!("\u{f401} {project}  \u{f418} {branch}"),
+        None => format!("\u{f401} {project}"),
+    }
+}
+
 /// One header per checkout, on the first agent of each, for a flat two-level
 /// list: every header is an entry's first row, so they all line up, and the
 /// project is named on worktrees too. Agents without a place get none.
@@ -262,7 +271,7 @@ pub fn checkout_headers(places: &[Option<Place>]) -> Vec<Option<String>> {
         .map(|place| {
             let place = place.as_ref()?;
             seen.insert(place.checkout.clone())
-                .then(|| format!("\u{f401} {}  \u{f418} {}", place.project, place.label))
+                .then(|| header_value(&place.project, Some(&place.label)))
         })
         .collect()
 }
@@ -447,16 +456,12 @@ pub const BRANCH_TOKEN: &str = "branch";
 /// Claude Code's own session list. The cost is a single colour for both.
 pub const HEADING_TOKEN: &str = "heading";
 
-/// The logo followed by the title, or by the agent's name before there is one.
-pub fn heading_value(icon: &str, title: Option<&str>, agent: &str) -> String {
-    format!("{icon} {}", title.unwrap_or(agent))
-}
-
-/// The name shown for an agent whose session has no title yet.
-pub fn agent_name(kind: &str) -> &'static str {
-    match kind {
-        "codex" => "Codex",
-        _ => "Claude",
+/// The logo followed by the title, or the logo alone before there is a title:
+/// the logo already says which agent it is.
+pub fn heading_value(icon: &str, title: Option<&str>) -> String {
+    match title {
+        Some(title) => format!("{icon} {title}"),
+        None => icon.to_string(),
     }
 }
 
@@ -1192,10 +1197,10 @@ mod tests {
     #[test]
     fn heading_is_the_logo_then_the_title() {
         assert_eq!(
-            heading_value("\u{ec82}", Some("Fix login"), "Claude"),
+            heading_value("\u{ec82}", Some("Fix login")),
             "\u{ec82} Fix login"
         );
-        assert_eq!(heading_value("\u{ec81}", None, "Codex"), "\u{ec81} Codex");
+        assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
     }
 
     #[test]
