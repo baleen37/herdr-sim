@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -68,40 +68,44 @@ pub fn token_value(state: PrState, count: usize) -> Option<String> {
 }
 
 /// PR URLs a Claude Code session linked, in first-seen order.
-pub fn claude_prs(home: &Path, session_id: &str) -> Vec<String> {
+pub fn claude_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String> {
     let file = format!("{session_id}.jsonl");
     let mut urls = Vec::new();
     for project in subdirs(&home.join(".claude/projects")) {
-        for_each_line(&project.join(&file), |line| {
+        urls.extend(cache.scan(&project.join(&file), |line| {
             if !line.contains(r#""type":"pr-link""#) {
-                return;
+                return Vec::new();
             }
-            if let Some(url) = parse(line).and_then(|v| v["prUrl"].as_str().map(String::from)) {
-                urls.push(url);
-            }
-        });
+            parse(line)
+                .and_then(|v| v["prUrl"].as_str().map(String::from))
+                .into_iter()
+                .collect()
+        }));
     }
     dedup(urls)
 }
 
 /// PR URLs printed by `gh pr ...` commands in a Codex session, in first-seen order.
-pub fn codex_prs(home: &Path, session_id: &str) -> Vec<String> {
+pub fn codex_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String> {
     let suffix = format!("{session_id}.jsonl");
     let mut urls = Vec::new();
     for year in subdirs(&home.join(".codex/sessions")) {
         for month in subdirs(&year) {
             for day in subdirs(&month) {
                 for rollout in files_ending_with(&day, &suffix) {
-                    for_each_line(&rollout, |line| {
+                    urls.extend(cache.scan(&rollout, |line| {
                         if !line.contains(r#""CommandExecution""#) || !line.contains("/pull/") {
-                            return;
+                            return Vec::new();
                         }
-                        let Some(v) = parse(line) else { return };
+                        let Some(v) = parse(line) else {
+                            return Vec::new();
+                        };
                         let item = &v["payload"]["item"];
-                        if is_gh_pr_command(&item["command"].to_string()) {
-                            urls.extend(pr_urls(item["aggregated_output"].as_str().unwrap_or("")));
+                        if !is_gh_pr_command(&item["command"].to_string()) {
+                            return Vec::new();
                         }
-                    });
+                        pr_urls(item["aggregated_output"].as_str().unwrap_or(""))
+                    }));
                 }
             }
         }
@@ -143,59 +147,126 @@ fn pr_urls(text: &str) -> Vec<String> {
     urls
 }
 
-/// PR states keyed by URL, persisted between runs.
+/// What one run learned, persisted for the next: PR states keyed by URL, and
+/// how far each session file has been read with the URLs found so far.
 #[derive(Default)]
 pub struct Cache {
-    entries: HashMap<String, (PrState, u64)>,
+    prs: HashMap<String, (PrState, u64)>,
+    files: HashMap<String, Scanned>,
+}
+
+#[derive(Default)]
+struct Scanned {
+    offset: u64,
+    urls: Vec<String>,
 }
 
 impl Cache {
     pub fn load(path: &Path) -> Self {
-        let Some(Value::Object(map)) = fs::read_to_string(path).ok().and_then(|s| parse(&s)) else {
+        let Some(v) = fs::read_to_string(path).ok().and_then(|s| parse(&s)) else {
             return Self::default();
         };
-        let entries = map
-            .into_iter()
+        let prs = object(&v["prs"])
             .filter_map(|(url, v)| {
                 let state = PrState::parse(v["state"].as_str()?)?;
-                Some((url, (state, v["at"].as_u64()?)))
+                Some((url.clone(), (state, v["at"].as_u64()?)))
             })
             .collect();
-        Self { entries }
+        let files = object(&v["files"])
+            .filter_map(|(path, v)| {
+                let urls = v["urls"].as_array()?.iter().filter_map(|u| u.as_str());
+                let scanned = Scanned {
+                    offset: v["offset"].as_u64()?,
+                    urls: urls.map(String::from).collect(),
+                };
+                Some((path.clone(), scanned))
+            })
+            .collect();
+        Self { prs, files }
     }
 
+    /// Writes through a temporary file so a concurrent run never reads half of it.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let map: serde_json::Map<String, Value> = self
-            .entries
+        let prs: serde_json::Map<String, Value> = self
+            .prs
             .iter()
-            .map(|(url, (state, at))| {
-                let state = match state {
-                    PrState::Open => "OPEN",
-                    PrState::Merged => "MERGED",
-                    PrState::Closed => "CLOSED",
-                };
-                (url.clone(), json!({ "state": state, "at": at }))
-            })
+            .map(|(url, (state, at))| (url.clone(), json!({ "state": state.name(), "at": at })))
             .collect();
-        fs::write(path, Value::Object(map).to_string())
+        let files: serde_json::Map<String, Value> = self
+            .files
+            .iter()
+            .map(|(path, s)| (path.clone(), json!({ "offset": s.offset, "urls": s.urls })))
+            .collect();
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        fs::write(&tmp, json!({ "prs": prs, "files": files }).to_string())?;
+        fs::rename(&tmp, path)
     }
 
     /// The PR's state, calling `fetch` only when the cached one may be stale.
+    /// A failed fetch keeps the last known state.
     pub fn state(
         &mut self,
         url: &str,
         now: u64,
         fetch: impl FnOnce(&str) -> Option<PrState>,
     ) -> Option<PrState> {
-        if let Some(&(state, at)) = self.entries.get(url)
+        let cached = self.prs.get(url).copied();
+        if let Some((state, at)) = cached
             && (state != PrState::Open || now.saturating_sub(at) < OPEN_TTL_SECS)
         {
             return Some(state);
         }
-        let state = fetch(url)?;
-        self.entries.insert(url.to_string(), (state, now));
-        Some(state)
+        match fetch(url) {
+            Some(state) => {
+                self.prs.insert(url.to_string(), (state, now));
+                Some(state)
+            }
+            None => cached.map(|(state, _)| state),
+        }
     }
+
+    /// URLs `extract` finds in `path`'s lines, reading only complete lines
+    /// appended since the previous scan. Session files are append-only; one
+    /// that shrank was rewritten and is read again from the start.
+    fn scan(&mut self, path: &Path, mut extract: impl FnMut(&str) -> Vec<String>) -> Vec<String> {
+        let Ok(file) = File::open(path) else {
+            return Vec::new();
+        };
+        let key = path.to_string_lossy().into_owned();
+        let scanned = self.files.entry(key).or_default();
+        if file.metadata().map_or(0, |m| m.len()) < scanned.offset {
+            *scanned = Scanned::default();
+        }
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(scanned.offset)).is_ok() {
+            let mut line = Vec::new();
+            // A line without its newline is still being written; take it next time.
+            while matches!(reader.read_until(b'\n', &mut line), Ok(n) if n > 0)
+                && line.ends_with(b"\n")
+            {
+                scanned.offset += line.len() as u64;
+                scanned
+                    .urls
+                    .extend(extract(&String::from_utf8_lossy(&line)));
+                line.clear();
+            }
+        }
+        scanned.urls.clone()
+    }
+}
+
+impl PrState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Open => "OPEN",
+            Self::Merged => "MERGED",
+            Self::Closed => "CLOSED",
+        }
+    }
+}
+
+fn object(v: &Value) -> impl Iterator<Item = (&String, &Value)> {
+    v.as_object().into_iter().flatten()
 }
 
 fn parse(s: &str) -> Option<Value> {
@@ -231,22 +302,21 @@ fn entries(dir: &Path) -> impl Iterator<Item = PathBuf> {
         .map(|e| e.path())
 }
 
-fn for_each_line(path: &Path, mut f: impl FnMut(&str)) {
-    let Ok(file) = File::open(path) else { return };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        f(&line);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tempfile::TempDir;
 
+    /// JSONL as agents write it: every line, including the last, ends in `\n`.
     fn write(path: &Path, lines: &[Value]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
-        fs::write(path, body.join("\n")).unwrap();
+        let body: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        fs::write(path, body).unwrap();
+    }
+
+    fn link(n: u32) -> Value {
+        json!({ "type": "pr-link", "prUrl": format!("https://github.com/o/r/pull/{n}") })
     }
 
     fn codex_command(command: &str, output: &str) -> Value {
@@ -270,14 +340,57 @@ mod tests {
                 link("https://github.com/o/search/pull/1"),
             ],
         );
+        let mut cache = Cache::default();
         assert_eq!(
-            claude_prs(home.path(), "s1"),
+            claude_prs(home.path(), "s1", &mut cache),
             [
                 "https://github.com/o/search/pull/1",
                 "https://github.com/o/batch/pull/2"
             ]
         );
-        assert!(claude_prs(home.path(), "other").is_empty());
+        assert!(claude_prs(home.path(), "other", &mut cache).is_empty());
+    }
+
+    #[test]
+    fn scan_reads_only_complete_appended_lines() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".claude/projects/p/s1.jsonl");
+        write(&path, &[link(1)]);
+        let mut cache = Cache::default();
+        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 1);
+
+        // A line still being written (no newline yet) is left for the next run.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(f, "{}", link(2)).unwrap();
+        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 1);
+        writeln!(f).unwrap();
+        assert_eq!(claude_prs(home.path(), "s1", &mut cache).len(), 2);
+
+        // The offset survives a save/load, so already-read lines are not read
+        // again: editing the first line in place (same length) changes nothing.
+        let saved = home.path().join("cache.json");
+        cache.save(&saved).unwrap();
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replacen("pull/1", "pull/9", 1);
+        fs::write(&path, text).unwrap();
+        let urls = claude_prs(home.path(), "s1", &mut Cache::load(&saved));
+        assert_eq!(
+            urls,
+            [
+                "https://github.com/o/r/pull/1",
+                "https://github.com/o/r/pull/2"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_fetch_keeps_last_known_state() {
+        let mut cache = Cache::default();
+        let url = "https://github.com/o/r/pull/1";
+        cache.state(url, 0, |_| Some(PrState::Open));
+        assert_eq!(cache.state(url, 1_000, |_| None), Some(PrState::Open));
+        assert_eq!(Cache::default().state(url, 0, |_| None), None);
     }
 
     #[test]
@@ -304,7 +417,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            codex_prs(home.path(), "c1"),
+            codex_prs(home.path(), "c1", &mut Cache::default()),
             [
                 "https://github.com/o/infra/pull/750",
                 "https://github.com/o/infra/pull/751"

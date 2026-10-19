@@ -33,8 +33,8 @@ fn main() -> Result<()> {
             continue;
         };
         let urls = match agent["agent"].as_str() {
-            Some("claude") => claude_prs(&home, session),
-            Some("codex") => codex_prs(&home, session),
+            Some("claude") => claude_prs(&home, session, &mut cache),
+            Some("codex") => codex_prs(&home, session, &mut cache),
             _ => continue,
         };
 
@@ -56,7 +56,10 @@ fn main() -> Result<()> {
                 None => args.extend(["--clear-token".into(), state.token().into()]),
             }
         }
-        run(&herdr, &args)?;
+        // A pane can close between `agent list` and here; keep going for the rest.
+        if let Err(err) = run(&herdr, &args) {
+            eprintln!("herdr-sim: {pane}: {err:#}");
+        }
     }
 
     cache.save(&cache_path)?;
