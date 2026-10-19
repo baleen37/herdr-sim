@@ -19,10 +19,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
-    PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN,
-    age_value, agent_count_value, agent_icon, agent_name, claude_session, codex_session,
-    heading_value, project_name, resolve_claude_session, scope, session_files, summary_value,
-    token_value, tree_headers, workspace_agent_token,
+    PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_WORKTREE_TOKEN, age_value, agent_count_value, agent_icon, agent_name, checkout_headers,
+    claude_session, codex_session, heading_value, project_name, resolve_claude_session, scope,
+    session_files, summary_value, token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -128,11 +128,15 @@ impl Run {
             .iter()
             .map(|agent| agent["cwd"].as_str().map(|cwd| self.place(cwd)))
             .collect();
-        for (agent, (project, worktree)) in agents.iter().zip(tree_headers(&places)) {
+        let headers = tree_headers(&places)
+            .into_iter()
+            .zip(checkout_headers(&places));
+        for (agent, ((project, worktree), header)) in agents.iter().zip(headers) {
             if let Some(pane) = agent["pane_id"].as_str() {
                 let tokens = [
                     (TREE_PROJECT_TOKEN.to_string(), project),
                     (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                    (TREE_HEADER_TOKEN.to_string(), header),
                     (AGE_TOKEN.to_string(), self.age(agent)),
                 ];
                 self.report("pane", pane, "tree", None, &tokens);
