@@ -25,9 +25,10 @@ in its first pane that is inside a git repository.
 
 ## Load
 
-A finished turn only revisits its own pane and workspace: about three short
-process calls when nothing changed (`herdr pane get`, `herdr pane list`,
-`git rev-parse`), and no `report-metadata` call unless a token changed. A
+A finished turn only revisits its own pane and workspace: four short process
+calls when nothing changed (`herdr agent list`, `herdr pane list`, and one
+`git rev-parse` each for the pane and its Space), and no `report-metadata` call
+unless a token changed. A
 started turn exits at once. Runs never overlap: one that finds another in
 progress leaves a note, and the running one does a single extra pass. `gh` calls
 are cached as below and killed after 10 seconds.
@@ -72,13 +73,13 @@ Agent and Space rows in Herdr's `config.toml`:
 ```toml
 [ui.sidebar.agents]
 rows = [
-  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "workspace", bold = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "$project", bold = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
   ["terminal_title_stripped"],
 ]
 
 [ui.sidebar.spaces]
 rows = [
-  ["state_icon", "workspace"],
+  ["state_icon", { token = "$project", bold = true }, { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
   ["branch", "git_status", { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
@@ -89,6 +90,8 @@ rows = [
 | `$pr_open` | `` (git-pull-request), followed by a count when more than one (agents only) |
 | `$pr_merged` | `` (git-merge) |
 | `$pr_closed` | `` (git-pull-request-closed) |
+| `$project` | The repository the pane or Space works in. A linked worktree names its main repository (`search`, not `search-14527-status`); a directory outside git is named after itself, `~` for home. |
+| `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
