@@ -17,7 +17,7 @@ out, like a branch row in a Git client.
 
 | Agent | Source |
 | --- | --- |
-| Claude Code | `pr-link` records in the session transcript (`~/.claude/projects/*/<session>.jsonl`). Claude Code writes one when the session creates, pushes to, edits, or comments on a PR. |
+| Claude Code | (A pane whose conversation was parked as a background job is followed to that job's session.) `pr-link` records in the session transcript (`~/.claude/projects/*/<session>.jsonl`). Claude Code writes one when the session creates, pushes to, edits, or comments on a PR. |
 | Codex | PR URLs printed by `gh pr create/edit/comment/ready/close/merge/checkout` in the session rollout (`~/.codex/sessions/**/rollout-*<session>.jsonl`). |
 
 A Space's PR is the one `gh pr view <branch>` finds for the branch checked out
@@ -71,10 +71,15 @@ The plugin only sets tokens, on agent panes and on workspaces; add them to the
 Agent and Space rows in Herdr's `config.toml`:
 
 ```toml
+[ui]
+agent_panel_sort = "spaces"
+
 [ui.sidebar.agents]
 rows = [
+  [{ token = "$tree_project", bold = true }],
+  [{ token = "$tree_worktree", dim = true }],
   ["state_icon", "$heading"],
-  [{ token = "$project", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+  [{ token = "$branch", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
@@ -92,6 +97,8 @@ rows = [
 | `$pr_closed` | `` (git-pull-request-closed) |
 | `$project` | The repository the pane or Space works in. A linked worktree names its main repository (`search`, not `search-14527-status`); a directory outside git is named after itself, `~` for home. |
 | `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
+| `$branch` | On agent panes: the branch checked out where the agent works (Herdr's own `branch` token is for Space rows only). Unset outside git or on a detached HEAD. |
+| `$tree_project`, `$tree_worktree` | A project → worktree tree over the Agents list (the structure follows [herdr-radar](https://github.com/hhdebb/herdr-radar)): the project name on the first agent of each project, `└─ <worktree dir>` on the first agent of each linked worktree. Use `agent_panel_sort = "spaces"` so groups stay together. |
 | `$heading` | On agent panes: the logo and the title as one value (` Fix login`), or the logo alone before there is a title. Herdr puts ` · ` between tokens, so one token reads like a line in Claude Code's own session list; the cost is one colour for both. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Unset until the agent has titled the session. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
