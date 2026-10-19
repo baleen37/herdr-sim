@@ -144,6 +144,45 @@ pub fn project_name(toplevel: &str, common_dir: &str) -> String {
     name.strip_suffix(".git").map(String::from).unwrap_or(name)
 }
 
+/// Sidebar tokens that draw a project → worktree tree over the Agents list,
+/// referenced as `$tree_project` and `$tree_worktree`. Each is set only on the
+/// first agent of its group, so it reads as a header above that group.
+pub const TREE_PROJECT_TOKEN: &str = "tree_project";
+pub const TREE_WORKTREE_TOKEN: &str = "tree_worktree";
+
+/// Where an agent works, for the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub project: String,
+    /// The linked worktree's directory name; `None` in the main checkout.
+    pub worktree: Option<String>,
+}
+
+/// Tree header tokens for agents listed in sidebar order: the project name on
+/// the first agent of each project, `└─ <worktree>` on the first agent of
+/// each worktree. Agents without a place get neither.
+pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<String>)> {
+    let mut seen_projects = std::collections::HashSet::new();
+    let mut seen_worktrees = std::collections::HashSet::new();
+    places
+        .iter()
+        .map(|place| {
+            let Some(place) = place else {
+                return (None, None);
+            };
+            let project = seen_projects
+                .insert(place.project.clone())
+                .then(|| place.project.clone());
+            let worktree = place.worktree.as_ref().and_then(|w| {
+                seen_worktrees
+                    .insert((place.project.clone(), w.clone()))
+                    .then(|| format!("└─ {w}"))
+            });
+            (project, worktree)
+        })
+        .collect()
+}
+
 /// The agents herdr-sim knows, as Herdr agent ids.
 pub const AGENT_KINDS: [&str; 2] = ["claude", "codex"];
 
@@ -369,6 +408,9 @@ pub struct Cache {
     branches: HashMap<String, (Option<PrState>, u64)>,
     files: HashMap<String, Scanned>,
     reported: HashMap<String, String>,
+    /// Where each directory sits in the tree; a checkout's project and
+    /// worktree do not change, so this saves a `git` call per agent per run.
+    places: HashMap<String, Place>,
 }
 
 #[derive(Default)]
@@ -419,11 +461,21 @@ impl Cache {
         let reported = object(&v["reported"])
             .filter_map(|(key, v)| Some((key.clone(), v.as_str()?.to_string())))
             .collect();
+        let places = object(&v["places"])
+            .filter_map(|(cwd, v)| {
+                let place = Place {
+                    project: v["project"].as_str()?.to_string(),
+                    worktree: v["worktree"].as_str().map(String::from),
+                };
+                Some((cwd.clone(), place))
+            })
+            .collect();
         Self {
             prs,
             branches,
             files,
             reported,
+            places,
         }
     }
 
@@ -454,10 +506,20 @@ impl Cache {
                 (path.clone(), entry)
             })
             .collect();
+        let places: serde_json::Map<String, Value> = self
+            .places
+            .iter()
+            .map(|(cwd, p)| {
+                (
+                    cwd.clone(),
+                    json!({ "project": p.project, "worktree": p.worktree }),
+                )
+            })
+            .collect();
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -510,6 +572,15 @@ impl Cache {
             }
             None => cached.and_then(|(state, _)| state),
         }
+    }
+
+    /// The cached tree place of `cwd`, if any.
+    pub fn place(&self, cwd: &str) -> Option<Place> {
+        self.places.get(cwd).cloned()
+    }
+
+    pub fn set_place(&mut self, cwd: &str, place: Place) {
+        self.places.insert(cwd.to_string(), place);
     }
 
     /// Whether `value` differs from what was last reported for `key`; records
@@ -891,6 +962,36 @@ mod tests {
             "\u{ec82} Fix login"
         );
         assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
+    }
+
+    #[test]
+    fn tree_headers_mark_the_first_agent_of_each_group() {
+        let at = |project: &str, worktree: Option<&str>| {
+            Some(Place {
+                project: project.into(),
+                worktree: worktree.map(String::from),
+            })
+        };
+        let headers = tree_headers(&[
+            at("search", None),
+            at("search", None),
+            at("search", Some("status")),
+            at("search", Some("status")),
+            None,
+            at("dotfiles", Some("deploy")),
+        ]);
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            headers,
+            [
+                (some("search"), None),
+                (None, None),
+                (None, some("└─ status")),
+                (None, None),
+                (None, None),
+                (some("dotfiles"), some("└─ deploy")),
+            ]
+        );
     }
 
     #[test]

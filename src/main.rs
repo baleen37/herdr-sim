@@ -19,9 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, Cache, HEADING_TOKEN, PR_SUMMARY_TOKEN,
-    PROJECT_TOKEN, PrState, Scope, TITLE_TOKEN, agent_count_value, agent_icon, claude_session,
-    codex_session, heading_value, project_name, resolve_claude_session, scope, summary_value,
-    token_value, workspace_agent_token,
+    PROJECT_TOKEN, Place, PrState, Scope, TITLE_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN,
+    agent_count_value, agent_icon, claude_session, codex_session, heading_value, project_name,
+    resolve_claude_session, scope, summary_value, token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::Value;
 
@@ -121,6 +121,22 @@ impl Run {
             }
         }
 
+        // Project and worktree headers over the Agents list, which Herdr shows
+        // in the same order as `agent list` when sorted by Space.
+        let places: Vec<Option<Place>> = agents
+            .iter()
+            .map(|agent| agent["cwd"].as_str().map(|cwd| self.place(cwd)))
+            .collect();
+        for (agent, (project, worktree)) in agents.iter().zip(tree_headers(&places)) {
+            if let Some(pane) = agent["pane_id"].as_str() {
+                let tokens = [
+                    (TREE_PROJECT_TOKEN.to_string(), project),
+                    (TREE_WORKTREE_TOKEN.to_string(), worktree),
+                ];
+                self.report("pane", pane, "tree", None, &tokens);
+            }
+        }
+
         // A workspace shows the PR of the branch checked out in its first pane
         // that sits in a git repository, and the logos of its agents.
         let panes = self.json(&["pane", "list"]);
@@ -172,7 +188,7 @@ impl Run {
                 .collect();
             tokens.push((PROJECT_TOKEN.into(), projects.remove(&workspace)));
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
-            self.report("workspace", &workspace, Some(&prs), &tokens);
+            self.report("workspace", &workspace, "space", Some(&prs), &tokens);
         }
     }
 
@@ -183,7 +199,14 @@ impl Run {
         };
         let (project, branch) = match agent["cwd"].as_str() {
             Some(cwd) => match git_repo(cwd) {
-                Some(repo) => (Some(repo.project), repo.branch),
+                Some(repo) => {
+                    let place = Place {
+                        project: repo.project.clone(),
+                        worktree: repo.worktree,
+                    };
+                    self.cache.set_place(cwd, place);
+                    (Some(repo.project), repo.branch)
+                }
                 None => (Some(dir_name(cwd, &self.home)), None),
             },
             None => (None, None),
@@ -196,7 +219,7 @@ impl Run {
         // The logo needs no session; the PRs and title do, so leave those be.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
             tokens.push((HEADING_TOKEN.to_string(), Some(heading_value(icon, None))));
-            self.report("pane", pane, None, &tokens);
+            self.report("pane", pane, "agent", None, &tokens);
             return;
         };
         let session = if kind == "claude" {
@@ -214,17 +237,19 @@ impl Run {
         let heading = heading_value(icon, session.title.as_deref());
         tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
         tokens.push((TITLE_TOKEN.to_string(), session.title));
-        self.report("pane", pane, Some(&counts), &tokens);
+        self.report("pane", pane, "agent", Some(&counts), &tokens);
     }
 
     /// Sets `tokens` on a pane or workspace (clearing those that are `None`),
     /// and sets or clears the PR tokens
     /// (`$pr` and the three per-state ones) from `counts` unless it is `None`.
-    /// Skips the call when it would send what was sent last time.
+    /// Skips the call when it would send what was sent last time for the same
+    /// `slot` (each part of a run that reports on a pane keeps its own record).
     fn report(
         &mut self,
         kind: &str,
         id: &str,
+        slot: &str,
         counts: Option<&HashMap<PrState, usize>>,
         tokens: &[(String, Option<String>)],
     ) {
@@ -253,7 +278,7 @@ impl Run {
                 }
             }
         }
-        let key = format!("{kind}:{id}");
+        let key = format!("{kind}:{id}:{slot}");
         if !self.cache.changed(&key, &args[3..].join("\u{1f}")) {
             return;
         }
@@ -262,6 +287,25 @@ impl Run {
             self.cache.forget_reported(&key);
             eprintln!("herdr-sim: {id}: {err:#}");
         }
+    }
+
+    /// Where `cwd` sits in the tree, from the cache or one `git` call.
+    fn place(&mut self, cwd: &str) -> Place {
+        if let Some(place) = self.cache.place(cwd) {
+            return place;
+        }
+        let place = match git_repo(cwd) {
+            Some(repo) => Place {
+                project: repo.project,
+                worktree: repo.worktree,
+            },
+            None => Place {
+                project: dir_name(cwd, &self.home),
+                worktree: None,
+            },
+        };
+        self.cache.set_place(cwd, place.clone());
+        place
     }
 
     /// A Herdr CLI call's JSON, or `Null` when it fails: one failed lookup
@@ -279,6 +323,8 @@ struct Repo {
     project: String,
     /// `None` on a detached HEAD.
     branch: Option<String>,
+    /// The directory name of a linked worktree; `None` in the main checkout.
+    worktree: Option<String>,
 }
 
 /// The repository `cwd` is in, in one `git` call; `None` outside a repository.
@@ -299,10 +345,22 @@ fn git_repo(cwd: &str) -> Option<Repo> {
     let text = String::from_utf8(out.stdout).ok()?;
     let mut lines = text.lines();
     let (top, common, branch) = (lines.next()?, lines.next()?, lines.next()?);
+    // The main checkout's git dir is <top>/.git; a linked worktree's is not.
+    let main_top = Path::new(common)
+        .parent()
+        .filter(|_| common.ends_with("/.git"));
+    let worktree = (main_top != Some(Path::new(top)))
+        .then(|| {
+            Path::new(top)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .flatten();
     Some(Repo {
         top: top.to_string(),
         project: project_name(top, common),
         branch: (branch != "HEAD").then(|| branch.to_string()),
+        worktree,
     })
 }
 
