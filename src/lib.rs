@@ -184,7 +184,7 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             let first_of_project = seen_projects.insert(place.project.clone());
             let first_of_checkout = seen_worktrees.insert(place.checkout.clone());
             let project = match (first_of_project, first_of_checkout) {
-                (true, _) => Some(place.project.clone()),
+                (true, _) => Some(format!("\u{f401} {}", place.project)),
                 (false, true) => Some(TREE_SPINE.to_string()),
                 (false, false) => None,
             };
@@ -192,6 +192,44 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
             (project, checkout)
         })
         .collect()
+}
+
+/// Sidebar token with how long ago an agent's session last changed,
+/// referenced as `$age`.
+pub const AGE_TOKEN: &str = "age";
+
+/// A short age like Orca's: `now` under 5 minutes, then 10-minute steps,
+/// hours, days. Coarse on purpose: the value, and so a `report-metadata` call,
+/// changes at most six times an hour.
+pub fn age_value(secs: u64) -> String {
+    match secs {
+        0..300 => "now".into(),
+        300..3600 => format!("{}m", (secs / 600).max(1) * 10),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+/// The files an agent session writes as it works: a Claude Code transcript or
+/// Codex rollout.
+pub fn session_files(home: &Path, kind: &str, session_id: &str) -> Vec<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    if kind == "claude" {
+        return subdirs(&home.join(".claude/projects"))
+            .into_iter()
+            .map(|project| project.join(&name))
+            .filter(|path| path.is_file())
+            .collect();
+    }
+    let mut files = Vec::new();
+    for year in subdirs(&home.join(".codex/sessions")) {
+        for month in subdirs(&year) {
+            for day in subdirs(&month) {
+                files.extend(files_ending_with(&day, &name));
+            }
+        }
+    }
+    files
 }
 
 /// The agents herdr-sim knows, as Herdr agent ids.
@@ -1001,13 +1039,26 @@ mod tests {
         assert_eq!(
             headers,
             [
-                (some("search"), some("\u{f418} main")),
+                (some("\u{f401} search"), some("\u{f418} main")),
                 (None, None),
                 (some("│"), some("\u{f418} fix-x")),
                 (None, None),
-                (some("dotfiles"), some("\u{f418} main")),
+                (some("\u{f401} dotfiles"), some("\u{f418} main")),
             ]
         );
+    }
+
+    #[test]
+    fn age_value_is_coarse() {
+        assert_eq!(age_value(0), "now");
+        assert_eq!(age_value(299), "now");
+        assert_eq!(age_value(300), "10m");
+        assert_eq!(age_value(1199), "10m");
+        assert_eq!(age_value(1200), "20m");
+        assert_eq!(age_value(3599), "50m");
+        assert_eq!(age_value(3600), "1h");
+        assert_eq!(age_value(5 * 3600 + 59), "5h");
+        assert_eq!(age_value(2 * 86400), "2d");
     }
 
     #[test]
