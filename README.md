@@ -63,19 +63,20 @@ Agent and Space rows in Herdr's `config.toml`:
 ```toml
 [ui.sidebar.agents]
 rows = [
-  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "workspace", bold = true }, { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
+  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "workspace", bold = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
   ["terminal_title_stripped"],
 ]
 
 [ui.sidebar.spaces]
 rows = [
   ["state_icon", "workspace"],
-  ["branch", "git_status", { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
+  ["branch", "git_status", { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
 
 | Token | Value |
 | --- | --- |
+| `$pr` | All PRs as one icon, like Claude Code's session label: the icon of the state that most needs attention (open, then merged, then closed), then the total when there is more than one — ` 3`. Colour it with `starts_with` rules on the icon. |
 | `$pr_open` | `` (git-pull-request), followed by a count when more than one (agents only) |
 | `$pr_merged` | `` (git-merge) |
 | `$pr_closed` | `` (git-pull-request-closed) |

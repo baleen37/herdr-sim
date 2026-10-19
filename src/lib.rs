@@ -80,6 +80,22 @@ pub fn token_value(state: PrState, count: usize) -> Option<String> {
     }
 }
 
+/// Sidebar token summarising all PRs, referenced as `$pr`.
+pub const PR_SUMMARY_TOKEN: &str = "pr";
+
+/// All PRs as one icon, the way Claude Code labels a session: the icon of the
+/// state that most needs attention (open, then merged, then closed) and, when
+/// there is more than one PR, the total count. `None` clears the token.
+pub fn summary_value(counts: &HashMap<PrState, usize>) -> Option<String> {
+    let lead = PrState::ALL
+        .into_iter()
+        .find(|s| counts.get(s).is_some_and(|&n| n > 0))?;
+    match counts.values().sum::<usize>() {
+        1 => Some(lead.icon().to_string()),
+        total => Some(format!("{} {total}", lead.icon())),
+    }
+}
+
 /// PR URLs a Claude Code session linked, in first-seen order.
 pub fn claude_prs(home: &Path, session_id: &str, cache: &mut Cache) -> Vec<String> {
     let file = format!("{session_id}.jsonl");
@@ -499,6 +515,24 @@ mod tests {
             manifest.lines().any(|l| l == line),
             "herdr-plugin.toml must say {line}"
         );
+    }
+
+    #[test]
+    fn summary_leads_with_the_state_needing_attention() {
+        let counts = |pairs: &[(PrState, usize)]| pairs.iter().copied().collect();
+        assert_eq!(summary_value(&counts(&[])), None);
+        assert_eq!(
+            summary_value(&counts(&[(PrState::Merged, 1)])).unwrap(),
+            "\u{f419}"
+        );
+        let mixed = counts(&[
+            (PrState::Merged, 2),
+            (PrState::Open, 1),
+            (PrState::Closed, 0),
+        ]);
+        assert_eq!(summary_value(&mixed).unwrap(), "\u{f407} 3");
+        let done = counts(&[(PrState::Closed, 1), (PrState::Merged, 1)]);
+        assert_eq!(summary_value(&done).unwrap(), "\u{f419} 2");
     }
 
     #[test]

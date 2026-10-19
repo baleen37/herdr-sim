@@ -13,7 +13,10 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use herdr_sim::{AGENT_ICON_TOKEN, Cache, PrState, agent_icon, claude_prs, codex_prs, token_value};
+use herdr_sim::{
+    AGENT_ICON_TOKEN, Cache, PR_SUMMARY_TOKEN, PrState, agent_icon, claude_prs, codex_prs,
+    summary_value, token_value,
+};
 use serde_json::Value;
 
 fn main() -> Result<()> {
@@ -92,8 +95,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Sets `tokens` on a pane or workspace, and sets or clears the three PR
-/// tokens from `counts` unless it is `None`.
+/// Sets `tokens` on a pane or workspace, and sets or clears the PR tokens
+/// (`$pr` and the three per-state ones) from `counts` unless it is `None`.
 fn report(
     herdr: &str,
     kind: &str,
@@ -108,6 +111,10 @@ fn report(
         args.extend(["--token".into(), format!("{name}={value}")]);
     }
     if let Some(counts) = counts {
+        match summary_value(counts) {
+            Some(value) => args.extend(["--token".into(), format!("{PR_SUMMARY_TOKEN}={value}")]),
+            None => args.extend(["--clear-token".into(), PR_SUMMARY_TOKEN.into()]),
+        }
         for state in PrState::ALL {
             match token_value(state, counts.get(&state).copied().unwrap_or(0)) {
                 Some(value) => {
