@@ -252,6 +252,11 @@ pub struct Place {
 /// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
 pub const TREE_HEADER_TOKEN: &str = "tree_header";
 
+/// Sidebar token with the PR of a checkout's branch, as an icon on the same
+/// agent as `$tree_worktree` (Orca puts the PR on the worktree card),
+/// referenced as `$tree_pr`.
+pub const TREE_PR_TOKEN: &str = "tree_pr";
+
 /// The header text shared by Agent and Space rows: the project, then branch
 /// icon and branch when there is one.
 pub fn header_value(project: &str, branch: Option<&str>) -> String {
