@@ -25,7 +25,7 @@ use herdr_sim::{
     SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_TOKEN,
     TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN,
     activity_order, age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
-    codex_session, diff_value, group_rows, header_value, heading_value, project_name,
+    codex_session, diff_value, group_rows, header_value, heading_value, held_status, project_name,
     resolve_claude_session, scope, split_marks, state_heading_token, summary_value, token_value,
     tree_headers, workspace_agent_token,
 };
@@ -405,6 +405,10 @@ impl Run {
                 continue;
             };
             let status = agent["agent_status"].as_str().unwrap_or("unknown");
+            let focused = agent["focused"].as_bool().unwrap_or(false);
+            let held = self.cache.held(pane).map(String::from);
+            let (status, held) = held_status(status, held.as_deref(), focused);
+            self.cache.set_held(pane, held);
             let state = state_heading_token(status, self.age_secs(agent));
             let heading = self.cache.heading(pane).unwrap_or_else(|| icon.to_string());
             let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
