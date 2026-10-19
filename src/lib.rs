@@ -182,6 +182,19 @@ pub fn summary_value(counts: &HashMap<PrState, usize>) -> Option<String> {
 /// Sidebar token holding an agent session's title, referenced as `$title`.
 pub const TITLE_TOKEN: &str = "title";
 
+/// Sidebar token with the agent's logo and title in one value, referenced as
+/// `$heading`. Herdr puts ` · ` between tokens; one token reads like a line in
+/// Claude Code's own session list. The cost is a single colour for both.
+pub const HEADING_TOKEN: &str = "heading";
+
+/// The logo followed by the title, or the logo alone before there is a title.
+pub fn heading_value(icon: &str, title: Option<&str>) -> String {
+    match title {
+        Some(title) => format!("{icon} {title}"),
+        None => icon.to_string(),
+    }
+}
+
 /// What herdr-sim knows about one agent session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Session {
@@ -815,6 +828,15 @@ mod tests {
         let worktree = "/dev/search/.worktrees/search-14527-status";
         assert_eq!(project_name(worktree, "/dev/search/.git"), "search");
         assert_eq!(project_name("/srv/infra", "/srv/repos/infra.git"), "infra");
+    }
+
+    #[test]
+    fn heading_is_the_logo_then_the_title() {
+        assert_eq!(
+            heading_value("\u{ec82}", Some("Fix login")),
+            "\u{ec82} Fix login"
+        );
+        assert_eq!(heading_value("\u{ec81}", None), "\u{ec81}");
     }
 
     #[test]
