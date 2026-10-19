@@ -25,9 +25,8 @@ use herdr_sim::{
     SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN,
     TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value,
     agent_count_value, agent_icon, checkout_headers, claude_session, codex_session, diff_value,
-    header_value, heading_value, project_name, resolve_claude_session, scope, session_files,
-    split_marks, state_heading_token, summary_value, token_value, tree_headers,
-    workspace_agent_token,
+    header_value, heading_value, project_name, resolve_claude_session, scope, split_marks,
+    state_heading_token, summary_value, token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -398,18 +397,17 @@ impl Run {
         }
     }
 
-    fn age_secs(&self, agent: &Value) -> Option<u64> {
+    /// Seconds since the agent's session last had a message.
+    fn age_secs(&mut self, agent: &Value) -> Option<u64> {
         let kind = agent["agent"].as_str()?;
-        let mut session = agent["agent_session"]["value"].as_str()?.to_string();
-        if kind == "claude" {
-            session = resolve_claude_session(&self.home, &session);
-        }
-        let last = session_files(&self.home, kind, &session)
-            .iter()
-            .filter_map(|f| f.metadata().ok()?.modified().ok())
-            .max()?;
-        let secs = last.duration_since(UNIX_EPOCH).ok()?.as_secs();
-        Some(self.now.saturating_sub(secs))
+        let session = agent["agent_session"]["value"].as_str()?;
+        let last = if kind == "claude" {
+            let session = resolve_claude_session(&self.home, session);
+            claude_session(&self.home, &session, &mut self.cache).last_activity
+        } else {
+            codex_session(&self.home, session, &mut self.cache).last_activity
+        }?;
+        Some(self.now.saturating_sub(last))
     }
 
     /// Where `cwd` sits in the tree, from the cache or one `git` call.

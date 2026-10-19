@@ -501,11 +501,15 @@ pub struct Session {
     pub prs: Vec<String>,
     /// The session's title, if it has one yet.
     pub title: Option<String>,
+    /// When the session last had a message (Unix seconds).
+    pub last_activity: Option<u64>,
 }
 
 /// One thing found in a session file line.
 enum Hit {
     Pr(String),
+    /// A message's time (Unix seconds).
+    Activity(u64),
     /// `custom`: a title the user gave (`/rename`), which outranks generated ones.
     Title {
         custom: bool,
@@ -544,6 +548,11 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
     let mut session = Session::default();
     for project in subdirs(&home.join(".claude/projects")) {
         let found = cache.scan(&project.join(&file), |line| {
+            // Claude Code also rewrites old records, so the file's mtime is not
+            // when the session last did something; its messages' times are.
+            if line.contains(r#""type":"user""#) || line.contains(r#""type":"assistant""#) {
+                return message_time(line).map(Hit::Activity).into_iter().collect();
+            }
             let (field, custom) = if line.contains(r#""type":"pr-link""#) {
                 ("prUrl", None)
             } else if line.contains(r#""type":"custom-title""#) {
@@ -563,6 +572,7 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
         });
         session.prs.extend(found.urls);
         session.title = session.title.or(found.title);
+        session.last_activity = session.last_activity.max(found.last);
     }
     session.prs = dedup(session.prs);
     session
@@ -573,13 +583,18 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
 pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Session {
     let suffix = format!("{session_id}.jsonl");
     let mut urls = Vec::new();
+    let mut last = None;
     for year in subdirs(&home.join(".codex/sessions")) {
         for month in subdirs(&year) {
             for day in subdirs(&month) {
                 for rollout in files_ending_with(&day, &suffix) {
                     let found = cache.scan(&rollout, |line| {
+                        let mut hits: Vec<Hit> = Vec::new();
+                        if line.contains(r#""type":"response_item""#) {
+                            hits.extend(message_time(line).map(Hit::Activity));
+                        }
                         if !line.contains(r#""CommandExecution""#) || !line.contains("/pull/") {
-                            return Vec::new();
+                            return hits;
                         }
                         let Some(v) = parse(line) else {
                             return Vec::new();
@@ -589,9 +604,11 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
                             return Vec::new();
                         }
                         let output = item["aggregated_output"].as_str().unwrap_or("");
-                        pr_urls(output).into_iter().map(Hit::Pr).collect()
+                        hits.extend(pr_urls(output).into_iter().map(Hit::Pr));
+                        hits
                     });
                     urls.extend(found.urls);
+                    last = last.max(found.last);
                 }
             }
         }
@@ -610,7 +627,31 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
     Session {
         prs: dedup(urls),
         title,
+        last_activity: last,
     }
+}
+
+/// The `"timestamp"` of a log line as Unix seconds, read without parsing the
+/// whole line: `YYYY-MM-DDTHH:MM:SS…Z`.
+fn message_time(line: &str) -> Option<u64> {
+    let key = r#""timestamp":""#;
+    let start = line.find(key)? + key.len();
+    parse_utc(line.get(start..start + 19)?)
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` in UTC to Unix seconds.
+pub fn parse_utc(s: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
 }
 
 fn for_each_line(path: &Path, mut f: impl FnMut(&str)) {
@@ -685,12 +726,15 @@ struct Scanned {
     urls: Vec<String>,
     /// Latest title so far, and whether the user set it.
     title: Option<(bool, String)>,
+    /// Latest message time so far.
+    last: Option<u64>,
 }
 
 /// What [`Cache::scan`] has found in a file so far.
 struct Found {
     urls: Vec<String>,
     title: Option<String>,
+    last: Option<u64>,
 }
 
 impl Cache {
@@ -719,10 +763,14 @@ impl Cache {
                 let title = v["title"]
                     .as_str()
                     .map(|t| (v["custom"].as_bool().unwrap_or(false), t.to_string()));
+                // Entries from before message times were tracked lack "last";
+                // dropping them rereads those files once from the start.
+                v.get("last")?;
                 let scanned = Scanned {
                     offset: v["offset"].as_u64()?,
                     urls: urls.map(String::from).collect(),
                     title,
+                    last: v["last"].as_u64(),
                 };
                 Some((path.clone(), scanned))
             })
@@ -778,7 +826,7 @@ impl Cache {
             .map(|(path, s)| {
                 let (custom, title) = s.title.clone().unzip();
                 let entry =
-                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom });
+                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom, "last": s.last });
                 (path.clone(), entry)
             })
             .collect();
@@ -896,6 +944,7 @@ impl Cache {
             return Found {
                 urls: Vec::new(),
                 title: None,
+                last: None,
             };
         };
         let key = path.to_string_lossy().into_owned();
@@ -914,6 +963,7 @@ impl Cache {
                 for hit in extract(&String::from_utf8_lossy(&line)) {
                     match hit {
                         Hit::Pr(url) => scanned.urls.push(url),
+                        Hit::Activity(t) => scanned.last = scanned.last.max(Some(t)),
                         // A generated title never replaces one the user chose.
                         Hit::Title { custom, text } => {
                             if custom || !scanned.title.as_ref().is_some_and(|(c, _)| *c) {
@@ -928,6 +978,7 @@ impl Cache {
         Found {
             urls: scanned.urls.clone(),
             title: scanned.title.as_ref().map(|(_, t)| t.clone()),
+            last: scanned.last,
         }
     }
 }
@@ -1362,6 +1413,30 @@ mod tests {
         );
         assert_eq!(state_heading_token("unknown", None), "heading_unknown");
         assert!(STATE_HEADING_TOKENS.contains(&state_heading_token("idle", Some(60))));
+    }
+
+    #[test]
+    fn parse_utc_matches_known_instants() {
+        assert_eq!(parse_utc("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(parse_utc("2000-03-01T00:00:00"), Some(951_868_800));
+        assert_eq!(parse_utc("2026-10-19T05:50:46"), Some(1_792_389_046));
+        assert_eq!(parse_utc("not a time at all"), None);
+    }
+
+    #[test]
+    fn claude_activity_is_the_latest_message_not_the_file_time() {
+        let home = TempDir::new().unwrap();
+        let msg = |t: &str, ts: &str| json!({ "type": t, "timestamp": ts });
+        write(
+            &home.path().join(".claude/projects/p/s1.jsonl"),
+            &[
+                msg("user", "2026-10-19T05:00:00.000Z"),
+                msg("assistant", "2026-10-19T05:50:46.173Z"),
+                msg("file-history-snapshot", "2026-10-19T09:00:00.000Z"),
+            ],
+        );
+        let session = claude_session(home.path(), "s1", &mut Cache::default());
+        assert_eq!(session.last_activity, parse_utc("2026-10-19T05:50:46"));
     }
 
     #[test]
