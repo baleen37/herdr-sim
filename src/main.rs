@@ -25,8 +25,8 @@ use herdr_sim::{
     SORT_RANK_TOKEN, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
     TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon, agent_name,
     checkout_headers, claude_session, codex_session, diff_value, heading_value, project_name,
-    rank_value, resolve_claude_session, scope, session_files, split_marks, summary_value,
-    token_value, tree_headers, workspace_agent_token,
+    resolve_claude_session, scope, session_files, split_marks, summary_value, token_value,
+    tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -59,9 +59,9 @@ fn main() -> Result<()> {
     // Present while the order is off; the toggle action flips it.
     let order_off = state_dir.join("order-off");
     if env::args().any(|a| a == "--toggle-order") {
+        // Turning it on needs no call here: every pass below sets the view.
         if order_off.exists() {
             fs::remove_file(&order_off)?;
-            set_agent_view(true);
         } else {
             fs::write(&order_off, b"")?;
             set_agent_view(false);
@@ -160,14 +160,12 @@ impl Run {
             })
             .collect();
         // Agents without a place get no rank, so the view lists them last.
-        let mut order = if self.ordered {
-            activity_order(&activity)
+        let (order, ranked) = if self.ordered {
+            let placed = activity.iter().filter(|a| a.place.is_some()).count();
+            (activity_order(&activity), placed)
         } else {
-            Vec::new()
+            ((0..agents.len()).collect(), 0)
         };
-        let ranked = order.len();
-        let ordered = self.ordered;
-        order.extend((0..agents.len()).filter(|&i| !ordered || activity[i].place.is_none()));
         let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
         let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
         let marks = split_marks(&tabs);
@@ -187,7 +185,7 @@ impl Run {
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
                 (
                     SORT_RANK_TOKEN.to_string(),
-                    (pos < ranked).then(|| rank_value(pos)),
+                    (pos < ranked).then(|| format!("{pos:04}")),
                 ),
             ];
             self.report("pane", pane, "tree", None, &tokens);
@@ -234,8 +232,7 @@ impl Run {
             let pr = self
                 .cache
                 .branch_state(&key, self.now, || gh_branch_pr(&repo, &branch));
-            // Checks only matter while the PR is open.
-            if let (Some(PrState::Open), Some(ci)) = (pr.state, pr.ci) {
+            if let Some(ci) = pr.ci {
                 cis.insert(workspace.to_string(), ci);
             }
             let counts = pr
@@ -421,7 +418,7 @@ fn set_agent_view(on: bool) {
 
 /// One request over Herdr's socket, for the calls its CLI does not wrap. The
 /// server answers one newline-terminated JSON line and hangs up.
-fn socket_call(method: &str, params: Value) -> Result<Value> {
+fn socket_call(method: &str, params: Value) -> Result<()> {
     let path = env::var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set")?;
     let mut stream = UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
@@ -433,7 +430,7 @@ fn socket_call(method: &str, params: Value) -> Result<Value> {
     if !reply["error"].is_null() {
         bail!("{}", reply["error"]);
     }
-    Ok(reply)
+    Ok(())
 }
 
 struct Repo {
@@ -516,9 +513,14 @@ fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
             .then(BranchPr::default);
     }
     let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let state = PrState::parse(v["state"].as_str()?)?;
+    // Checks only matter while the PR is open.
+    let ci = (state == PrState::Open)
+        .then(|| Ci::from_rollup(&v["statusCheckRollup"]))
+        .flatten();
     Some(BranchPr {
-        state: Some(PrState::parse(v["state"].as_str()?)?),
-        ci: Ci::from_rollup(&v["statusCheckRollup"]),
+        state: Some(state),
+        ci,
     })
 }
 

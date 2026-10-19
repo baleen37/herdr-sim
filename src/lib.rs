@@ -322,10 +322,6 @@ pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
 /// the token only changes when the order does.
 pub const SORT_RANK_TOKEN: &str = "sort_rank";
 
-pub fn rank_value(position: usize) -> String {
-    format!("{position:04}")
-}
-
 /// One agent as the activity order sees it.
 pub struct Activity {
     pub place: Option<Place>,
@@ -334,10 +330,10 @@ pub struct Activity {
     pub seq: u64,
 }
 
-/// Indices of the agents placed in activity order: projects by their most
-/// recent agent, then checkouts (main checkout and worktrees alike) and tabs
-/// within them the same way; names break ties, then list order. Agents
-/// without a place are left out.
+/// Indices of the agents in activity order: projects by their most recent
+/// agent, then checkouts (main checkout and worktrees alike) and tabs within
+/// them the same way; names break ties, then list order. Agents without a
+/// place come last, in list order.
 pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
     fn groups(agent: &Activity) -> Option<[&str; 3]> {
         let place = agent.place.as_ref()?;
@@ -350,14 +346,18 @@ pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
             *seq = (*seq).max(agent.seq);
         }
     }
-    let mut order: Vec<usize> = (0..agents.len())
-        .filter(|&i| agents[i].place.is_some())
+    let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
+    let mut placed: Vec<_> = agents
+        .iter()
+        .enumerate()
+        .filter_map(|(i, agent)| {
+            let [project, checkout, tab] = groups(agent)?;
+            Some((i, [key(0, project), key(1, checkout), key(2, tab)]))
+        })
         .collect();
-    order.sort_by_cached_key(|&i| {
-        let [project, checkout, tab] = groups(&agents[i]).unwrap_or_default();
-        let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
-        [key(0, project), key(1, checkout), key(2, tab)]
-    });
+    placed.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut order: Vec<usize> = placed.into_iter().map(|(i, _)| i).collect();
+    order.extend((0..agents.len()).filter(|&i| agents[i].place.is_none()));
     order
 }
 
@@ -1291,8 +1291,8 @@ mod tests {
         ];
         // search (latest 9): status (9: tab t2 then t6), batch (3), the main
         // checkout (1); dotfiles (5); the two idle projects and their tabs by
-        // name; the agent without a place is left out.
-        assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9]);
+        // name; last the agent without a place.
+        assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9, 3]);
     }
 
     #[test]
