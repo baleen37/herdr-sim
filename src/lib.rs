@@ -315,31 +315,63 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
 }
 
 /// Sidebar tokens for herdr-radar's one-header-per-group layout, referenced as
-/// `$tree_group` and `$tree_gap`: the project (and its branch, when it has
-/// several checkouts) over its first checkout,
-/// `└─ <branch>` over each later one, and a blank row after the project.
+/// `$tree_group`, `$tree_group_stale` and `$tree_gap`: the project (and its
+/// branch, when it has several checkouts) over its first checkout,
+/// `└─ <branch>` over each later one, and a blank row after the project. A
+/// header whose sessions have all gone stale moves to `$tree_group_stale`.
 pub const TREE_GROUP_TOKEN: &str = "tree_group";
+pub const TREE_GROUP_STALE_TOKEN: &str = "tree_group_stale";
 pub const TREE_GAP_TOKEN: &str = "tree_gap";
 
 /// Herdr trims leading whitespace off token values, so the indent and the
 /// blank gap row both lean on a zero-width space.
 const ZWSP: &str = "\u{200b}";
 
-/// `($tree_group, $tree_gap)` for agents listed in sidebar order. The gap goes
-/// on a project's last agent: one above a header would make the header a
-/// continuation row, which Herdr indents. Agents without a place get neither.
-pub fn group_rows(places: &[Option<Place>]) -> Vec<(Option<String>, Option<String>)> {
+/// The indent `depth` levels deep, two columns a level, as herdr-radar.
+pub fn indent(depth: usize) -> String {
+    if depth == 0 {
+        String::new()
+    } else {
+        format!("{ZWSP}{}", "  ".repeat(depth))
+    }
+}
+
+/// What [`group_rows`] gives one agent.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GroupRow {
+    /// The group header, if this agent heads a checkout.
+    pub group: Option<String>,
+    /// Whether every session of that checkout has gone stale.
+    pub stale: bool,
+    /// The blank row after a project's last agent.
+    pub gap: Option<String>,
+    /// How far the agent's own row sits in, on top of Herdr's: Herdr indents
+    /// an entry's continuation rows itself, so a header's agent starts a level
+    /// in and the rest need one of ours; a later checkout's agents go one
+    /// level deeper, under its `└─` header.
+    pub depth: usize,
+}
+
+/// [`GroupRow`]s for agents listed in sidebar order, given whether each one's
+/// session is stale. The gap goes on a project's last agent: one above a
+/// header would make the header a continuation row, which Herdr indents.
+/// Agents without a place get nothing.
+pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
     let mut seen_projects = std::collections::HashSet::new();
     let mut seen_checkouts = std::collections::HashSet::new();
+    let mut nested = std::collections::HashSet::new();
     places
         .iter()
         .enumerate()
         .map(|(i, place)| {
             let Some(place) = place else {
-                return (None, None);
+                return GroupRow::default();
             };
             let first_of_project = seen_projects.insert(place.project.clone());
             let first_of_checkout = seen_checkouts.insert(place.checkout.clone());
+            if !first_of_project && first_of_checkout {
+                nested.insert(place.checkout.clone());
+            }
             // A project with one checkout is named alone, as in herdr-radar;
             // with more, its first header names the branch too.
             let several = places
@@ -349,14 +381,25 @@ pub fn group_rows(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Strin
             let group = match (first_of_project, first_of_checkout) {
                 (true, _) if several => Some(header_value(&place.project, Some(&place.label))),
                 (true, _) => Some(place.project.clone()),
-                (false, true) => Some(format!("{ZWSP}  └─ \u{f418} {}", place.label)),
+                (false, true) => Some(format!("{}└─ \u{f418} {}", indent(1), place.label)),
                 (false, false) => None,
             };
+            let stale = group.is_some()
+                && places.iter().zip(stale).all(|(other, &stale)| {
+                    other.as_ref().is_none_or(|o| o.checkout != place.checkout) || stale
+                });
             let last_of_project = !places[i + 1..]
                 .iter()
                 .flatten()
                 .any(|next| next.project == place.project);
-            (group, last_of_project.then(|| ZWSP.to_string()))
+            let depth =
+                usize::from(group.is_none()) + usize::from(nested.contains(&place.checkout));
+            GroupRow {
+                group,
+                stale,
+                gap: last_of_project.then(|| ZWSP.to_string()),
+                depth,
+            }
         })
         .collect()
 }
@@ -393,12 +436,15 @@ pub struct Activity {
     pub tab: String,
     /// Herdr's `state_change_seq`: higher changed state more recently.
     pub seq: u64,
+    /// Whether the session has been idle over two hours.
+    pub stale: bool,
 }
 
 /// Indices of the agents in activity order: projects by their most recent
 /// agent, then checkouts (main checkout and worktrees alike) and tabs within
-/// them the same way; names break ties, then list order. Agents without a
-/// place come last, in list order.
+/// them the same way; names break ties, then list order. A tab whose sessions
+/// have all gone stale sinks to the bottom of its checkout, as in herdr-radar.
+/// Agents without a place come last, in list order.
 pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
     fn groups(agent: &Activity) -> Option<[&str; 3]> {
         let place = agent.place.as_ref()?;
@@ -411,13 +457,18 @@ pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
             *seq = (*seq).max(agent.seq);
         }
     }
+    let mut fresh_tabs = std::collections::HashSet::new();
+    for agent in agents.iter().filter(|a| !a.stale) {
+        fresh_tabs.insert(agent.tab.as_str());
+    }
     let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
     let mut placed: Vec<_> = agents
         .iter()
         .enumerate()
         .filter_map(|(i, agent)| {
             let [project, checkout, tab] = groups(agent)?;
-            Some((i, [key(0, project), key(1, checkout), key(2, tab)]))
+            let sunk = !fresh_tabs.contains(tab);
+            Some((i, (key(0, project), key(1, checkout), sunk, key(2, tab))))
         })
         .collect();
     placed.sort_by(|a, b| a.1.cmp(&b.1));
@@ -533,6 +584,9 @@ pub const STATE_HEADING_TOKENS: [&str; 7] = [
     "heading_unknown",
 ];
 
+/// The state token of a session idle over two hours.
+pub const STALE_HEADING_TOKEN: &str = "heading_idle_stale";
+
 /// Which of [`STATE_HEADING_TOKENS`] holds an agent's heading: by Herdr's
 /// agent status, and for idle agents by how long ago the session last changed
 /// (under 15 minutes fresh, over 2 hours stale, as in herdr-radar).
@@ -543,7 +597,7 @@ pub fn state_heading_token(status: &str, idle_secs: Option<u64>) -> &'static str
         "done" => "heading_done",
         "idle" => match idle_secs {
             Some(s) if s < 15 * 60 => "heading_idle_fresh",
-            Some(s) if s > 2 * 3600 => "heading_idle_stale",
+            Some(s) if s > 2 * 3600 => STALE_HEADING_TOKEN,
             _ => "heading_idle",
         },
         _ => "heading_unknown",
@@ -567,6 +621,22 @@ pub fn held_status<'a>(
         ("done", _) | ("idle", Some("done")) => ("done", Some("done")),
         _ => (status, None),
     }
+}
+
+/// A state token's value: the indent, then the heading with herdr-radar's
+/// mark for an event that needs you between logo and title — `✓` a finished
+/// turn not yet seen, `?` a question.
+pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String {
+    let mark = match status {
+        "done" => "✓",
+        "blocked" => "?",
+        _ => return format!("{}{heading}", indent(depth)),
+    };
+    let marked = match heading.split_once(' ') {
+        Some((logo, title)) => format!("{logo} {mark} {title}"),
+        None => format!("{heading} {mark}"),
+    };
+    format!("{}{marked}", indent(depth))
 }
 
 /// What herdr-sim knows about one agent session.
@@ -787,6 +857,8 @@ pub struct Cache {
     headings: HashMap<String, String>,
     /// The `done` or `blocked` each pane holds past Herdr's own status.
     held: HashMap<String, String>,
+    /// How far in each pane's heading sits, from the last tree pass.
+    depths: HashMap<String, usize>,
 }
 
 /// The PR of a checked-out branch (`state` is `None` when there is none) and
@@ -871,6 +943,9 @@ impl Cache {
         let held = object(&v["held"])
             .filter_map(|(pane, v)| Some((pane.clone(), v.as_str()?.to_string())))
             .collect();
+        let depths = object(&v["depths"])
+            .filter_map(|(pane, v)| Some((pane.clone(), usize::try_from(v.as_u64()?).ok()?)))
+            .collect();
         Self {
             prs,
             branches,
@@ -879,6 +954,7 @@ impl Cache {
             places,
             headings,
             held,
+            depths,
         }
     }
 
@@ -924,7 +1000,7 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings, "held": self.held })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings, "held": self.held, "depths": self.depths })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -981,6 +1057,14 @@ impl Cache {
     /// The pane's latest heading, if one was computed.
     pub fn heading(&self, pane: &str) -> Option<String> {
         self.headings.get(pane).cloned()
+    }
+
+    pub fn depth(&self, pane: &str) -> usize {
+        self.depths.get(pane).copied().unwrap_or(0)
+    }
+
+    pub fn set_depth(&mut self, pane: &str, depth: usize) {
+        self.depths.insert(pane.to_string(), depth);
     }
 
     pub fn held(&self, pane: &str) -> Option<&str> {
@@ -1422,6 +1506,13 @@ mod tests {
     }
 
     #[test]
+    fn state_heading_value_marks_events_after_the_logo() {
+        assert_eq!(state_heading_value("L Fix", "done", 0), "L ✓ Fix");
+        assert_eq!(state_heading_value("L", "blocked", 0), "L ?");
+        assert_eq!(state_heading_value("L Fix", "idle", 2), "\u{200b}    L Fix");
+    }
+
+    #[test]
     fn held_status_keeps_done_until_seen_and_blocked_until_working() {
         assert_eq!(held_status("done", None, false), ("done", Some("done")));
         assert_eq!(
@@ -1446,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn group_rows_head_each_project_and_close_it_with_a_gap() {
+    fn group_rows_head_each_checkout_indent_members_and_fade_stale_groups() {
         let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
                 project: project.into(),
@@ -1454,22 +1545,32 @@ mod tests {
                 label: label.into(),
             })
         };
-        let rows = group_rows(&[
-            at("search", "/s", "main"),
-            at("search", "/s", "main"),
-            at("search", "/s/wt", "fix-x"),
-            None,
-            at("dotfiles", "/d", "main"),
-        ]);
-        let some = |s: &str| Some(s.to_string());
+        let rows = group_rows(
+            &[
+                at("search", "/s", "main"),
+                at("search", "/s", "main"),
+                at("search", "/s/wt", "fix-x"),
+                at("search", "/s/wt", "fix-x"),
+                None,
+                at("dotfiles", "/d", "main"),
+            ],
+            &[false, true, true, true, false, true],
+        );
+        let row = |group: Option<&str>, stale: bool, gap: bool, depth: usize| GroupRow {
+            group: group.map(String::from),
+            stale,
+            gap: gap.then(|| "\u{200b}".to_string()),
+            depth,
+        };
         assert_eq!(
             rows,
             [
-                (some("search  \u{f418} main"), None),
-                (None, None),
-                (some("\u{200b}  └─ \u{f418} fix-x"), some("\u{200b}")),
-                (None, None),
-                (some("dotfiles"), some("\u{200b}")),
+                row(Some("search  \u{f418} main"), false, false, 0),
+                row(None, false, false, 1),
+                row(Some("\u{200b}  └─ \u{f418} fix-x"), true, false, 1),
+                row(None, false, true, 2),
+                GroupRow::default(),
+                row(Some("dotfiles"), true, true, 0),
             ]
         );
     }
@@ -1518,6 +1619,7 @@ mod tests {
             }),
             tab: tab.into(),
             seq,
+            stale: false,
         };
         let agents = [
             at("search", "/s", "t1", 1),
@@ -1527,6 +1629,7 @@ mod tests {
                 place: None,
                 tab: "t4".into(),
                 seq: 20,
+                stale: false,
             },
             at("search", "/s/batch", "t5", 3),
             at("search", "/s/status", "t6", 2),
@@ -1540,6 +1643,22 @@ mod tests {
         // checkout (1); dotfiles (5); the two idle projects and their tabs by
         // name; last the agent without a place.
         assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9, 3]);
+    }
+
+    #[test]
+    fn activity_order_sinks_stale_tabs_within_their_checkout() {
+        let at = |tab: &str, seq: u64, stale: bool| Activity {
+            place: Some(Place {
+                project: "search".into(),
+                checkout: "/s".into(),
+                label: "main".into(),
+            }),
+            tab: tab.into(),
+            seq,
+            stale,
+        };
+        let agents = [at("t1", 9, true), at("t2", 1, false), at("t3", 5, false)];
+        assert_eq!(activity_order(&agents), [2, 1, 0]);
     }
 
     #[test]
