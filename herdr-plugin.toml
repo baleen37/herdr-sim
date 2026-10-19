@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.4.0"
+version = "0.5.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -28,4 +28,9 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 
 [[events]]
 on = "worktree.opened"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+
+# An agent pane going away changes its Space's agent count.
+[[events]]
+on = "pane.closed"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]

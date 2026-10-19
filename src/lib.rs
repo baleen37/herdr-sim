@@ -120,6 +120,25 @@ pub fn scope(event: Option<&str>, event_json: Option<&str>) -> Scope {
     }
 }
 
+/// The agents herdr-sim knows, as Herdr agent ids.
+pub const AGENT_KINDS: [&str; 2] = ["claude", "codex"];
+
+/// Workspace token for how many agents of one kind run there, referenced as
+/// `$agent_claude` / `$agent_codex` so each can have its own colour.
+pub fn workspace_agent_token(kind: &str) -> String {
+    format!("agent_{kind}")
+}
+
+/// The kind's logo, plus the count when more than one runs. `None` clears it.
+pub fn agent_count_value(kind: &str, count: usize) -> Option<String> {
+    let icon = agent_icon(kind)?;
+    match count {
+        0 => None,
+        1 => Some(icon.to_string()),
+        n => Some(format!("{icon} {n}")),
+    }
+}
+
 /// Sidebar token summarising all PRs, referenced as `$pr`.
 pub const PR_SUMMARY_TOKEN: &str = "pr";
 
@@ -629,6 +648,14 @@ mod tests {
         assert_eq!(summary_value(&mixed).unwrap(), "\u{f407} 3");
         let done = counts(&[(PrState::Closed, 1), (PrState::Merged, 1)]);
         assert_eq!(summary_value(&done).unwrap(), "\u{f419} 2");
+    }
+
+    #[test]
+    fn agent_count_value_shows_count_only_above_one() {
+        assert_eq!(agent_count_value("claude", 0), None);
+        assert_eq!(agent_count_value("claude", 1).unwrap(), "\u{ec82}");
+        assert_eq!(agent_count_value("codex", 2).unwrap(), "\u{ec81} 2");
+        assert_eq!(agent_count_value("pi", 1), None);
     }
 
     #[test]

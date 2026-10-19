@@ -78,7 +78,7 @@ rows = [
 
 [ui.sidebar.spaces]
 rows = [
-  ["state_icon", "workspace"],
+  ["state_icon", "workspace", { token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }],
   ["branch", "git_status", { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 ```
@@ -89,6 +89,7 @@ rows = [
 | `$pr_open` | `` (git-pull-request), followed by a count when more than one (agents only) |
 | `$pr_merged` | `` (git-merge) |
 | `$pr_closed` | `` (git-pull-request-closed) |
+| `$agent_claude`, `$agent_codex` | On workspaces: that agent's logo when it runs there, plus the count when more than one does (` 2`). Separate tokens so each can have its own colour. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
