@@ -233,11 +233,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         let _ = done.send((stale, got));
                     });
                 }
-                // With no PR yet, what the checkout has changed instead.
-                let cwd = agent["cwd"].as_str().filter(|_| list.is_empty());
-                let diff = cwd.and_then(local_diff);
-                let compare = diff.as_ref().and(cwd).and_then(compare_url);
-                render(&list, &prs, diff, compare)
+                let local = agent["cwd"].as_str().and_then(local_changes);
+                render(&list, &prs, local)
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -440,6 +437,7 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
 }
 
 const GREEN: &str = "\x1b[38;2;166;227;161m";
+const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const DIM: &str = "\x1b[2m";
@@ -449,34 +447,42 @@ const RESET: &str = "\x1b[0m";
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(urls: &[String], prs: &Prs, diff: Option<String>, compare: Option<String>) -> String {
+fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
     let width = columns().saturating_sub(1).max(20);
     let mut s = format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n\n");
-    if urls.is_empty() {
-        s += &match diff {
-            Some(diff) => {
-                let lines: Vec<String> = diff
-                    .split(' ')
-                    .map(|n| {
-                        let c = if n.starts_with('+') { GREEN } else { RED };
-                        format!("{c}{n}{RESET}")
-                    })
-                    .collect();
-                // "Create PR" opens GitHub's compare page for the branch.
-                let button = "\u{f407} Create PR";
-                let button = match compare {
-                    Some(url) => format!("\x1b]8;;{url}\x1b\\{button}\x1b]8;;\x1b\\"),
-                    None => button.to_string(),
-                };
-                let gap = width.saturating_sub(2 + cols(&diff) + 11).max(1);
-                format!(
-                    "{DIM}\u{f4d2}{RESET} {}{}{DIM}{button}{RESET}\n",
-                    lines.join(" "),
-                    " ".repeat(gap)
-                )
-            }
-            None => format!("{DIM}No changes.{RESET}\n"),
+    // What the focused checkout has not committed yet, above its PRs.
+    if let Some(local) = local {
+        let lines: Vec<String> = local
+            .diff
+            .split(' ')
+            .map(|n| {
+                let c = if n.starts_with('+') { GREEN } else { RED };
+                format!("{c}{n}{RESET}")
+            })
+            .collect();
+        // "Create PR" opens GitHub's compare page for the branch.
+        let button = "\u{f407} Create PR";
+        let button_cols = cols(button);
+        let button = match local.compare {
+            Some(url) => format!("\x1b]8;;{url}\x1b\\{button}\x1b]8;;\x1b\\"),
+            None => button.to_string(),
         };
+        let repo = cut(
+            &local.repo,
+            width
+                .saturating_sub(4 + cols(&local.diff) + button_cols)
+                .max(4),
+        );
+        let gap = width
+            .saturating_sub(3 + cols(&repo) + cols(&local.diff) + button_cols)
+            .max(1);
+        s += &format!(
+            "{DIM}\u{f4d2}{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n\n",
+            lines.join(" "),
+            " ".repeat(gap)
+        );
+    } else if urls.is_empty() {
+        s += &format!("{DIM}No changes.{RESET}\n");
     }
     for url in urls {
         let Some((_, Some(pr))) = prs.get(url) else {
@@ -490,7 +496,7 @@ fn render(urls: &[String], prs: &Prs, diff: Option<String>, compare: Option<Stri
             continue;
         };
         let (icon, colour) = match (pr.state.as_str(), pr.draft) {
-            ("MERGED", _) => ("\u{f49e}", GREEN),
+            ("MERGED", _) => ("\u{f419}", PURPLE),
             ("CLOSED", _) => ("\u{f4dc}", RED),
             (_, true) => ("\u{f4dd}", DIM),
             _ => ("\u{f407}", GREEN),
@@ -521,7 +527,8 @@ fn render(urls: &[String], prs: &Prs, diff: Option<String>, compare: Option<Stri
             right += &format!("{DIM}\u{f41f} {n}{RESET}");
             right_cols += 2 + n.len();
         }
-        if let Some((ok, failed, total)) = pr.checks {
+        // Checks matter only while the PR is open.
+        if let Some((ok, failed, total)) = pr.checks.filter(|_| pr.state == "OPEN") {
             let c = if failed > 0 {
                 RED
             } else if ok == total {
@@ -538,17 +545,16 @@ fn render(urls: &[String], prs: &Prs, diff: Option<String>, compare: Option<Stri
     s
 }
 
-/// Uncommitted lines changed in the checkout at `cwd`, as `+a -d`.
-fn local_diff(cwd: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["-C", cwd, "diff", "--shortstat", "HEAD"])
-        .output()
-        .ok()?;
-    diff_value(&String::from_utf8_lossy(&out.stdout))
+/// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
+/// for opening a PR from its branch.
+struct Local {
+    repo: String,
+    diff: String,
+    compare: Option<String>,
 }
 
-/// GitHub's page for opening a PR from the branch checked out at `cwd`.
-fn compare_url(cwd: &str) -> Option<String> {
+/// What the checkout at `cwd` has not committed; `None` when clean.
+fn local_changes(cwd: &str) -> Option<Local> {
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .arg("-C")
@@ -559,15 +565,43 @@ fn compare_url(cwd: &str) -> Option<String> {
         let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
         (!s.is_empty()).then_some(s)
     };
-    let remote = git(&["remote", "get-url", "origin"])?;
-    let repo = remote
-        .strip_prefix("git@github.com:")
-        .or_else(|| remote.strip_prefix("https://github.com/"))?
-        .trim_end_matches(".git");
-    let branch = git(&["branch", "--show-current"])?;
-    Some(format!(
-        "https://github.com/{repo}/compare/{branch}?expand=1"
-    ))
+    let diff = diff_value(&git(&["diff", "--shortstat", "HEAD"])?)?;
+    // owner/repo on GitHub; a linked worktree's directory is not the repo's
+    // name, its remote is.
+    let slug = git(&["remote", "get-url", "origin"]).and_then(|remote| {
+        let slug = remote
+            .strip_prefix("git@github.com:")
+            .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+            .or_else(|| remote.strip_prefix("https://github.com/"))?;
+        Some(slug.trim_end_matches(".git").to_string())
+    });
+    let repo = match &slug {
+        Some(slug) => slug.rsplit('/').next().unwrap_or(slug).to_string(),
+        None => {
+            let top = git(&["rev-parse", "--show-toplevel"])?;
+            Path::new(&top).file_name()?.to_string_lossy().into_owned()
+        }
+    };
+    let compare = slug
+        .zip(git(&["branch", "--show-current"]))
+        .map(|(slug, branch)| {
+            // Branch names may hold `#`, `?`, `%`, or spaces; `/` stays as is.
+            let branch: String = branch
+                .bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                        (b as char).to_string()
+                    }
+                    _ => format!("%{b:02X}"),
+                })
+                .collect();
+            format!("https://github.com/{slug}/compare/{branch}?expand=1")
+        });
+    Some(Local {
+        repo,
+        diff,
+        compare,
+    })
 }
 
 /// The pane's width in columns, from the terminal it runs in.
