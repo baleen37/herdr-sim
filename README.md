@@ -73,8 +73,8 @@ Agent and Space rows in Herdr's `config.toml`:
 ```toml
 [ui.sidebar.agents]
 rows = [
-  ["state_icon", { token = "$agent_icon", fg = "#d97757", rules = [{ equals = "\uEC81", fg = "#cdd6f4" }] }, { token = "$project", bold = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
-  ["$title"],
+  ["state_icon", "$heading"],
+  [{ token = "$project", dim = true }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
 ]
 
 [ui.sidebar.spaces]
