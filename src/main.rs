@@ -17,9 +17,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
-use std::thread::sleep;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{OnceLock, mpsc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
@@ -676,7 +675,8 @@ fn gh_pr_state(url: &str) -> Option<PrState> {
 }
 
 /// Runs `gh`, killing it after [`GH_TIMEOUT`] so a stalled network cannot hold
-/// the lock. Its output is a few hundred bytes, well under the pipe buffer.
+/// the lock. Its output is read while it runs, so a large answer (the Changes
+/// pane's) cannot fill the pipe and stall it.
 ///
 /// While GitHub's rate limit is near, it returns `None` without calling, and
 /// callers keep what they cached.
@@ -689,17 +689,17 @@ fn gh(args: &[&str], cwd: Option<&Path>) -> Option<Output> {
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    let mut child = cmd.spawn().ok()?;
-    let deadline = Instant::now() + GH_TIMEOUT;
-    while child.try_wait().ok()?.is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        sleep(Duration::from_millis(20));
-    }
-    let out = child.wait_with_output().ok()?;
+    let child = cmd.spawn().ok()?;
+    let pid = child.id().to_string();
+    let (done, waited) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    let Ok(out) = waited.recv_timeout(GH_TIMEOUT) else {
+        let _ = Command::new("kill").arg(&pid).status();
+        return None;
+    };
+    let out = out.ok()?;
     if !out.status.success()
         && String::from_utf8_lossy(&out.stderr)
             .to_ascii_lowercase()
