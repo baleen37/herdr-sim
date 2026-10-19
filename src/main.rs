@@ -22,11 +22,12 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN,
-    TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value, agent_icon,
-    checkout_headers, claude_session, codex_session, diff_value, header_value, heading_value,
-    project_name, resolve_claude_session, scope, session_files, split_marks, summary_value,
-    token_value, tree_headers, workspace_agent_token,
+    SORT_RANK_TOKEN, STATE_HEADING_TOKENS, Scope, TITLE_TOKEN, TREE_HEADER_TOKEN,
+    TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value,
+    agent_count_value, agent_icon, checkout_headers, claude_session, codex_session, diff_value,
+    header_value, heading_value, project_name, resolve_claude_session, scope, session_files,
+    split_marks, state_heading_token, summary_value, token_value, tree_headers,
+    workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -48,10 +49,6 @@ fn main() -> Result<()> {
         event.as_deref(),
         env::var("HERDR_PLUGIN_EVENT_JSON").ok().as_deref(),
     );
-    if scope == Scope::Skip {
-        return Ok(());
-    }
-
     let state_dir = env::var("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
@@ -142,9 +139,18 @@ impl Run {
                     .entry(kind.to_string())
                     .or_default() += 1;
             }
-            if only_pane.is_none_or(|p| agent["pane_id"].as_str() == Some(p)) {
+            if scope != &Scope::Status
+                && only_pane.is_none_or(|p| agent["pane_id"].as_str() == Some(p))
+            {
                 self.agent(agent);
             }
+        }
+
+        self.report_states(&agents);
+        // A turn start changes only colours; tree order and headers wait for
+        // its end, as before.
+        if scope == &Scope::Status {
+            return;
         }
 
         // Project and checkout (branch) headers over the Agents list. Herdr
@@ -181,7 +187,7 @@ impl Run {
                 (TREE_PROJECT_TOKEN.to_string(), project),
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
                 (TREE_HEADER_TOKEN.to_string(), header),
-                (AGE_TOKEN.to_string(), self.age(agent)),
+                (AGE_TOKEN.to_string(), self.age_secs(agent).map(age_value)),
                 (TREE_SPLIT_TOKEN.to_string(), marks[pos].map(String::from)),
                 (
                     SORT_RANK_TOKEN.to_string(),
@@ -293,7 +299,12 @@ impl Run {
         ];
         // The logo needs no session; the PRs and title do, so leave those be.
         let Some(session) = agent["agent_session"]["value"].as_str() else {
-            tokens.push((HEADING_TOKEN.to_string(), Some(heading_value(icon, None))));
+            let heading = self
+                .cache
+                .heading(pane)
+                .unwrap_or_else(|| heading_value(icon, None));
+            self.cache.set_heading(pane, heading.clone());
+            tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
             self.report("pane", pane, "agent", None, &tokens);
             return;
         };
@@ -310,6 +321,7 @@ impl Run {
             }
         }
         let heading = heading_value(icon, session.title.as_deref());
+        self.cache.set_heading(pane, heading.clone());
         tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
         tokens.push((TITLE_TOKEN.to_string(), session.title));
         self.report("pane", pane, "agent", Some(&counts), &tokens);
@@ -365,7 +377,28 @@ impl Run {
     }
 
     /// How long ago the agent's session file last changed.
-    fn age(&self, agent: &Value) -> Option<String> {
+    /// Puts each agent's heading in the token for its state (herdr-radar's
+    /// colour by state), reusing the heading the last full pass computed.
+    fn report_states(&mut self, agents: &[Value]) {
+        for agent in agents {
+            let (Some(pane), Some(icon)) = (
+                agent["pane_id"].as_str(),
+                agent_icon(agent["agent"].as_str().unwrap_or_default()),
+            ) else {
+                continue;
+            };
+            let status = agent["agent_status"].as_str().unwrap_or("unknown");
+            let state = state_heading_token(status, self.age_secs(agent));
+            let heading = self.cache.heading(pane).unwrap_or_else(|| icon.to_string());
+            let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
+                .iter()
+                .map(|t| (t.to_string(), (*t == state).then(|| heading.clone())))
+                .collect();
+            self.report("pane", pane, "state", None, &tokens);
+        }
+    }
+
+    fn age_secs(&self, agent: &Value) -> Option<u64> {
         let kind = agent["agent"].as_str()?;
         let mut session = agent["agent_session"]["value"].as_str()?.to_string();
         if kind == "claude" {
@@ -376,7 +409,7 @@ impl Run {
             .filter_map(|f| f.metadata().ok()?.modified().ok())
             .max()?;
         let secs = last.duration_since(UNIX_EPOCH).ok()?.as_secs();
-        Some(age_value(self.now.saturating_sub(secs)))
+        Some(self.now.saturating_sub(secs))
     }
 
     /// Where `cwd` sits in the tree, from the cache or one `git` call.
