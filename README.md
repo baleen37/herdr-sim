@@ -64,6 +64,22 @@ mkdir -p bin && cp target/release/herdr-sim bin/
 herdr plugin link .
 ```
 
+## Changes panel
+
+Claude Code's "Changes" panel as a right-hand split: the PRs the focused agent's
+session touched, newest first — state icon, title (a link), repo and number,
+lines changed, comments and checks. It starts on the pane the key was pressed
+in and then follows focus between agent panes. Open PRs are refetched every 30
+seconds while it is open, merged and closed ones every 10 minutes.
+
+```toml
+[[keys.command]]
+key = "cmd+p"
+type = "plugin_action"
+command = "baleen37.herdr-sim.toggle-changes"
+description = "changes panel on/off"
+```
+
 ## Sidebar config
 
 The plugin only sets tokens, on agent panes and on workspaces; add them to the
