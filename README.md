@@ -3,7 +3,8 @@
 A [Herdr](https://herdr.dev) plugin that marks each Claude Code or Codex pane with
 the pull requests its session touched — open, merged, or closed — as icons in the
 sidebar. It works across repositories: a session that opened PRs in two repos
-shows both.
+shows both. Each Space (workspace) also gets the PR of the branch it has checked
+out, like a branch row in a Git client.
 
 ```
 ● search 
@@ -19,8 +20,12 @@ shows both.
 | Claude Code | `pr-link` records in the session transcript (`~/.claude/projects/*/<session>.jsonl`). Claude Code writes one when the session creates, pushes to, edits, or comments on a PR. |
 | Codex | PR URLs printed by `gh pr create/edit/comment/ready/close/merge/checkout` in the session rollout (`~/.codex/sessions/**/rollout-*<session>.jsonl`). |
 
+A Space's PR is the one `gh pr view <branch>` finds for the branch checked out
+in its first pane that is inside a git repository.
+
 States come from `gh pr view`. Open PRs are re-checked at most once a minute;
-merged and closed PRs are never re-checked. Herdr runs the plugin at server
+merged and closed PRs are never re-checked. A branch without a PR is re-checked
+once a minute too. Herdr runs the plugin at server
 startup and whenever an agent's status changes.
 
 ## Install
@@ -52,7 +57,8 @@ herdr plugin link .
 
 ## Sidebar config
 
-The plugin only sets tokens; add them to an Agent row in Herdr's `config.toml`:
+The plugin only sets tokens, on agent panes and on workspaces; add them to the
+Agent and Space rows in Herdr's `config.toml`:
 
 ```toml
 [ui.sidebar.agents]
@@ -60,11 +66,17 @@ rows = [
   ["state_icon", { token = "workspace", bold = true }, { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
   ["terminal_title_stripped"],
 ]
+
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace"],
+  ["branch", "git_status", { token = "$pr_open", fg = "#a6e3a1" }, { token = "$pr_merged", fg = "#cba6f7" }, { token = "$pr_closed", dim = true }],
+]
 ```
 
 | Token | Value |
 | --- | --- |
-| `$pr_open` | `` (git-pull-request), followed by a count when more than one |
+| `$pr_open` | `` (git-pull-request), followed by a count when more than one (agents only) |
 | `$pr_merged` | `` (git-merge) |
 | `$pr_closed` | `` (git-pull-request-closed) |
 
