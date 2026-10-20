@@ -61,14 +61,12 @@ title = "Changes"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --changes-pane"]
 
-# A diff viewer the Changes panel opens full screen (delta, diffnav, hunk,
-# lazygit). A login shell, for the user's PATH; delta's pager without
-# quit-if-one-screen.
+# The diff the Changes panel opens full screen with `d`.
 [[panes]]
 id = "diff"
 title = "Diff"
 placement = "zoomed"
-command = ["sh", "-c", "DELTA_PAGER='less -R' exec \"${SHELL:-/bin/sh}\" -lc \"$HERDR_SIM_DIFF\""]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --diff-pane"]
 
 [[actions]]
 id = "toggle-changes"

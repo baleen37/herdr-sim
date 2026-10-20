@@ -27,7 +27,7 @@ const PLUGIN: &str = "baleen37.herdr-sim";
 const FOR_PANE: &str = "HERDR_SIM_CHANGES_FOR";
 const ENTRYPOINT: &str = "changes";
 
-struct Pr {
+pub(crate) struct Pr {
     url: String,
     repo: String,
     number: String,
@@ -438,9 +438,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some(url) = url {
                                 open_url(url);
                             }
-                            if let Some((command, cwd)) = item.and_then(|i| viewer(key, i)) {
+                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i)) {
                                 let cwd = cwd.unwrap_or_else(|| home.display().to_string());
-                                view_diff(herdr, &command, &cwd);
+                                view_diff(herdr, &source, &cwd);
                             }
                             None
                         }
@@ -667,19 +667,19 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
         .collect()
 }
 
-const GREEN: &str = "\x1b[38;2;166;227;161m";
+pub(crate) const GREEN: &str = "\x1b[38;2;166;227;161m";
 const PURPLE: &str = "\x1b[38;2;203;166;247m";
-const RED: &str = "\x1b[38;2;243;139;168m";
-const DIM: &str = "\x1b[2m";
+pub(crate) const RED: &str = "\x1b[38;2;243;139;168m";
+pub(crate) const DIM: &str = "\x1b[2m";
 /// The selected or pointed-at link: underlined on a raised background, which
 /// shows even where underline is not drawn.
 const HL_ON: &str = "\x1b[4;48;2;69;71;90m";
 const HL_OFF: &str = "\x1b[24;49m";
 /// The row the keys selected: a bar across the pane.
-const SELECTED: &str = "\x1b[48;2;49;50;68m";
+pub(crate) const SELECTED: &str = "\x1b[48;2;49;50;68m";
 /// Rows a drag covers, to be copied.
 const DRAGGED: &str = "\x1b[48;2;88;91;112m";
-const RESET: &str = "\x1b[0m";
+pub(crate) const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
@@ -735,7 +735,6 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
                 lines: (out.len(), out.len()),
                 open: Some(url.clone()),
                 pr: Some(url.clone()),
-                pr_ref: pr_ref(url),
                 ..Item::default()
             });
             out.push((
@@ -762,7 +761,6 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             pr: Some(pr.url.clone()),
             comment: Some(pr.comment_url.clone().unwrap_or_else(|| pr.url.clone())),
             checkout: None,
-            pr_ref: pr_ref(&pr.url),
         });
         out.push((
             format!("{colour}{icon}{RESET} {title}"),
@@ -888,52 +886,25 @@ struct Item {
     /// p, c.
     pr: Option<String>,
     comment: Option<String>,
-    /// d and g: the checkout, for a row of uncommitted changes.
+    /// d: the checkout, for a row of uncommitted changes.
     checkout: Option<String>,
-    /// d: the PR as `owner/repo#n`.
-    pr_ref: Option<String>,
 }
 
-/// The diff viewer `key` opens for `item`, and the directory to run it in
-/// (`None`: anywhere). d: delta, n: diffnav, h: hunk, g: lazygit (checkouts
-/// only) — side by side while choosing one. delta always pages, without
-/// less's quit-if-one-screen, so a short diff stays up until `q`.
-fn viewer(key: u8, item: &Item) -> Option<(String, Option<String>)> {
-    if let Some(top) = &item.checkout {
-        let command = match key {
-            b'd' => "git diff HEAD | delta --paging=always",
-            b'n' => "git diff HEAD | diffnav",
-            b'h' => "hunk diff --watch",
-            b'g' => "lazygit",
-            _ => return None,
-        };
-        return Some((command.to_string(), Some(top.clone())));
+/// What `d` shows for `item` in herdr-sim's diff pane: a checkout's
+/// uncommitted changes or a PR's, and the directory to run it in.
+fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
+    if key != b'd' {
+        return None;
     }
-    let url = item.pr.as_deref()?;
-    let command = match key {
-        b'd' => format!("gh pr diff {url} | delta --paging=always"),
-        b'n' => format!("gh pr diff {url} | diffnav"),
-        // hunk reads the token from the environment, not from gh.
-        b'h' => format!(
-            "GH_TOKEN=$(gh auth token) hunk gh pr '{}'",
-            item.pr_ref.as_deref()?
-        ),
-        _ => return None,
-    };
-    Some((command, None))
+    if let Some(top) = &item.checkout {
+        return Some((format!("checkout:{top}"), Some(top.clone())));
+    }
+    Some((format!("pr:{}", item.pr.as_deref()?), None))
 }
 
-/// `owner/repo#n` for a PR's URL.
-fn pr_ref(url: &str) -> Option<String> {
-    let parts: Vec<&str> = url.split('/').collect();
-    let (owner, repo, number) = (parts.get(3)?, parts.get(4)?, parts.get(6)?);
-    number.parse::<u64>().ok()?;
-    Some(format!("{owner}/{repo}#{number}"))
-}
-
-/// Runs `command` in `cwd` in a zoomed pane over this one; quitting it closes
-/// the pane and brings the panel back.
-fn view_diff(herdr: &str, command: &str, cwd: &str) {
+/// Opens the diff pane on `source` in `cwd`, zoomed over this one; quitting it
+/// closes the pane and brings the panel back.
+fn view_diff(herdr: &str, source: &str, cwd: &str) {
     let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
@@ -941,7 +912,7 @@ fn view_diff(herdr: &str, command: &str, cwd: &str) {
         .args(["plugin", "pane", "open", "--plugin", PLUGIN])
         .args(["--entrypoint", "diff", "--placement", "zoomed", "--focus"])
         .args(["--target-pane", &pane, "--cwd", cwd])
-        .args(["--env", &format!("HERDR_SIM_DIFF={command}")])
+        .args(["--env", &format!("{}={source}", crate::diff::SOURCE)])
         .output();
 }
 
@@ -1126,7 +1097,7 @@ fn copy(text: &str) {
 }
 
 /// What wakes the Changes loop besides its tick.
-enum Event {
+pub(crate) enum Event {
     Fetched(Vec<String>, HashMap<String, Pr>),
     Click {
         x: usize,
@@ -1152,7 +1123,7 @@ enum Event {
 
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
 /// 1-based column and row, and each wheel notch to `events`.
-fn listen_for_clicks(events: mpsc::Sender<Event>) {
+pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
     // Unbuffered input without echo; output keeps its newlines.
     let _ = Command::new("stty")
         .args(["-icanon", "-echo"])
@@ -1296,7 +1267,7 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
 }
 
 /// The pane's size as (rows, columns), from the terminal it runs in.
-fn size() -> (usize, usize) {
+pub(crate) fn size() -> (usize, usize) {
     let out = Command::new("stty")
         .arg("size")
         .stdin(Stdio::inherit())
@@ -1330,12 +1301,12 @@ fn char_cols(c: char) -> usize {
     }
 }
 
-fn cols(s: &str) -> usize {
+pub(crate) fn cols(s: &str) -> usize {
     s.chars().map(char_cols).sum()
 }
 
 /// `s` cut to `n` columns, with an ellipsis when cut.
-fn cut(s: &str, n: usize) -> String {
+pub(crate) fn cut(s: &str, n: usize) -> String {
     if cols(s) <= n {
         return s.to_string();
     }
@@ -1395,11 +1366,14 @@ mod tests {
         let prs = pr((1, 0, 2));
         let urls: Vec<String> = prs.keys().cloned().collect();
         let (frame, targets, items) = render(&urls, &prs, &[]);
-        // One row for the PR, over its title and details; d views it in
-        // hunk as owner/repo#n, c opens its latest comment.
+        // One row for the PR, over its title and details; d shows its diff,
+        // c opens its latest comment.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].lines, (0, 1));
-        assert_eq!(items[0].pr_ref.as_deref(), Some("o/repo#7"));
+        assert_eq!(
+            diff_source(b'd', &items[0]),
+            Some(("pr:https://github.com/o/repo/pull/7".into(), None))
+        );
         assert_eq!(
             items[0].comment.as_deref(),
             Some("https://github.com/o/repo/pull/7#issuecomment-1")

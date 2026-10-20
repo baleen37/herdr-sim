@@ -9,6 +9,7 @@
 //! overlap: one that finds another in progress leaves a note for it instead.
 
 mod changes;
+mod diff;
 
 use std::collections::HashMap;
 use std::env;
@@ -72,6 +73,9 @@ fn main() -> Result<()> {
     if env::args().any(|a| a == "--changes-pane") {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         return changes::run(&herdr_bin, &home, &state_dir);
+    }
+    if env::args().any(|a| a == "--diff-pane") {
+        return diff::run();
     }
     if env::args().any(|a| a == "--toggle-changes") {
         return changes::toggle(&herdr_bin, &state_dir);
