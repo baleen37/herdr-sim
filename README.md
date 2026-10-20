@@ -178,13 +178,16 @@ rows = [
 | `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Until Claude Code titles the session, its first real question (not a slash command or command output, cut to 60 characters) stands in; unset before that. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
+| `$tree_header_idle` | `$tree_header` on a Space with no agent in it, in its own token so it can be dimmed. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
 A token with no PRs is cleared, so its separator disappears too.
 
 ## Activity order
 
-By default the plugin orders the Agents list by activity, the way
+Off by default: the Agents list keeps Herdr's own sort (`agent_panel_sort`,
+for example `priority`, which puts sessions waiting for you first). Turned
+on, the plugin orders the Agents list by activity, the way
 [herdr-radar](https://github.com/hhdebb/herdr-radar) does: the project whose
 agent changed state most recently comes first, then within it its checkouts
 (main checkout and worktrees alike) and their split tabs, each by their latest

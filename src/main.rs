@@ -28,12 +28,13 @@ use herdr_sim::{
     Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
     SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN,
     TREE_GAP_TOKEN, TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
-    agent_icon, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
-    group_rows, header_value, heading_value, held_status, indent, project_name,
-    resolve_claude_session, scope, split_marks, state_heading_token, state_heading_value,
-    summary_value, token_value, tree_headers, workspace_agent_token,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
+    TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order,
+    age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
+    claude_session_name, codex_session, diff_value, group_rows, header_value, heading_value,
+    held_status, indent, project_name, resolve_claude_session, scope, split_marks,
+    state_heading_token, state_heading_value, summary_value, token_value, tree_headers,
+    workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -72,8 +73,9 @@ fn main() -> Result<()> {
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
     fs::create_dir_all(&state_dir)?;
     let _ = GH_PAUSE.set(state_dir.join("gh-pause"));
-    // Present while the order is off; the toggle action flips it.
-    let order_off = state_dir.join("order-off");
+    // Present while the activity order is on (it is off by default, leaving
+    // Herdr's own sort); the toggle action flips it.
+    let order_on = state_dir.join("order-on");
     let herdr_bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
     if env::args().any(|a| a == "--changes-pane") {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
@@ -90,11 +92,11 @@ fn main() -> Result<()> {
     }
     if env::args().any(|a| a == "--toggle-order") {
         // Turning it on needs no call here: every pass below sets the view.
-        if order_off.exists() {
-            fs::remove_file(&order_off)?;
-        } else {
-            fs::write(&order_off, b"")?;
+        if order_on.exists() {
+            fs::remove_file(&order_on)?;
             set_agent_view(false);
+        } else {
+            fs::write(&order_on, b"")?;
         }
     }
     let pending = state_dir.join("pending");
@@ -128,10 +130,10 @@ fn main() -> Result<()> {
         // Every pass sets the view while the order is on: it dies with the
         // server, and a plugin linked into a running server gets no startup
         // hook. Only the toggle clears it, so another plugin's view stays.
-        run.ordered = !order_off.exists();
-        if run.ordered {
-            set_agent_view(true);
-        }
+        run.ordered = order_on.exists();
+        // Our own view only: on while the order is on, cleared otherwise
+        // (it would outlive the setting until the server restarts).
+        set_agent_view(run.ordered);
         run.now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         run.pass(&scope);
         run.cache.save(&cache_path)?;
@@ -229,7 +231,8 @@ impl Run {
             // edge, so it gets the same indent itself.
             // The indent leads the row: in the split mark's cell if there is
             // one, else in the heading, which then carries the state mark.
-            let depth = usize::from(header.is_none());
+            // Sessions stand alone, one row each: no indent.
+            let depth = 0;
             let split = marks[pos].map(|mark| format!("{}{mark}", indent(depth)));
             self.cache
                 .set_depth(pane, if split.is_some() { 0 } else { depth });
@@ -349,7 +352,12 @@ impl Run {
             let header = headers
                 .remove(&workspace)
                 .or_else(|| project.as_deref().map(|p| header_value(p, None)));
+            // A Space without an agent puts its header in the idle token,
+            // so the sidebar can dim it.
+            let busy = kinds.is_some_and(|k| k.values().any(|&n| n > 0));
+            let (header, idle) = if busy { (header, None) } else { (None, header) };
             tokens.push((TREE_HEADER_TOKEN.into(), header));
+            tokens.push((TREE_HEADER_IDLE_TOKEN.into(), idle));
             tokens.push((PROJECT_TOKEN.into(), project));
             tokens.push((DIFF_TOKEN.into(), diffs.remove(&workspace)));
             let ci = cis.remove(&workspace).map(|ci| ci.icon().to_string());
