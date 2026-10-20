@@ -438,36 +438,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some(url) = url {
                                 open_url(url);
                             }
-                            // d: the diff in hunk, g: the checkout in lazygit,
-                            // full screen over the panel.
-                            match (key, item) {
-                                (
-                                    b'd',
-                                    Some(Item {
-                                        checkout: Some(top),
-                                        ..
-                                    }),
-                                ) => view_diff(herdr, "hunk diff --watch", top),
-                                (
-                                    b'd',
-                                    Some(Item {
-                                        pr_ref: Some(pr), ..
-                                    }),
-                                ) => view_diff(
-                                    herdr,
-                                    // hunk reads the token from the
-                                    // environment, not from gh.
-                                    &format!("GH_TOKEN=$(gh auth token) hunk gh pr '{pr}'"),
-                                    &home.display().to_string(),
-                                ),
-                                (
-                                    b'g',
-                                    Some(Item {
-                                        checkout: Some(top),
-                                        ..
-                                    }),
-                                ) => view_diff(herdr, "lazygit", top),
-                                _ => {}
+                            if let Some((command, cwd)) = item.and_then(|i| viewer(key, i)) {
+                                let cwd = cwd.unwrap_or_else(|| home.display().to_string());
+                                view_diff(herdr, &command, &cwd);
                             }
                             None
                         }
@@ -919,6 +892,35 @@ struct Item {
     checkout: Option<String>,
     /// d: the PR as `owner/repo#n`.
     pr_ref: Option<String>,
+}
+
+/// The diff viewer `key` opens for `item`, and the directory to run it in
+/// (`None`: anywhere). d: delta, n: diffnav, h: hunk, g: lazygit (checkouts
+/// only) — side by side while choosing one. delta always pages, without
+/// less's quit-if-one-screen, so a short diff stays up until `q`.
+fn viewer(key: u8, item: &Item) -> Option<(String, Option<String>)> {
+    if let Some(top) = &item.checkout {
+        let command = match key {
+            b'd' => "git diff HEAD | delta --paging=always",
+            b'n' => "git diff HEAD | diffnav",
+            b'h' => "hunk diff --watch",
+            b'g' => "lazygit",
+            _ => return None,
+        };
+        return Some((command.to_string(), Some(top.clone())));
+    }
+    let url = item.pr.as_deref()?;
+    let command = match key {
+        b'd' => format!("gh pr diff {url} | delta --paging=always"),
+        b'n' => format!("gh pr diff {url} | diffnav"),
+        // hunk reads the token from the environment, not from gh.
+        b'h' => format!(
+            "GH_TOKEN=$(gh auth token) hunk gh pr '{}'",
+            item.pr_ref.as_deref()?
+        ),
+        _ => return None,
+    };
+    Some((command, None))
 }
 
 /// `owner/repo#n` for a PR's URL.
