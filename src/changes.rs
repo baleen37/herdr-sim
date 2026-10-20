@@ -477,7 +477,7 @@ fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
             .saturating_sub(3 + cols(&repo) + cols(&local.diff) + button_cols)
             .max(1);
         s += &format!(
-            "{DIM}\u{f4d2}{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n\n",
+            "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n\n",
             lines.join(" "),
             " ".repeat(gap)
         );
