@@ -107,11 +107,18 @@ Claude Code's "Changes" panel as a right-hand split.
   dot and `8/11`.
 - **Focus.** It starts on the pane the key was pressed in, then follows the
   focused agent in its own workspace.
-- **Keys.** `j`/`k` move between rows. `Enter` opens the row, `p` its PR, `d`
-  its files, `c` its latest comment.
+- **Keys.** `j`/`k` move between rows, `gg`/`G` to the ends. `Enter` opens
+  the row, `p` its PR, `c` its latest comment, `d` its diff.
 - **Mouse.** A click opens what it is on: the repo, the PR, its files,
   comments, or checks. The wheel scrolls. A drag across rows copies their
   text.
+- **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
+  out like reviewr: the selected file's diff (line numbers, changed lines
+  barred and tinted, highlighted for the file's language, CSV columns in
+  colour) beside a tree of the changed files. Vim keys move (`j`/`k`,
+  `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
+  switches box, `z` hides the tree, `e` opens the file in `$EDITOR` at the
+  line, `q` brings the panel back.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
   reopened panel draws at once. Calls back off when GitHub's rate limit is

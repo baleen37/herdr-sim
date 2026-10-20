@@ -15,6 +15,9 @@ use herdr_sim::{
 };
 use serde_json::{Value, json};
 
+/// How long a checkout's `+a -d` stands without a file-system event saying
+/// it changed, in case one was missed.
+const LOCAL_TTL: Duration = Duration::from_secs(30);
 /// How often the pane looks at focus and the session again.
 const TICK: Duration = Duration::from_secs(3);
 /// How long fetched PR details are reused: open PRs change (checks,
@@ -24,10 +27,10 @@ const DONE_TTL: Duration = Duration::from_secs(600);
 
 const PLUGIN: &str = "baleen37.herdr-sim";
 /// The pane the panel starts on, set by the toggle.
-const FOR_PANE: &str = "HERDR_SIM_CHANGES_FOR";
+pub(crate) const FOR_PANE: &str = "HERDR_SIM_CHANGES_FOR";
 const ENTRYPOINT: &str = "changes";
 
-struct Pr {
+pub(crate) struct Pr {
     url: String,
     repo: String,
     number: String,
@@ -81,7 +84,20 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
     }
-    open.output()?;
+    let opened = open.output()?;
+    // Narrow it at once, from the id the open returns: the panel would size
+    // itself too, but only once its process is up, and the half-screen pane
+    // would show until then.
+    let pane = serde_json::from_slice::<Value>(&opened.stdout)
+        .ok()
+        .and_then(|v| {
+            v["result"]["plugin_pane"]["pane"]["pane_id"]
+                .as_str()
+                .map(String::from)
+        });
+    if let Some(pane) = pane {
+        fit_width(herdr, &pane, Some(PANEL_COLS));
+    }
     Ok(())
 }
 
@@ -135,23 +151,57 @@ fn changes_panes(herdr: &str, workspace: Option<&str>) -> Vec<String> {
 /// Width the panel aims for, in columns.
 const PANEL_COLS: f64 = 42.0;
 
-/// The `pane resize --amount` that brings `pane` down to about PANEL_COLS:
-/// the fraction of the tab's width to move its left edge by.
-fn shrink_amount(herdr: &str, pane: &str) -> Option<f64> {
-    let out = Command::new(herdr)
-        .args(["pane", "layout", "--pane", pane])
-        .output()
-        .ok()?;
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let layout = &v["result"]["layout"];
-    let area = layout["area"]["width"].as_f64()?;
-    let width = layout["panes"]
-        .as_array()?
-        .iter()
-        .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
-        .as_f64()?;
-    let amount = (width - PANEL_COLS) / area;
-    (amount > 0.0).then_some(amount)
+/// Names the pane a newly opened panel takes the place of; it waits for it
+/// to close before sizing itself.
+pub(crate) const REPLACES: &str = "HERDR_SIM_REPLACES";
+
+/// Waits, a second at most, for the pane in `REPLACES` to close.
+pub(crate) fn wait_gone(herdr: &str) {
+    let Ok(pane) = std::env::var(REPLACES) else {
+        return;
+    };
+    for _ in 0..20 {
+        let alive = Command::new(herdr)
+            .args(["pane", "get", &pane])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Moves `pane`'s left edge so it is about `target` columns wide, or half
+/// the tab when `None`.
+pub(crate) fn fit_width(herdr: &str, pane: &str, target: Option<f64>) {
+    let Some((width, area)) = (|| {
+        let out = Command::new(herdr)
+            .args(["pane", "layout", "--pane", pane])
+            .output()
+            .ok()?;
+        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+        let layout = &v["result"]["layout"];
+        let width = layout["panes"]
+            .as_array()?
+            .iter()
+            .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
+            .as_f64()?;
+        Some((width, layout["area"]["width"].as_f64()?))
+    })() else {
+        return;
+    };
+    let by = width - target.unwrap_or(area / 2.0);
+    if by.abs() < 1.0 {
+        return;
+    }
+    // `right` moves the edge right, narrowing the pane; `left` widens it.
+    let direction = if by > 0.0 { "right" } else { "left" };
+    let _ = Command::new(herdr)
+        .args(["pane", "resize", "--pane", pane, "--direction", direction])
+        .arg("--amount")
+        .arg(format!("{:.3}", by.abs() / area))
+        .output();
 }
 
 /// PR details by URL, with when they were fetched; `None` for details read
@@ -172,14 +222,12 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let saved = state_dir.join("changes-prs.json");
     let mut prs = load_prs(&saved);
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
-        // A side panel, not half the screen. Sized here, before the first
-        // frame, so nothing is drawn for the wider pane.
-        if let Some(amount) = shrink_amount(herdr, &pane) {
-            let _ = Command::new(herdr)
-                .args(["pane", "resize", "--pane", &pane, "--direction", "right"])
-                .arg("--amount")
-                .arg(format!("{amount:.3}"))
-                .output();
+        // Opened in place of the diff pane, it takes that pane's space when
+        // it goes, so it sizes itself then. Opened by the toggle, the toggle
+        // has sized it already; sizing again here would race it.
+        if std::env::var(REPLACES).is_ok() {
+            wait_gone(herdr);
+            fit_width(herdr, &pane, Some(PANEL_COLS));
         }
         // Tell the toggle which pane is the panel in this workspace.
         if let Some(ws) = workspace_id() {
@@ -190,6 +238,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // arrive on the same channel.
     let (done, events) = mpsc::channel::<Event>();
     listen_for_clicks(done.clone());
+    // File-system events tell which checkouts to ask git about again.
+    let mut watch = crate::watch::Watch::new(done.clone());
+    let mut local_cache: HashMap<String, (Instant, Option<String>)> = HashMap::new();
     let mut fetching = false;
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
@@ -198,6 +249,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // stays put as the list changes.
     let mut items: Vec<Item> = Vec::new();
     let mut selected: Option<String> = None;
+    let mut pending_g = false;
     // Where the left button went down: its column and line in the frame.
     let mut drag_from: Option<(usize, usize)> = None;
     let mut view = View {
@@ -229,95 +281,131 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
             last_agent = Some(agent.clone());
         }
-        let frame = match &last_agent {
-            Some(agent) => {
-                let session = session_of(agent, home, &mut cache);
-                // Newest first, as in Claude Code's Changes panel.
-                let list: Vec<String> = session
-                    .as_ref()
-                    .map(|s| s.prs.iter().rev().cloned().collect())
-                    .unwrap_or_default();
-                let stale: Vec<String> = list
-                    .iter()
-                    .filter(|url| {
-                        !prs.get(*url).is_some_and(|(at, pr)| {
-                            let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
-                            at.is_some_and(|at| {
-                                at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
+        // A panel in a workspace not on screen keeps its last frame: no git,
+        // no transcripts, no redraw. Only the cheap agent list runs, so it
+        // catches up within a tick of coming back on screen.
+        let hidden = agents.iter().any(|a| {
+            a["focused"].as_bool() == Some(true)
+                && workspace
+                    .as_deref()
+                    .is_some_and(|ws| a["workspace_id"].as_str() != Some(ws))
+        });
+        let frame = if hidden && !last_frame.is_empty() {
+            last_frame.clone()
+        } else {
+            match &last_agent {
+                Some(agent) => {
+                    let session = session_of(agent, home, &mut cache);
+                    // Newest first, as in Claude Code's Changes panel.
+                    let list: Vec<String> = session
+                        .as_ref()
+                        .map(|s| s.prs.iter().rev().cloned().collect())
+                        .unwrap_or_default();
+                    let stale: Vec<String> = list
+                        .iter()
+                        .filter(|url| {
+                            !prs.get(*url).is_some_and(|(at, pr)| {
+                                let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
+                                at.is_some_and(|at| {
+                                    at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
+                                })
                             })
                         })
-                    })
-                    .cloned()
-                    .collect();
-                if !stale.is_empty() && !fetching {
-                    fetching = true;
-                    let done = done.clone();
-                    std::thread::spawn(move || {
-                        let got = fetch_all(&stale);
-                        let _ = done.send(Event::Fetched(stale, got));
-                    });
-                }
-                // Every checkout the session worked in, where it runs first.
-                let dirs = agent["cwd"]
-                    .as_str()
-                    .map(String::from)
-                    .into_iter()
-                    .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
-                let dirs: Vec<String> = dirs.collect();
-                // Directories not seen before are looked up together.
-                let new: Vec<&String> = dirs
-                    .iter()
-                    .filter(|d| !checkouts.contains_key(*d))
-                    .collect();
-                let found: Vec<Option<String>> = std::thread::scope(|s| {
-                    let running: Vec<_> =
-                        new.iter().map(|dir| s.spawn(|| checkout_of(dir))).collect();
-                    running
-                        .into_iter()
-                        .map(|t| t.join().ok().flatten())
-                        .collect()
-                });
-                for (dir, top) in new.into_iter().zip(found) {
-                    checkouts.insert(dir.clone(), top);
-                }
-                let mut tops: Vec<String> = Vec::new();
-                for dir in &dirs {
-                    if let Some(Some(top)) = checkouts.get(dir)
-                        && !tops.contains(top)
-                    {
-                        tops.push(top.clone());
+                        .cloned()
+                        .collect();
+                    if !stale.is_empty() && !fetching {
+                        fetching = true;
+                        let done = done.clone();
+                        std::thread::spawn(move || {
+                            let got = fetch_all(&stale);
+                            let _ = done.send(Event::Fetched(stale, got));
+                        });
                     }
-                }
-                // Every checkout's diff at once: git is the slow part of a tick.
-                let diffs: Vec<Option<String>> = std::thread::scope(|s| {
-                    let running: Vec<_> =
-                        tops.iter().map(|top| s.spawn(|| local_diff(top))).collect();
-                    running
+                    // Every checkout the session worked in, where it runs first.
+                    let dirs = agent["cwd"]
+                        .as_str()
+                        .map(String::from)
                         .into_iter()
-                        .map(|t| t.join().ok().flatten())
-                        .collect()
-                });
-                let local: Vec<Local> = tops
-                    .iter()
-                    .zip(diffs)
-                    .filter_map(|(top, diff)| {
-                        let (repo, slug) = names
-                            .entry(top.clone())
-                            .or_insert_with(|| (repo_name(top), github_slug(top)));
-                        Some(Local {
-                            top: top.clone(),
-                            repo: repo.clone()?,
-                            diff: diff?,
-                            url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
+                        .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
+                    let dirs: Vec<String> = dirs.collect();
+                    // Directories not seen before are looked up together.
+                    let new: Vec<&String> = dirs
+                        .iter()
+                        .filter(|d| !checkouts.contains_key(*d))
+                        .collect();
+                    let found: Vec<Option<String>> = std::thread::scope(|s| {
+                        let running: Vec<_> =
+                            new.iter().map(|dir| s.spawn(|| checkout_of(dir))).collect();
+                        running
+                            .into_iter()
+                            .map(|t| t.join().ok().flatten())
+                            .collect()
+                    });
+                    for (dir, top) in new.into_iter().zip(found) {
+                        checkouts.insert(dir.clone(), top);
+                    }
+                    let mut tops: Vec<String> = Vec::new();
+                    for dir in &dirs {
+                        if let Some(Some(top)) = checkouts.get(dir)
+                            && !tops.contains(top)
+                        {
+                            tops.push(top.clone());
+                        }
+                    }
+                    // git only for checkouts whose files changed (or not seen
+                    // for a while), all at once: git is the slow part of a tick.
+                    let stale: Vec<&String> = tops
+                        .iter()
+                        .filter(|top| {
+                            if let Some(watch) = watch.as_mut() {
+                                watch.add(top);
+                            }
+                            let changed = watch.as_ref().is_none_or(|w| w.take(top));
+                            changed
+                                || local_cache
+                                    .get(*top)
+                                    .is_none_or(|(at, _)| at.elapsed() >= LOCAL_TTL)
                         })
-                    })
-                    .collect();
-                let (changes, clicks, rows) = render(&list, &prs, &local);
-                targets = clicks;
-                items = rows;
-                changes
+                        .collect();
+                    let fresh: Vec<Option<String>> = std::thread::scope(|s| {
+                        let running: Vec<_> = stale
+                            .iter()
+                            .map(|top| s.spawn(|| local_diff(top)))
+                            .collect();
+                        running
+                            .into_iter()
+                            .map(|t| t.join().ok().flatten())
+                            .collect()
+                    });
+                    for (top, diff) in stale.into_iter().zip(fresh) {
+                        local_cache.insert(top.clone(), (Instant::now(), diff));
+                    }
+                    let diffs: Vec<Option<String>> = tops
+                        .iter()
+                        .map(|top| local_cache.get(top).and_then(|(_, d)| d.clone()))
+                        .collect();
+                    let local: Vec<Local> = tops
+                        .iter()
+                        .zip(diffs)
+                        .filter_map(|(top, diff)| {
+                            let (repo, slug) = names
+                                .entry(top.clone())
+                                .or_insert_with(|| (repo_name(top), github_slug(top)));
+                            Some(Local {
+                                top: top.clone(),
+                                repo: repo.clone()?,
+                                diff: diff?,
+                                url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
+                            })
+                        })
+                        .collect();
+                    let (changes, clicks, rows) = render(&list, &prs, &local);
+                    targets = clicks;
+                    items = rows;
+                    changes
+                }
+                None => "No agent focused yet.\n".to_string(),
             }
-            None => "No agent focused yet.\n".to_string(),
         };
         // Redraw only on change: no flicker, no work for the terminal. The
         // pane's size is read once a tick, not per draw.
@@ -418,7 +506,19 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     let at = selected
                         .as_ref()
                         .and_then(|key| items.iter().position(|i| &i.key == key));
+                    // gg: a first g waits for the second.
+                    let after_g = std::mem::take(&mut pending_g);
+                    // Ctrl-d/u move half a screen of rows.
+                    let half = (view.rows / 4).max(1);
                     let to = match (key, at) {
+                        (b'g', _) if !after_g => {
+                            pending_g = true;
+                            None
+                        }
+                        (b'g', _) => items.first(),
+                        (b'G', _) => items.last(),
+                        (4, Some(i)) => items.get((i + half).min(items.len().saturating_sub(1))),
+                        (21, Some(i)) => items.get(i.saturating_sub(half)),
                         (b'j', Some(i)) => items.get(i + 1),
                         (b'k', Some(i)) => i.checked_sub(1).and_then(|i| items.get(i)),
                         // Nothing selected yet: the first or last row on screen.
@@ -432,12 +532,18 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             let url = item.and_then(|item| match key {
                                 b'\r' | b'\n' => item.open.as_deref(),
                                 b'p' => item.pr.as_deref(),
-                                b'd' => item.diff.as_deref(),
                                 b'c' => item.comment.as_deref(),
                                 _ => None,
                             });
                             if let Some(url) = url {
                                 open_url(url);
+                            }
+                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i))
+                                && let Some(agent) =
+                                    last_agent.as_ref().and_then(|a| a["pane_id"].as_str())
+                            {
+                                let cwd = cwd.unwrap_or_else(|| home.display().to_string());
+                                view_diff(herdr, &source, &cwd, agent);
                             }
                             None
                         }
@@ -545,8 +651,14 @@ fn save_prs(path: &Path, prs: &Prs) {
     }
 }
 
-/// Every agent pane Herdr knows, or none when the call fails.
+/// Every agent pane Herdr knows, or none when the call fails. Asked over the
+/// server's socket, which costs no process; the CLI only without one.
 fn agents(herdr: &str) -> Vec<Value> {
+    if let Ok(mut result) = crate::socket_request("agent.list", json!({}))
+        && let Value::Array(agents) = result["agents"].take()
+    {
+        return agents;
+    }
     Command::new(herdr)
         .args(["agent", "list"])
         .output()
@@ -664,19 +776,19 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
         .collect()
 }
 
-const GREEN: &str = "\x1b[38;2;166;227;161m";
+pub(crate) const GREEN: &str = "\x1b[38;2;166;227;161m";
 const PURPLE: &str = "\x1b[38;2;203;166;247m";
-const RED: &str = "\x1b[38;2;243;139;168m";
-const DIM: &str = "\x1b[2m";
+pub(crate) const RED: &str = "\x1b[38;2;243;139;168m";
+pub(crate) const DIM: &str = "\x1b[2m";
 /// The selected or pointed-at link: underlined on a raised background, which
 /// shows even where underline is not drawn.
 const HL_ON: &str = "\x1b[4;48;2;69;71;90m";
 const HL_OFF: &str = "\x1b[24;49m";
 /// The row the keys selected: a bar across the pane.
-const SELECTED: &str = "\x1b[48;2;49;50;68m";
+pub(crate) const SELECTED: &str = "\x1b[48;2;49;50;68m";
 /// Rows a drag covers, to be copied.
 const DRAGGED: &str = "\x1b[48;2;88;91;112m";
-const RESET: &str = "\x1b[0m";
+pub(crate) const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
@@ -705,6 +817,7 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             key: format!("local:{}", local.top),
             lines: (out.len(), out.len()),
             open: local.url.clone(),
+            checkout: Some(local.top.clone()),
             ..Item::default()
         });
         out.push((
@@ -755,8 +868,8 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             lines: (out.len(), out.len() + 1),
             open: Some(pr.url.clone()),
             pr: Some(pr.url.clone()),
-            diff: Some(format!("{}/files", pr.url)),
             comment: Some(pr.comment_url.clone().unwrap_or_else(|| pr.url.clone())),
+            checkout: None,
         });
         out.push((
             format!("{colour}{icon}{RESET} {title}"),
@@ -879,10 +992,70 @@ struct Item {
     lines: (usize, usize),
     /// Enter.
     open: Option<String>,
-    /// p, d, c.
+    /// p, c.
     pr: Option<String>,
-    diff: Option<String>,
     comment: Option<String>,
+    /// d: the checkout, for a row of uncommitted changes.
+    checkout: Option<String>,
+}
+
+/// What `d` shows for `item` in herdr-sim's diff pane: a checkout's
+/// uncommitted changes or a PR's, and the directory to run it in.
+fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
+    if key != b'd' {
+        return None;
+    }
+    if let Some(top) = &item.checkout {
+        return Some((format!("checkout:{top}"), Some(top.clone())));
+    }
+    Some((format!("pr:{}", item.pr.as_deref()?), None))
+}
+
+/// Swaps this panel for the diff pane on `source`: the diff opens on the
+/// right half beside `agent`, and this panel closes. Quitting the diff brings
+/// the panel back.
+fn view_diff(herdr: &str, source: &str, cwd: &str, agent: &str) {
+    let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
+        return;
+    };
+    let opened = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
+        .args([
+            "--entrypoint",
+            "diff",
+            "--placement",
+            "split",
+            "--direction",
+            "right",
+        ])
+        .args(["--focus", "--target-pane", agent, "--cwd", cwd])
+        .args(["--env", &format!("{}={source}", crate::diff::SOURCE)])
+        .args(["--env", &format!("{FOR_PANE}={agent}")])
+        .args(["--env", &format!("{REPLACES}={pane}")])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if opened {
+        // Ends this process too.
+        let _ = Command::new(herdr).args(["pane", "close", &pane]).output();
+    }
+}
+
+/// Opens the Changes panel beside `agent` in place of `replaces`.
+pub(crate) fn reopen(herdr: &str, agent: &str, replaces: &str) {
+    let _ = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
+        .args([
+            "--entrypoint",
+            ENTRYPOINT,
+            "--placement",
+            "split",
+            "--direction",
+            "right",
+        ])
+        .args(["--focus", "--target-pane", agent])
+        .args(["--env", &format!("{FOR_PANE}={agent}")])
+        .args(["--env", &format!("{REPLACES}={replaces}")])
+        .output();
 }
 
 /// Stands in a frame for a running check's dot, drawn at each step.
@@ -933,7 +1106,9 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
         out += &format!("\x1b[{};1H{}\x1b[K", row + 1, line.replace(PULSE, &dot));
     }
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(out.as_bytes());
+    // One synchronized update (DEC mode 2026): terminals that know it show
+    // the frame whole, never half drawn.
+    let _ = stdout.write_all(format!("\x1b[?2026h{out}\x1b[?2026l").as_bytes());
     let _ = stdout.flush();
 }
 
@@ -1066,7 +1241,7 @@ fn copy(text: &str) {
 }
 
 /// What wakes the Changes loop besides its tick.
-enum Event {
+pub(crate) enum Event {
     Fetched(Vec<String>, HashMap<String, Pr>),
     Click {
         x: usize,
@@ -1081,6 +1256,8 @@ enum Event {
     },
     /// A key pressed in the pane.
     Key(u8),
+    /// Work finished off the drawing thread; draw again.
+    Wake,
     /// Left button pressed or dragged, on a 1-based row, or released.
     Press {
         x: usize,
@@ -1092,7 +1269,7 @@ enum Event {
 
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
 /// 1-based column and row, and each wheel notch to `events`.
-fn listen_for_clicks(events: mpsc::Sender<Event>) {
+pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
     // Unbuffered input without echo; output keeps its newlines.
     let _ = Command::new("stty")
         .args(["-icanon", "-echo"])
@@ -1236,19 +1413,54 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
 }
 
 /// The pane's size as (rows, columns), from the terminal it runs in.
-fn size() -> (usize, usize) {
-    let out = Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let mut n = out.split_whitespace().map(|n| n.parse().ok());
-    (
-        n.next().flatten().unwrap_or(40),
-        n.next().flatten().unwrap_or(40),
-    )
+pub(crate) fn size() -> (usize, usize) {
+    window_size().unwrap_or_else(|| {
+        let out = Command::new("stty")
+            .arg("size")
+            .stdin(Stdio::inherit())
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let mut n = out.split_whitespace().map(|n| n.parse().ok());
+        (
+            n.next().flatten().unwrap_or(40),
+            n.next().flatten().unwrap_or(40),
+        )
+    })
+}
+
+/// The terminal's rows and columns from the kernel (TIOCGWINSZ on stdout),
+/// without spawning `stty`; `None` where that is not available.
+fn window_size() -> Option<(usize, usize)> {
+    #[cfg(target_os = "macos")]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x4008_7468;
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x5413;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[repr(C)]
+        struct Winsize {
+            rows: u16,
+            cols: u16,
+            xpixel: u16,
+            ypixel: u16,
+        }
+        unsafe extern "C" {
+            fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+        }
+        let mut size = Winsize {
+            rows: 0,
+            cols: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ writes one Winsize through the pointer given.
+        let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut size as *mut Winsize) } == 0;
+        (ok && size.rows > 0).then_some((size.rows as usize, size.cols as usize))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
 }
 
 /// Terminal columns `c` takes: two for Hangul and other East Asian wide
@@ -1270,12 +1482,12 @@ fn char_cols(c: char) -> usize {
     }
 }
 
-fn cols(s: &str) -> usize {
+pub(crate) fn cols(s: &str) -> usize {
     s.chars().map(char_cols).sum()
 }
 
 /// `s` cut to `n` columns, with an ellipsis when cut.
-fn cut(s: &str, n: usize) -> String {
+pub(crate) fn cut(s: &str, n: usize) -> String {
     if cols(s) <= n {
         return s.to_string();
     }
@@ -1335,13 +1547,13 @@ mod tests {
         let prs = pr((1, 0, 2));
         let urls: Vec<String> = prs.keys().cloned().collect();
         let (frame, targets, items) = render(&urls, &prs, &[]);
-        // One row for the PR, over its title and details; d and c open its
-        // files and latest comment.
+        // One row for the PR, over its title and details; d shows its diff,
+        // c opens its latest comment.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].lines, (0, 1));
         assert_eq!(
-            items[0].diff.as_deref(),
-            Some("https://github.com/o/repo/pull/7/files")
+            diff_source(b'd', &items[0]),
+            Some(("pr:https://github.com/o/repo/pull/7".into(), None))
         );
         assert_eq!(
             items[0].comment.as_deref(),

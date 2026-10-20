@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.19.0"
+version = "0.20.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -60,6 +60,21 @@ id = "changes"
 title = "Changes"
 placement = "split"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --changes-pane"]
+
+# The diff the Changes panel opens full screen with `d`.
+[[panes]]
+id = "diff"
+title = "Diff"
+placement = "zoomed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --diff-pane"]
+
+# `e` in the diff pane: the file in the user's editor, at the line, zoomed
+# over the diff.
+[[panes]]
+id = "edit"
+title = "Edit"
+placement = "zoomed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --edit-pane"]
 
 [[actions]]
 id = "toggle-changes"

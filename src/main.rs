@@ -9,6 +9,8 @@
 //! overlap: one that finds another in progress leaves a note for it instead.
 
 mod changes;
+mod diff;
+mod watch;
 
 use std::collections::HashMap;
 use std::env;
@@ -56,6 +58,10 @@ struct Run {
 }
 
 fn main() -> Result<()> {
+    // Every git this plugin runs only reads: never take the index lock an
+    // agent's own git may want (git status's --no-optional-locks).
+    // SAFETY: set before any thread starts.
+    unsafe { env::set_var("GIT_OPTIONAL_LOCKS", "0") };
     let event = env::var("HERDR_PLUGIN_EVENT").ok();
     let mut scope = scope(
         event.as_deref(),
@@ -72,6 +78,12 @@ fn main() -> Result<()> {
     if env::args().any(|a| a == "--changes-pane") {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         return changes::run(&herdr_bin, &home, &state_dir);
+    }
+    if env::args().any(|a| a == "--edit-pane") {
+        return diff::edit_pane();
+    }
+    if env::args().any(|a| a == "--diff-pane") {
+        return diff::run(&herdr_bin);
     }
     if env::args().any(|a| a == "--toggle-changes") {
         return changes::toggle(&herdr_bin, &state_dir);
@@ -556,6 +568,12 @@ fn set_agent_view(on: bool) {
 /// One request over Herdr's socket, for the calls its CLI does not wrap. The
 /// server answers one newline-terminated JSON line and hangs up.
 fn socket_call(method: &str, params: Value) -> Result<()> {
+    socket_request(method, params).map(|_| ())
+}
+
+/// One request to the Herdr server over its socket, without spawning the
+/// CLI; the reply's `result`.
+pub fn socket_request(method: &str, params: Value) -> Result<Value> {
     let path = env::var("HERDR_SOCKET_PATH").context("HERDR_SOCKET_PATH is not set")?;
     let mut stream = UnixStream::connect(&path).with_context(|| format!("connecting to {path}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(4)))?;
@@ -563,11 +581,11 @@ fn socket_call(method: &str, params: Value) -> Result<()> {
     writeln!(stream, "{request}")?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    let reply: Value = serde_json::from_str(&line)?;
+    let mut reply: Value = serde_json::from_str(&line)?;
     if !reply["error"].is_null() {
         bail!("{}", reply["error"]);
     }
-    Ok(())
+    Ok(reply["result"].take())
 }
 
 struct Repo {
