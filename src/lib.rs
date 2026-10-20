@@ -632,20 +632,18 @@ pub fn held_status<'a>(
     }
 }
 
-/// A state token's value: the indent, then the heading with herdr-radar's
-/// mark for an event that needs you between logo and title — `✓` a finished
-/// turn not yet seen, `?` a question.
+/// A state token's value: the indent, the state's mark — `◐` working, `✓` a
+/// finished turn not yet seen, `?` a question, `○` idle — then the heading.
 pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String {
+    // The state leads, as Herdr's own state icon would: the heading then
+    // stands alone in its row, so an indent before it opens no gap.
     let mark = match status {
+        "working" => "◐",
         "done" => "✓",
         "blocked" => "?",
-        _ => return format!("{}{heading}", indent(depth)),
+        _ => "○",
     };
-    let marked = match heading.split_once(' ') {
-        Some((logo, title)) => format!("{logo} {mark} {title}"),
-        None => format!("{heading} {mark}"),
-    };
-    format!("{}{marked}", indent(depth))
+    format!("{}{mark} {heading}", indent(depth))
 }
 
 /// What herdr-sim knows about one agent session.
@@ -700,6 +698,25 @@ pub fn resolve_claude_session(home: &Path, session_id: &str) -> String {
             parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
         })
         .unwrap_or_else(|| session_id.to_string())
+}
+
+/// The name Claude Code gave a session in `~/.claude/sessions/<pid>.json`
+/// (such as `search-4b`): something to show before it has a title or a
+/// question.
+pub fn claude_session_name(home: &Path, session_id: &str) -> Option<String> {
+    entries(&home.join(".claude/sessions")).find_map(|path| {
+        if path.extension().is_none_or(|e| e != "json") {
+            return None;
+        }
+        let v = parse(&fs::read_to_string(&path).ok()?)?;
+        if v["sessionId"].as_str() != Some(session_id) {
+            return None;
+        }
+        v["name"]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+    })
 }
 
 /// A Claude Code session: PRs from its `pr-link` records, and its title from
@@ -1641,9 +1658,9 @@ mod tests {
 
     #[test]
     fn state_heading_value_marks_events_after_the_logo() {
-        assert_eq!(state_heading_value("L Fix", "done", 0), "L ✓ Fix");
-        assert_eq!(state_heading_value("L", "blocked", 0), "L ?");
-        assert_eq!(state_heading_value("L Fix", "idle", 2), "\u{200b}    L Fix");
+        assert_eq!(state_heading_value("L Fix", "done", 0), "✓ L Fix");
+        assert_eq!(state_heading_value("L", "blocked", 0), "? L");
+        assert_eq!(state_heading_value("L Fix", "idle", 1), "\u{200b}  ○ L Fix");
     }
 
     #[test]
