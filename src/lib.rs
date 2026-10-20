@@ -255,6 +255,8 @@ pub struct Place {
 /// Sidebar token with a one-line checkout header, referenced as
 /// `$tree_header`: `<repo icon> <project>  <branch icon> <branch>`.
 pub const TREE_HEADER_TOKEN: &str = "tree_header";
+/// `$tree_header` on a Space with no agent in it, so it can be dimmed.
+pub const TREE_HEADER_IDLE_TOKEN: &str = "tree_header_idle";
 
 /// Sidebar token with the PR of a checkout's branch, as an icon on the same
 /// agent as `$tree_worktree` (Orca puts the PR on the worktree card),

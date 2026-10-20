@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.20.1"
+version = "0.21.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
