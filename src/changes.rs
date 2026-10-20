@@ -201,6 +201,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
     let mut targets: Vec<Target> = Vec::new();
+    // Lines scrolled off the top.
+    let mut scroll = 0usize;
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -268,19 +270,14 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                 // Environment rows do nothing when clicked.
                 targets = vec![Target::default(); env.lines().count()];
                 targets.extend(clicks);
-                // Only what fits: a longer frame scrolls the top rows off.
-                let rows = size().0;
-                (env + &changes)
-                    .lines()
-                    .take(rows)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                env + &changes
             }
             None => "No agent focused yet.\n".to_string(),
         };
         // Redraw only on change: no flicker, no work for the terminal.
         if frame != last_frame {
-            draw(&frame, 0);
+            scroll = scroll.min(max_scroll(&frame));
+            draw(&frame, scroll, 0);
             last_frame = frame;
         }
         // Wake early when GitHub answers or a click comes, so either shows at
@@ -292,16 +289,26 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             let spinning = last_frame.contains(SPIN);
             let wait = if spinning { left.min(SPIN_STEP) } else { left };
             match events.recv_timeout(wait) {
+                // The wheel moves the drawn frame; nothing needs reading again.
+                Ok(Event::Scroll(by)) => {
+                    let to = scroll
+                        .saturating_add_signed(by)
+                        .min(max_scroll(&last_frame));
+                    if to != scroll {
+                        scroll = to;
+                        draw(&last_frame, scroll, step);
+                    }
+                }
                 Ok(event) => break Some(event),
                 Err(_) if Instant::now() >= deadline => break None,
                 Err(_) => {
                     step += 1;
-                    draw(&last_frame, step);
+                    draw(&last_frame, scroll, step);
                 }
             }
         };
         if let Some(Event::Click { x, y }) = event {
-            let target = y.checked_sub(1).and_then(|row| targets.get(row));
+            let target = y.checked_sub(1).and_then(|row| targets.get(row + scroll));
             if let Some(url) = target.and_then(|t| t.at(x)) {
                 open_url(url);
             }
@@ -668,13 +675,23 @@ const SPIN: char = '\u{1}';
 const SPIN_STEP: Duration = Duration::from_millis(120);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Draws `frame` over the last one, spinners at `step`: line by line, each
-/// cleared to its end, so nothing flickers.
-fn draw(frame: &str, step: usize) {
+/// Lines one wheel notch scrolls.
+const SCROLL_LINES: isize = 3;
+
+/// How far `frame` can scroll: the lines that do not fit the pane.
+fn max_scroll(frame: &str) -> usize {
+    frame.lines().count().saturating_sub(size().0)
+}
+
+/// Draws what of `frame` fits the pane from line `scroll`, spinners at
+/// `step`: line by line over the last frame, each cleared to its end, so
+/// nothing flickers.
+fn draw(frame: &str, scroll: usize, step: usize) {
     let spin = SPINNER[step % SPINNER.len()].to_string();
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[H");
-    for (i, line) in frame.lines().enumerate() {
+    let rows = size().0;
+    for (i, line) in frame.lines().skip(scroll).take(rows).enumerate() {
         if i > 0 {
             let _ = write!(out, "\r\n");
         }
@@ -687,7 +704,12 @@ fn draw(frame: &str, step: usize) {
 /// What wakes the Changes loop besides its tick.
 enum Event {
     Fetched(Vec<String>, HashMap<String, Pr>),
-    Click { x: usize, y: usize },
+    Click {
+        x: usize,
+        y: usize,
+    },
+    /// Wheel: lines to move down (negative: up).
+    Scroll(isize),
 }
 
 /// Turns on mouse reporting in the pane and sends each left click, as
@@ -718,10 +740,13 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
             let press = byte[0] == b'M';
             buf.clear();
             let n: Vec<usize> = seq.split(';').filter_map(|n| n.parse().ok()).collect();
-            if press
-                && let [0, x, y] = n[..]
-                && events.send(Event::Click { x, y }).is_err()
-            {
+            let event = match n[..] {
+                [0, x, y] if press => Event::Click { x, y },
+                [64, ..] => Event::Scroll(-SCROLL_LINES),
+                [65, ..] => Event::Scroll(SCROLL_LINES),
+                _ => continue,
+            };
+            if events.send(event).is_err() {
                 return;
             }
         }
