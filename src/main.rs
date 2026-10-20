@@ -25,16 +25,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
-    Ci, DIFF_TOKEN, HEADING_TOKEN, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
+    Ci, DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
     SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN,
     TREE_GAP_TOKEN, TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN,
     TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
     TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order,
     age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
     claude_session_name, codex_session, diff_value, group_rows, header_value, heading_value,
-    held_status, indent, project_name, resolve_claude_session, scope, split_marks,
-    state_heading_token, state_heading_value, summary_value, token_value, tree_headers,
-    workspace_agent_token,
+    held_status, icon_token, indent, project_name, resolve_claude_session, scope, split_marks,
+    state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
+    token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -231,11 +231,11 @@ impl Run {
             // edge, so it gets the same indent itself.
             // The indent leads the row: in the split mark's cell if there is
             // one, else in the heading, which then carries the state mark.
-            // Sessions stand alone, one row each: no indent.
+            // Sessions stand alone, one row each: no indent. Only the
+            // tree's `$icon_*` sits in, under its branch.
             let depth = 0;
             let split = marks[pos].map(|mark| format!("{}{mark}", indent(depth)));
-            self.cache
-                .set_depth(pane, if split.is_some() { 0 } else { depth });
+            self.cache.set_depth(pane, row.depth);
             let fade = |stale: bool, header: Option<String>| {
                 if stale {
                     (None, header)
@@ -488,10 +488,8 @@ impl Run {
     /// colour by state), reusing the heading the last full pass computed.
     fn report_states(&mut self, agents: &[Value], states: &[(String, &'static str)]) {
         for (agent, (status, state)) in agents.iter().zip(states) {
-            let (Some(pane), Some(icon)) = (
-                agent["pane_id"].as_str(),
-                agent_icon(agent["agent"].as_str().unwrap_or_default()),
-            ) else {
+            let kind = agent["agent"].as_str().unwrap_or_default();
+            let (Some(pane), Some(icon)) = (agent["pane_id"].as_str(), agent_icon(kind)) else {
                 continue;
             };
             // Read the title now rather than reuse the last pass's: Claude
@@ -504,12 +502,33 @@ impl Run {
                 }
                 None => self.cache.heading(pane).unwrap_or_else(|| icon.to_string()),
             };
-            let value = state_heading_value(&heading, status, self.cache.depth(pane));
+            let value = state_heading_value(&heading, status, 0);
             let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
                 .map(|t| (t.to_string(), (t == state).then(|| value.clone())))
                 .collect();
             self.report("pane", pane, "state", None, &tokens);
+            // The same heading split in two, logo apart, for the radar rows.
+            // A report takes at most 16 tokens, so these go in a call of their own.
+            let title = heading.strip_prefix(icon).and_then(|t| t.strip_prefix(' '));
+            let label = state_label_value(title, status);
+            let mut radar: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
+                .iter()
+                .map(|t| {
+                    (
+                        state_label_token(t),
+                        (t == state).then(|| label.clone()).flatten(),
+                    )
+                })
+                .collect();
+            let logo = icon_token(kind, *state == STALE_HEADING_TOKEN);
+            let logo_value = format!("{}{icon}", indent(self.cache.depth(pane)));
+            radar.extend(
+                ICON_TOKENS
+                    .iter()
+                    .map(|t| (t.to_string(), (*t == logo).then(|| logo_value.clone()))),
+            );
+            self.report("pane", pane, "radar", None, &radar);
         }
     }
 
