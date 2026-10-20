@@ -551,25 +551,13 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
                 format!("{c}{n}{RESET}")
             })
             .collect();
-        // "Create PR" opens GitHub's compare page for the branch.
-        let button = "\u{f407} Create PR";
-        let button_cols = cols(button);
         let repo = cut(
             &local.repo,
-            width
-                .saturating_sub(4 + cols(&local.diff) + button_cols)
-                .max(4),
+            width.saturating_sub(4 + cols(&local.diff)).max(4),
         );
-        let gap = width
-            .saturating_sub(3 + cols(&repo) + cols(&local.diff) + button_cols)
-            .max(1);
         out.push((
-            format!(
-                "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}",
-                lines.join(" "),
-                " ".repeat(gap)
-            ),
-            Target::all(local.compare.clone()),
+            format!("{DIM}±{RESET} {DIM}{repo}{RESET} {}", lines.join(" ")),
+            Target::default(),
         ));
     }
     if !local.is_empty() {
@@ -884,12 +872,10 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-/// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
-/// for opening a PR from its branch.
+/// Uncommitted changes in a checkout: its repo and `+a -d`.
 struct Local {
     repo: String,
     diff: String,
-    compare: Option<String>,
 }
 
 /// The top of the git checkout holding `dir`, if any.
@@ -915,28 +901,8 @@ fn local_changes(cwd: &str) -> Option<Local> {
         (!s.is_empty()).then_some(s)
     };
     let diff = diff_value(&git(&["diff", "--shortstat", "HEAD"])?)?;
-    let slug = github_slug(cwd);
     let repo = repo_name(cwd)?;
-    let compare = slug
-        .zip(git(&["branch", "--show-current"]))
-        .map(|(slug, branch)| {
-            // Branch names may hold `#`, `?`, `%`, or spaces; `/` stays as is.
-            let branch: String = branch
-                .bytes()
-                .map(|b| match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                        (b as char).to_string()
-                    }
-                    _ => format!("%{b:02X}"),
-                })
-                .collect();
-            format!("https://github.com/{slug}/compare/{branch}?expand=1")
-        });
-    Some(Local {
-        repo,
-        diff,
-        compare,
-    })
+    Some(Local { repo, diff })
 }
 
 /// `owner/repo` of the checkout's GitHub `origin`, if it has one.
