@@ -15,6 +15,9 @@ use herdr_sim::{
 };
 use serde_json::{Value, json};
 
+/// How long a checkout's `+a -d` stands without a file-system event saying
+/// it changed, in case one was missed.
+const LOCAL_TTL: Duration = Duration::from_secs(30);
 /// How often the pane looks at focus and the session again.
 const TICK: Duration = Duration::from_secs(3);
 /// How long fetched PR details are reused: open PRs change (checks,
@@ -81,7 +84,20 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
     }
-    open.output()?;
+    let opened = open.output()?;
+    // Narrow it at once, from the id the open returns: the panel would size
+    // itself too, but only once its process is up, and the half-screen pane
+    // would show until then.
+    let pane = serde_json::from_slice::<Value>(&opened.stdout)
+        .ok()
+        .and_then(|v| {
+            v["result"]["plugin_pane"]["pane"]["pane_id"]
+                .as_str()
+                .map(String::from)
+        });
+    if let Some(pane) = pane {
+        fit_width(herdr, &pane, Some(PANEL_COLS));
+    }
     Ok(())
 }
 
@@ -206,11 +222,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let saved = state_dir.join("changes-prs.json");
     let mut prs = load_prs(&saved);
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
-        // A side panel, not half the screen. Sized here, before the first
-        // frame, so nothing is drawn for the wider pane — once the diff pane
-        // it replaces has gone and left its space.
-        wait_gone(herdr);
-        fit_width(herdr, &pane, Some(PANEL_COLS));
+        // Opened in place of the diff pane, it takes that pane's space when
+        // it goes, so it sizes itself then. Opened by the toggle, the toggle
+        // has sized it already; sizing again here would race it.
+        if std::env::var(REPLACES).is_ok() {
+            wait_gone(herdr);
+            fit_width(herdr, &pane, Some(PANEL_COLS));
+        }
         // Tell the toggle which pane is the panel in this workspace.
         if let Some(ws) = workspace_id() {
             let _ = std::fs::write(marker(state_dir, &ws), pane);
@@ -220,6 +238,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // arrive on the same channel.
     let (done, events) = mpsc::channel::<Event>();
     listen_for_clicks(done.clone());
+    // File-system events tell which checkouts to ask git about again.
+    let mut watch = crate::watch::Watch::new(done.clone());
+    let mut local_cache: HashMap<String, (Instant, Option<String>)> = HashMap::new();
     let mut fetching = false;
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
@@ -331,15 +352,38 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             tops.push(top.clone());
                         }
                     }
-                    // Every checkout's diff at once: git is the slow part of a tick.
-                    let diffs: Vec<Option<String>> = std::thread::scope(|s| {
-                        let running: Vec<_> =
-                            tops.iter().map(|top| s.spawn(|| local_diff(top))).collect();
+                    // git only for checkouts whose files changed (or not seen
+                    // for a while), all at once: git is the slow part of a tick.
+                    let stale: Vec<&String> = tops
+                        .iter()
+                        .filter(|top| {
+                            if let Some(watch) = watch.as_mut() {
+                                watch.add(top);
+                            }
+                            let changed = watch.as_ref().is_none_or(|w| w.take(top));
+                            changed
+                                || local_cache
+                                    .get(*top)
+                                    .is_none_or(|(at, _)| at.elapsed() >= LOCAL_TTL)
+                        })
+                        .collect();
+                    let fresh: Vec<Option<String>> = std::thread::scope(|s| {
+                        let running: Vec<_> = stale
+                            .iter()
+                            .map(|top| s.spawn(|| local_diff(top)))
+                            .collect();
                         running
                             .into_iter()
                             .map(|t| t.join().ok().flatten())
                             .collect()
                     });
+                    for (top, diff) in stale.into_iter().zip(fresh) {
+                        local_cache.insert(top.clone(), (Instant::now(), diff));
+                    }
+                    let diffs: Vec<Option<String>> = tops
+                        .iter()
+                        .map(|top| local_cache.get(top).and_then(|(_, d)| d.clone()))
+                        .collect();
                     let local: Vec<Local> = tops
                         .iter()
                         .zip(diffs)
@@ -607,8 +651,14 @@ fn save_prs(path: &Path, prs: &Prs) {
     }
 }
 
-/// Every agent pane Herdr knows, or none when the call fails.
+/// Every agent pane Herdr knows, or none when the call fails. Asked over the
+/// server's socket, which costs no process; the CLI only without one.
 fn agents(herdr: &str) -> Vec<Value> {
+    if let Ok(mut result) = crate::socket_request("agent.list", json!({}))
+        && let Value::Array(agents) = result["agents"].take()
+    {
+        return agents;
+    }
     Command::new(herdr)
         .args(["agent", "list"])
         .output()

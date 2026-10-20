@@ -80,6 +80,10 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     }
     let (events_in, events) = mpsc::channel::<Event>();
     let wake = events_in.clone();
+    let mut watch = crate::watch::Watch::new(events_in.clone());
+    if let (Some(watch), Some(dir)) = (watch.as_mut(), source.strip_prefix("checkout:")) {
+        watch.add(dir);
+    }
     listen_for_clicks(events_in);
     // Loading the syntaxes takes a moment; start now, off this thread.
     std::thread::spawn(|| {
@@ -232,17 +236,22 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                     focus = Focus::Diff;
                 }
             }
-            Ok(_) => {}
-            Err(_) if source.starts_with("checkout:") => {
-                // git runs only when something it reads has moved: a file
-                // in the diff, the index, or (every few ticks) a new file.
+            // A checkout is read again when its files change: file-system
+            // events, or without them an mtime fingerprint each tick; and
+            // every few quiet ticks regardless.
+            Ok(Event::Wake) | Err(_) if source.starts_with("checkout:") => {
                 let dir = source.trim_start_matches("checkout:");
-                let print = fingerprint(dir, &files);
-                quiet += 1;
-                if print == last_print && quiet < RESCAN_TICKS {
+                let changed = match &watch {
+                    Some(watch) => watch.take(dir),
+                    None => {
+                        let print = fingerprint(dir, &files);
+                        std::mem::replace(&mut last_print, print) != print
+                    }
+                };
+                quiet += u32::from(event.is_err());
+                if !changed && quiet < RESCAN_TICKS {
                     continue;
                 }
-                last_print = print;
                 quiet = 0;
                 let fresh = read(&source);
                 if fresh != files {
@@ -252,7 +261,7 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                 }
                 selected = selected.min(files.len().saturating_sub(1));
             }
-            Err(_) => {}
+            Ok(_) | Err(_) => {}
         }
     }
     // The Changes panel back in this pane's place.
