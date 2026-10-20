@@ -198,6 +198,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // stays put as the list changes.
     let mut items: Vec<Item> = Vec::new();
     let mut selected: Option<String> = None;
+    // Where a left drag started, as a line in the frame.
+    let mut drag_from: Option<usize> = None;
     let mut view = View {
         scroll: 0,
         rows: size().0,
@@ -205,6 +207,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         step: 0,
         hover: None,
         selected: None,
+        dragged: None,
     };
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
@@ -365,6 +368,29 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                 }
                 // The link under the pointer is underlined; only the lines it
                 // leaves and enters are redrawn.
+                // A drag marks whole rows; letting go copies their text.
+                Ok(Event::Press(y)) => {
+                    let line = y.saturating_sub(1) + view.scroll;
+                    view.dragged = None;
+                    drag_from = Some(line);
+                }
+                Ok(Event::Drag(y)) => {
+                    if let Some(from) = drag_from {
+                        let to = y.saturating_sub(1) + view.scroll;
+                        let range = Some((from.min(to), from.max(to)));
+                        if range != view.dragged {
+                            view.dragged = range;
+                            draw(&last_frame, view, None);
+                        }
+                    }
+                }
+                Ok(Event::Release) => {
+                    drag_from = None;
+                    if let Some((first, last)) = view.dragged.take() {
+                        copy(&plain_lines(&last_frame, first, last));
+                        draw(&last_frame, view, None);
+                    }
+                }
                 Ok(Event::Hover { x, y }) => {
                     let line = y.saturating_sub(1) + view.scroll;
                     let to = targets
@@ -640,6 +666,8 @@ const HL_ON: &str = "\x1b[4;48;2;69;71;90m";
 const HL_OFF: &str = "\x1b[24;49m";
 /// The row the keys selected: a bar across the pane.
 const SELECTED: &str = "\x1b[48;2;49;50;68m";
+/// Rows a drag covers, to be copied.
+const DRAGGED: &str = "\x1b[48;2;88;91;112m";
 const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
@@ -880,7 +908,15 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
         }
         let line = lines.get(row).copied().unwrap_or("");
         let line = match (view.selected, view.hover) {
-            (Some((first, last)), _) if (first..=last).contains(&i) => bar(line, view.cols),
+            _ if view
+                .dragged
+                .is_some_and(|(first, last)| (first..=last).contains(&i)) =>
+            {
+                bar(line, view.cols, DRAGGED)
+            }
+            (Some((first, last)), _) if (first..=last).contains(&i) => {
+                bar(line, view.cols, SELECTED)
+            }
             (_, Some((at, start, end))) if at == i => highlight(line, start, end),
             _ => line.to_string(),
         };
@@ -906,6 +942,8 @@ struct View {
     hover: Option<(usize, usize, usize)>,
     /// The selected row's first and last lines in the frame.
     selected: Option<(usize, usize)>,
+    /// The lines a drag covers so far.
+    dragged: Option<(usize, usize)>,
 }
 
 /// `line` with columns `[start, end)` (1-based) highlighted, through any
@@ -950,9 +988,9 @@ fn highlight(line: &str, start: usize, end: usize) -> String {
     out
 }
 
-/// `line` on the selected row's background, across the pane's whole width.
-fn bar(line: &str, width: usize) -> String {
-    let mut out = SELECTED.to_string();
+/// `line` on `colour`'s background, across the pane's whole width.
+fn bar(line: &str, width: usize, colour: &str) -> String {
+    let mut out = colour.to_string();
     let mut cols = 0;
     let mut chars = line.chars();
     while let Some(c) = chars.next() {
@@ -963,7 +1001,7 @@ fn bar(line: &str, width: usize) -> String {
                 out.push(e);
                 if e.is_ascii_alphabetic() || e == '\\' {
                     if e == 'm' {
-                        out += SELECTED;
+                        out += colour;
                     }
                     break;
                 }
@@ -975,6 +1013,47 @@ fn bar(line: &str, width: usize) -> String {
     }
     out += &" ".repeat(width.saturating_sub(cols));
     out + "\x1b[49m"
+}
+
+/// The text of `frame`'s lines `first..=last`, without colours.
+fn plain_lines(frame: &str, first: usize, last: usize) -> String {
+    let lines: Vec<String> = frame
+        .lines()
+        .skip(first)
+        .take(last + 1 - first)
+        .map(|line| {
+            let mut out = String::new();
+            let mut chars = line.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for e in chars.by_ref() {
+                        if e.is_ascii_alphabetic() || e == '\\' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(if c == PULSE { '\u{25cf}' } else { c });
+                }
+            }
+            out.trim_end().to_string()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// Puts `text` on the clipboard.
+fn copy(text: &str) {
+    let tool = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "wl-copy"
+    };
+    if let Ok(mut child) = Command::new(tool).stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 /// What wakes the Changes loop besides its tick.
@@ -993,6 +1072,10 @@ enum Event {
     },
     /// A key pressed in the pane.
     Key(u8),
+    /// Left button pressed or dragged, on a 1-based row, or released.
+    Press(usize),
+    Drag(usize),
+    Release,
 }
 
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
@@ -1036,6 +1119,10 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
                 // Ctrl adds 16 to the button: links open on Ctrl+click only,
                 // so a plain click just focuses the pane.
                 [16, x, y] if press => Event::Click { x, y },
+                // A plain left drag selects rows to copy.
+                [0, _, y] if press => Event::Press(y),
+                [32, _, y] => Event::Drag(y),
+                [0, ..] => Event::Release,
                 // Motion with no button (32 + 3), with or without Ctrl.
                 [35 | 51, x, y] => Event::Hover { x, y },
                 [64, ..] => Event::Scroll(-SCROLL_LINES),
