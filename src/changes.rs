@@ -609,6 +609,10 @@ const GREEN: &str = "\x1b[38;2;166;227;161m";
 const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
 const DIM: &str = "\x1b[2m";
+/// The selected or pointed-at link: underlined on a raised background, which
+/// shows even where underline is not drawn.
+const HL_ON: &str = "\x1b[4;48;2;69;71;90m";
+const HL_OFF: &str = "\x1b[24;49m";
 const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
@@ -828,7 +832,7 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
         }
         let line = lines.get(row).copied().unwrap_or("");
         let line = match view.hover {
-            Some((at, start, end)) if at == i => underline(line, start, end),
+            Some((at, start, end)) if at == i => highlight(line, start, end),
             _ => line.to_string(),
         };
         // Each row by its position, cleared to its end: nothing else moves.
@@ -852,9 +856,9 @@ struct View {
     hover: Option<(usize, usize, usize)>,
 }
 
-/// `line` with columns `[start, end)` (1-based) underlined, through any
+/// `line` with columns `[start, end)` (1-based) highlighted, through any
 /// colour resets inside.
-fn underline(line: &str, start: usize, end: usize) -> String {
+fn highlight(line: &str, start: usize, end: usize) -> String {
     let mut out = String::new();
     let mut col = 1;
     let mut on = false;
@@ -873,23 +877,23 @@ fn underline(line: &str, start: usize, end: usize) -> String {
                 }
             }
             if sgr && on {
-                out += "\x1b[4m";
+                out += HL_ON;
             }
             continue;
         }
         if !on && col >= start && col < end && c != ' ' {
             on = true;
-            out += "\x1b[4m";
+            out += HL_ON;
         }
         if on && col >= end {
             on = false;
-            out += "\x1b[24m";
+            out += HL_OFF;
         }
         out.push(c);
         col += if c == PULSE { 1 } else { char_cols(c) };
     }
     if on {
-        out += "\x1b[24m";
+        out += HL_OFF;
     }
     out
 }
@@ -1114,17 +1118,17 @@ mod tests {
     }
 
     #[test]
-    fn underline_marks_only_its_columns() {
+    fn highlight_marks_only_its_columns() {
         let line = format!("  {DIM}repo #7{RESET}  x");
         assert_eq!(
-            underline(&line, 3, 7),
-            format!("  {DIM}\x1b[4mrepo\x1b[24m #7{RESET}  x")
+            highlight(&line, 3, 7),
+            format!("  {DIM}{HL_ON}repo{HL_OFF} #7{RESET}  x")
         );
         // A reset inside the span keeps the underline on.
         let line = format!("{GREEN}+3{RESET} {RED}-1{RESET}");
         assert_eq!(
-            underline(&line, 1, 6),
-            format!("{GREEN}\x1b[4m+3{RESET}\x1b[4m {RED}\x1b[4m-1{RESET}\x1b[4m\x1b[24m")
+            highlight(&line, 1, 6),
+            format!("{GREEN}{HL_ON}+3{RESET}{HL_ON} {RED}{HL_ON}-1{RESET}{HL_ON}{HL_OFF}")
         );
     }
 
