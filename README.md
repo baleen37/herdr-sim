@@ -180,6 +180,7 @@ rows = [
 | `$diff` | On workspaces: uncommitted changes in the checkout, `+12 -3` (`git diff --shortstat HEAD`; untracked files are not counted). Unset when clean. |
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Until Claude Code titles the session, its first real question (not a slash command or command output, cut to 60 characters) stands in; unset before that. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
+| `$header_working`, `$header_blocked`, `$header_done`, `$header_idle`, `$header_unknown`, `$header_none` | On workspaces: `$tree_header` behind the state's mark, in the one token for the state of the Space's agents — whichever most needs you: a question, then work, a finished turn (held until seen, as on agent rows), idle — or `$header_none` (`·`) without an agent. So the Spaces list colours like the Agents list; leave Herdr's `state_icon` out of that row. A working Space's mark turns with the spinner. |
 | `$tree_header_idle` | `$tree_header` on a Space with no agent in it, in its own token so it can be dimmed. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 

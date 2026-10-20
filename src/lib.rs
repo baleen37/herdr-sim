@@ -708,6 +708,40 @@ pub fn state_label_value(title: Option<&str>, status: &str) -> Option<String> {
     }
 }
 
+/// A Space's header in a token per the state of the agents in it, so the
+/// Spaces list reads like the Agents list: `$header_working` and so on, and
+/// `$header_none` for a Space without an agent. Each leads with the state's
+/// mark (`·` for none), so leave Herdr's `state_icon` out of that row.
+pub const SPACE_HEADER_TOKENS: [&str; 6] = [
+    "header_working",
+    "header_blocked",
+    "header_done",
+    "header_idle",
+    "header_unknown",
+    "header_none",
+];
+
+/// The state a Space shows, from the shown states of its agents: whichever
+/// most needs you — a question, then work, a finished turn, idle. `none`
+/// without agents.
+pub fn space_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static str {
+    const ORDER: [&str; 5] = ["blocked", "working", "done", "idle", "unknown"];
+    let statuses: Vec<&str> = statuses.into_iter().collect();
+    if statuses.is_empty() {
+        return "none";
+    }
+    ORDER
+        .into_iter()
+        .find(|s| statuses.contains(s))
+        .unwrap_or("unknown")
+}
+
+/// A `$header_*` value: the state's mark, then the header.
+pub fn space_header_value(header: &str, status: &str) -> String {
+    let mark = state_mark(status).unwrap_or("·");
+    format!("{mark} {header}")
+}
+
 /// The braille spinner herdr-radar turns ahead of a working title, one step
 /// per [`SPIN_MS`].
 pub const SPINNER: [char; 8] = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾'];
@@ -1757,6 +1791,16 @@ mod tests {
         assert_eq!(state_label_token("heading_idle_stale"), "label_idle_stale");
         assert_eq!(icon_token("codex", false), "icon_codex");
         assert_eq!(icon_token("claude", true), "icon_stale");
+    }
+
+    #[test]
+    fn space_shows_the_state_that_most_needs_you() {
+        assert_eq!(space_status(["idle", "working", "done"]), "working");
+        assert_eq!(space_status(["working", "blocked"]), "blocked");
+        assert_eq!(space_status(["idle", "done"]), "done");
+        assert_eq!(space_status([]), "none");
+        assert_eq!(space_header_value("search", "done"), "✓ search");
+        assert_eq!(space_header_value("search", "none"), "· search");
     }
 
     #[test]
