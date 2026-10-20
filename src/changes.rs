@@ -208,9 +208,17 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     };
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
+    let workspace = workspace_id();
     loop {
         let agents = agents(herdr);
-        let focused = agents.iter().find(|a| a["focused"].as_bool() == Some(true));
+        // Only this workspace's agents: a panel in each workspace follows its
+        // own, not whichever agent has focus elsewhere.
+        let focused = agents.iter().find(|a| {
+            a["focused"].as_bool() == Some(true)
+                && workspace
+                    .as_deref()
+                    .is_none_or(|ws| a["workspace_id"].as_str() == Some(ws))
+        });
         let opener = start
             .as_deref()
             .and_then(|pane| agents.iter().find(|a| a["pane_id"].as_str() == Some(pane)));
