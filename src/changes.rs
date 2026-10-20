@@ -183,6 +183,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
     // Each directory's checkout, found once: sessions revisit the same few.
     let mut checkouts: HashMap<String, Option<String>> = HashMap::new();
+    // Each checkout's repo name, which comes from its remote.
+    let mut names: HashMap<String, String> = HashMap::new();
     // The last details seen, so a reopened panel draws its PRs before GitHub
     // answers.
     let saved = state_dir.join("changes-prs.json");
@@ -253,7 +255,18 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     }
                 }
                 let local: Vec<Local> = tops.iter().filter_map(|top| local_changes(top)).collect();
-                render(&list, &prs, &local)
+                // The agent's own checkout leads the environment when it is one.
+                let own = agent["cwd"]
+                    .as_str()
+                    .and_then(|cwd| checkouts.get(cwd).cloned().flatten());
+                let env = environment(&tops, own.as_deref(), home, &mut names);
+                // Only what fits: a longer frame scrolls the top rows off.
+                let rows = size().0;
+                (env + &render(&list, &prs, &local))
+                    .lines()
+                    .take(rows)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -460,14 +473,14 @@ const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
 fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
-    let (rows, columns) = size();
-    let width = columns.saturating_sub(1).max(20);
+    let width = size().1.saturating_sub(1).max(20);
     let mut s = String::new();
     // What the session's checkouts have not committed yet, above its PRs.
     for local in local {
@@ -564,8 +577,7 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
         let gap = (width - 2).saturating_sub(left_cols + right_cols).max(1);
         s += &format!("  {left}{}{right}\n\n", " ".repeat(gap));
     }
-    // Only what fits: a longer frame scrolls the newest rows off the top.
-    s.lines().take(rows).collect::<Vec<_>>().join("\n")
+    s
 }
 
 /// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
@@ -599,22 +611,8 @@ fn local_changes(cwd: &str) -> Option<Local> {
         (!s.is_empty()).then_some(s)
     };
     let diff = diff_value(&git(&["diff", "--shortstat", "HEAD"])?)?;
-    // owner/repo on GitHub; a linked worktree's directory is not the repo's
-    // name, its remote is.
-    let slug = git(&["remote", "get-url", "origin"]).and_then(|remote| {
-        let slug = remote
-            .strip_prefix("git@github.com:")
-            .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
-            .or_else(|| remote.strip_prefix("https://github.com/"))?;
-        Some(slug.trim_end_matches(".git").to_string())
-    });
-    let repo = match &slug {
-        Some(slug) => slug.rsplit('/').next().unwrap_or(slug).to_string(),
-        None => {
-            let top = git(&["rev-parse", "--show-toplevel"])?;
-            Path::new(&top).file_name()?.to_string_lossy().into_owned()
-        }
-    };
+    let slug = github_slug(cwd);
+    let repo = repo_name(cwd)?;
     let compare = slug
         .zip(git(&["branch", "--show-current"]))
         .map(|(slug, branch)| {
@@ -635,6 +633,117 @@ fn local_changes(cwd: &str) -> Option<Local> {
         diff,
         compare,
     })
+}
+
+/// `owner/repo` of the checkout's GitHub `origin`, if it has one.
+fn github_slug(top: &str) -> Option<String> {
+    let remote = git_in(top, &["remote", "get-url", "origin"])?;
+    let slug = remote
+        .strip_prefix("git@github.com:")
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("https://github.com/"))?;
+    Some(slug.trim_end_matches(".git").to_string())
+}
+
+/// The repo's name: from its GitHub remote, since a linked worktree's
+/// directory is not the repo's name; else the checkout's directory.
+fn repo_name(top: &str) -> Option<String> {
+    match github_slug(top) {
+        Some(slug) => Some(slug.rsplit('/').next().unwrap_or(&slug).to_string()),
+        None => Some(Path::new(top).file_name()?.to_string_lossy().into_owned()),
+    }
+}
+
+/// `git -C dir args`'s trimmed output; `None` on failure or no output.
+fn git_in(dir: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
+/// The Environment section, as in Claude Code: this computer, the repos the
+/// session works in (the agent's own first, with where it lives), and the
+/// agent's branch, marked when it is a linked worktree.
+fn environment(
+    tops: &[String],
+    own: Option<&str>,
+    home: &Path,
+    names: &mut HashMap<String, String>,
+) -> String {
+    let width = size().1.saturating_sub(1).max(20);
+    let mut s = format!("{BOLD}Environment{RESET} {DIM}\u{f47c}{RESET}\n");
+    s += "\u{f0322} This computer\n";
+    let mut shown: Vec<String> = Vec::new();
+    for top in tops {
+        let name = names
+            .entry(top.clone())
+            .or_insert_with(|| repo_name(top).unwrap_or_else(|| top.clone()))
+            .clone();
+        if shown.contains(&name) {
+            continue;
+        }
+        shown.push(name.clone());
+        let mut row = format!("\u{ea83} {}", cut(&name, width - 2));
+        if Some(top.as_str()) == own {
+            // Where the repo lives: its main checkout's folder, even from a
+            // linked worktree.
+            let main = git_in(
+                top,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .and_then(|d| Some(Path::new(&d).parent()?.parent()?.to_path_buf()));
+            if let Some(parent) = main {
+                let parent = parent.display().to_string();
+                let home = home.display().to_string();
+                let place = match parent.strip_prefix(&home) {
+                    Some(rest) => format!("~{rest}"),
+                    None => parent,
+                };
+                let room = width.saturating_sub(5 + cols(&name));
+                if room > 3 {
+                    row += &format!(" {DIM}\u{b7} {}{RESET}", cut(&place, room));
+                }
+            }
+        }
+        s += &row;
+        s += "\n";
+    }
+    if let Some(top) = own
+        && let Some(branch) = git_in(top, &["branch", "--show-current"])
+    {
+        let worktree = git_in(top, &["rev-parse", "--absolute-git-dir"])
+            != git_in(
+                top,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            );
+        let label = if worktree { "Worktree" } else { "" };
+        let room = width.saturating_sub(3 + cols(label));
+        let branch = cut_middle(&branch, room);
+        let gap = width.saturating_sub(2 + cols(&branch) + cols(label)).max(1);
+        s += &format!("\u{ec6f} {branch}{}{DIM}{label}{RESET}\n", " ".repeat(gap));
+    }
+    s + "\n" + &format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n")
+}
+
+/// `s` cut to `n` columns by dropping its middle, as branch names keep their
+/// meaning at both ends.
+fn cut_middle(s: &str, n: usize) -> String {
+    if cols(s) <= n {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let keep = n.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = chars.iter().take(head).collect();
+    out.push('…');
+    out.extend(chars[chars.len() - tail..].iter());
+    out
 }
 
 /// The pane's size as (rows, columns), from the terminal it runs in.
