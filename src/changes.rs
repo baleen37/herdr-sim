@@ -432,12 +432,42 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             let url = item.and_then(|item| match key {
                                 b'\r' | b'\n' => item.open.as_deref(),
                                 b'p' => item.pr.as_deref(),
-                                b'd' => item.diff.as_deref(),
                                 b'c' => item.comment.as_deref(),
                                 _ => None,
                             });
                             if let Some(url) = url {
                                 open_url(url);
+                            }
+                            // d: the diff in hunk, g: the checkout in lazygit,
+                            // full screen over the panel.
+                            match (key, item) {
+                                (
+                                    b'd',
+                                    Some(Item {
+                                        checkout: Some(top),
+                                        ..
+                                    }),
+                                ) => view_diff(herdr, "hunk diff --watch", top),
+                                (
+                                    b'd',
+                                    Some(Item {
+                                        pr_ref: Some(pr), ..
+                                    }),
+                                ) => view_diff(
+                                    herdr,
+                                    // hunk reads the token from the
+                                    // environment, not from gh.
+                                    &format!("GH_TOKEN=$(gh auth token) hunk gh pr '{pr}'"),
+                                    &home.display().to_string(),
+                                ),
+                                (
+                                    b'g',
+                                    Some(Item {
+                                        checkout: Some(top),
+                                        ..
+                                    }),
+                                ) => view_diff(herdr, "lazygit", top),
+                                _ => {}
                             }
                             None
                         }
@@ -705,6 +735,7 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             key: format!("local:{}", local.top),
             lines: (out.len(), out.len()),
             open: local.url.clone(),
+            checkout: Some(local.top.clone()),
             ..Item::default()
         });
         out.push((
@@ -731,6 +762,7 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
                 lines: (out.len(), out.len()),
                 open: Some(url.clone()),
                 pr: Some(url.clone()),
+                pr_ref: pr_ref(url),
                 ..Item::default()
             });
             out.push((
@@ -755,8 +787,9 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             lines: (out.len(), out.len() + 1),
             open: Some(pr.url.clone()),
             pr: Some(pr.url.clone()),
-            diff: Some(format!("{}/files", pr.url)),
             comment: Some(pr.comment_url.clone().unwrap_or_else(|| pr.url.clone())),
+            checkout: None,
+            pr_ref: pr_ref(&pr.url),
         });
         out.push((
             format!("{colour}{icon}{RESET} {title}"),
@@ -879,10 +912,35 @@ struct Item {
     lines: (usize, usize),
     /// Enter.
     open: Option<String>,
-    /// p, d, c.
+    /// p, c.
     pr: Option<String>,
-    diff: Option<String>,
     comment: Option<String>,
+    /// d and g: the checkout, for a row of uncommitted changes.
+    checkout: Option<String>,
+    /// d: the PR as `owner/repo#n`.
+    pr_ref: Option<String>,
+}
+
+/// `owner/repo#n` for a PR's URL.
+fn pr_ref(url: &str) -> Option<String> {
+    let parts: Vec<&str> = url.split('/').collect();
+    let (owner, repo, number) = (parts.get(3)?, parts.get(4)?, parts.get(6)?);
+    number.parse::<u64>().ok()?;
+    Some(format!("{owner}/{repo}#{number}"))
+}
+
+/// Runs `command` in `cwd` in a zoomed pane over this one; quitting it closes
+/// the pane and brings the panel back.
+fn view_diff(herdr: &str, command: &str, cwd: &str) {
+    let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
+        return;
+    };
+    let _ = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
+        .args(["--entrypoint", "diff", "--placement", "zoomed", "--focus"])
+        .args(["--target-pane", &pane, "--cwd", cwd])
+        .args(["--env", &format!("HERDR_SIM_DIFF={command}")])
+        .output();
 }
 
 /// Stands in a frame for a running check's dot, drawn at each step.
@@ -1335,14 +1393,11 @@ mod tests {
         let prs = pr((1, 0, 2));
         let urls: Vec<String> = prs.keys().cloned().collect();
         let (frame, targets, items) = render(&urls, &prs, &[]);
-        // One row for the PR, over its title and details; d and c open its
-        // files and latest comment.
+        // One row for the PR, over its title and details; d views it in
+        // hunk as owner/repo#n, c opens its latest comment.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].lines, (0, 1));
-        assert_eq!(
-            items[0].diff.as_deref(),
-            Some("https://github.com/o/repo/pull/7/files")
-        );
+        assert_eq!(items[0].pr_ref.as_deref(), Some("o/repo#7"));
         assert_eq!(
             items[0].comment.as_deref(),
             Some("https://github.com/o/repo/pull/7#issuecomment-1")
