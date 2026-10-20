@@ -199,9 +199,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     listen_for_clicks(done.clone());
     let mut fetching = false;
     let mut last_frame = String::new();
-    // What each drawn line does when clicked, and the PR whose menu is open.
+    // What each drawn line does when clicked.
     let mut targets: Vec<Target> = Vec::new();
-    let mut menu: Option<String> = None;
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -265,9 +264,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     .as_str()
                     .and_then(|cwd| checkouts.get(cwd).cloned().flatten());
                 let env = environment(&tops, own.as_deref(), home, &mut names);
-                let (changes, clicks) = render(&list, &prs, &local, menu.as_deref());
+                let (changes, clicks) = render(&list, &prs, &local);
                 // Environment rows do nothing when clicked.
-                targets = vec![Target::None; env.lines().count()];
+                targets = vec![Target::default(); env.lines().count()];
                 targets.extend(clicks);
                 // Only what fits: a longer frame scrolls the top rows off.
                 let rows = size().0;
@@ -281,32 +280,33 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         };
         // Redraw only on change: no flicker, no work for the terminal.
         if frame != last_frame {
-            let mut out = io::stdout();
-            // Home, clear, frame.
-            let _ = write!(out, "\x1b[H\x1b[2J{frame}");
-            let _ = out.flush();
+            draw(&frame, 0);
             last_frame = frame;
         }
         // Wake early when GitHub answers or a click comes, so either shows at
-        // once.
-        let event = events.recv_timeout(TICK);
-        if let Ok(Event::Click { x, y }) = event {
-            let width = size().1.saturating_sub(1).max(20);
-            let target = y.checked_sub(1).and_then(|row| targets.get(row)).cloned();
-            // Any click closes an open menu; the ⋮ of another PR opens its own.
-            let was = menu.take();
-            match target {
-                Some(Target::Title(url)) if x + 3 >= width => {
-                    if was.as_deref() != Some(url.as_str()) {
-                        menu = Some(url);
-                    }
+        // once. Meanwhile, running checks spin.
+        let deadline = Instant::now() + TICK;
+        let mut step = 0;
+        let event = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let spinning = last_frame.contains(SPIN);
+            let wait = if spinning { left.min(SPIN_STEP) } else { left };
+            match events.recv_timeout(wait) {
+                Ok(event) => break Some(event),
+                Err(_) if Instant::now() >= deadline => break None,
+                Err(_) => {
+                    step += 1;
+                    draw(&last_frame, step);
                 }
-                Some(Target::Title(url) | Target::Open(url)) => open_url(&url),
-                Some(Target::Copy(text)) => copy(&text),
-                Some(Target::None) | None => {}
+            }
+        };
+        if let Some(Event::Click { x, y }) = event {
+            let target = y.checked_sub(1).and_then(|row| targets.get(row));
+            if let Some(url) = target.and_then(|t| t.at(x)) {
+                open_url(url);
             }
         }
-        if let Ok(Event::Fetched(asked, mut got)) = event {
+        if let Some(Event::Fetched(asked, mut got)) = event {
             fetching = false;
             let now = Some(Instant::now());
             for url in asked {
@@ -506,15 +506,10 @@ const RESET: &str = "\x1b[0m";
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(
-    urls: &[String],
-    prs: &Prs,
-    local: &[Local],
-    menu: Option<&str>,
-) -> (String, Vec<Target>) {
+fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) {
     let width = size().1.saturating_sub(1).max(20);
     let mut out: Vec<(String, Target)> = Vec::new();
-    let blank = |out: &mut Vec<(String, Target)>| out.push((String::new(), Target::None));
+    let blank = |out: &mut Vec<(String, Target)>| out.push((String::new(), Target::default()));
     // What the session's checkouts have not committed yet, above its PRs.
     for local in local {
         let lines: Vec<String> = local
@@ -543,13 +538,13 @@ fn render(
                 lines.join(" "),
                 " ".repeat(gap)
             ),
-            local.compare.clone().map_or(Target::None, Target::Open),
+            Target::all(local.compare.clone()),
         ));
     }
     if !local.is_empty() {
         blank(&mut out);
     } else if urls.is_empty() {
-        out.push((format!("{DIM}No changes.{RESET}"), Target::None));
+        out.push((format!("{DIM}No changes.{RESET}"), Target::default()));
     }
     for url in urls {
         let Some((_, Some(pr))) = prs.get(url) else {
@@ -561,7 +556,7 @@ fn render(
             };
             out.push((
                 format!("{DIM}\u{f407} {}{RESET}", cut(&name, width - 2)),
-                Target::Open(url.clone()),
+                Target::all(Some(url.clone())),
             ));
             blank(&mut out);
             blank(&mut out);
@@ -573,54 +568,67 @@ fn render(
             (_, true) => ("\u{f4dd}", DIM),
             _ => ("\u{f407}", GREEN),
         };
-        // Title, then the row's menu mark at the right edge.
-        let title = cut(&pr.title, width - 4);
-        let gap = (width - 3).saturating_sub(cols(&title)).max(1);
-        let open = menu == Some(pr.url.as_str());
-        let mark = if open { "" } else { DIM };
+        let title = cut(&pr.title, width - 2);
         out.push((
-            format!(
-                "{colour}{icon}{RESET} {title}{}{mark}\u{f142}{RESET}",
-                " ".repeat(gap)
-            ),
-            Target::Title(pr.url.clone()),
+            format!("{colour}{icon}{RESET} {title}"),
+            Target::all(Some(pr.url.clone())),
         ));
-        if open {
-            out.extend(pr_menu(&pr.url, width));
-        }
-        let mut left = format!("{DIM}{} #{}{RESET}", pr.repo, pr.number);
-        let mut left_cols = cols(&pr.repo) + 2 + pr.number.len();
+        // Each part of the details line links to its own page; columns are
+        // 1-based, after the two-space indent.
+        let mut spans: Vec<(usize, usize, String)> = Vec::new();
+        let name = format!("{} #{}", pr.repo, pr.number);
+        let repo_url = pr.url.split("/pull/").next().unwrap_or(&pr.url).to_string();
+        spans.push((3, 3 + cols(&pr.repo), repo_url));
+        spans.push((3 + cols(&pr.repo), 3 + cols(&name), pr.url.clone()));
+        let mut left = format!("{DIM}{name}{RESET}");
+        let mut left_cols = cols(&name);
         if pr.additions + pr.deletions > 0 {
             let lines = format!("+{} -{}", pr.additions, pr.deletions);
+            let at = 3 + left_cols + 2;
+            spans.push((at, at + lines.len(), format!("{}/files", pr.url)));
             left += &format!(
                 "  {GREEN}+{}{RESET} {RED}-{}{RESET}",
                 pr.additions, pr.deletions
             );
             left_cols += 2 + lines.len();
         }
-        let mut right = String::new();
-        let mut right_cols = 0;
+        // Right-hand parts: (text, columns, colour, link).
+        let mut right: Vec<(String, usize, &str, String)> = Vec::new();
         if pr.comments > 0 {
             let n = pr.comments.to_string();
-            right += &format!("{DIM}\u{f41f} {n}{RESET}");
-            right_cols += 2 + n.len();
+            right.push((format!("\u{f41f} {n}"), 2 + n.len(), DIM, pr.url.clone()));
         }
-        // Checks matter only while the PR is open.
+        // Checks matter only while the PR is open; running ones spin.
         if let Some((ok, failed, total)) = pr.checks.filter(|_| pr.state == "OPEN") {
-            let c = if failed > 0 {
-                RED
+            let (mark, c) = if failed > 0 {
+                ('\u{25cf}', RED)
             } else if ok == total {
-                GREEN
+                ('\u{25cf}', GREEN)
             } else {
-                YELLOW
+                (SPIN, YELLOW)
             };
-            right += &format!("  {c}\u{25cf}{RESET}");
-            right_cols += 3;
+            right.push((mark.to_string(), 1, c, format!("{}/checks", pr.url)));
         }
+        let right_cols: usize =
+            right.iter().map(|(_, n, ..)| n).sum::<usize>() + 2 * right.len().saturating_sub(1);
         let gap = (width - 2).saturating_sub(left_cols + right_cols).max(1);
+        let mut line = format!("  {left}{}", " ".repeat(gap));
+        let mut at = 3 + left_cols + gap;
+        for (i, (text, n, c, url)) in right.into_iter().enumerate() {
+            if i > 0 {
+                line += "  ";
+                at += 2;
+            }
+            line += &format!("{c}{text}{RESET}");
+            spans.push((at, at + n, url));
+            at += n;
+        }
         out.push((
-            format!("  {left}{}{right}", " ".repeat(gap)),
-            Target::Open(pr.url.clone()),
+            line,
+            Target {
+                spans,
+                rest: Some(pr.url.clone()),
+            },
         ));
         blank(&mut out);
     }
@@ -628,43 +636,52 @@ fn render(
     (lines.join("\n"), targets)
 }
 
-/// The menu a PR's ⋮ opens, boxed under its title at the right edge.
-fn pr_menu(url: &str, width: usize) -> Vec<(String, Target)> {
-    let items = [
-        ("Open in browser", Target::Open(url.to_string())),
-        ("Files changed", Target::Open(format!("{url}/files"))),
-        ("Checks", Target::Open(format!("{url}/checks"))),
-        ("Copy link", Target::Copy(url.to_string())),
-    ];
-    let inner = items
-        .iter()
-        .map(|(label, _)| cols(label))
-        .max()
-        .unwrap_or(0)
-        + 2;
-    let indent = " ".repeat(width.saturating_sub(inner + 2));
-    let edge = |l: &str, r: &str| format!("{indent}{DIM}{l}{}{r}{RESET}", "─".repeat(inner));
-    let mut rows = vec![(edge("┌", "┐"), Target::None)];
-    for (label, target) in items {
-        let pad = " ".repeat(inner - 1 - cols(label));
-        rows.push((
-            format!("{indent}{DIM}│{RESET} {label}{pad}{DIM}│{RESET}"),
-            target,
-        ));
-    }
-    rows.push((edge("└", "┘"), Target::None));
-    rows
+/// The links a click on a drawn line opens: by column, else the line's own.
+#[derive(Clone, Default)]
+struct Target {
+    /// Columns `[start, end)`, 1-based, and the link there.
+    spans: Vec<(usize, usize, String)>,
+    rest: Option<String>,
 }
 
-/// What a click on a drawn line does.
-#[derive(Clone)]
-enum Target {
-    None,
-    /// A PR's title row: its ⋮ at the right edge opens the menu, the rest
-    /// opens the PR.
-    Title(String),
-    Open(String),
-    Copy(String),
+impl Target {
+    /// The whole line opens `url`.
+    fn all(url: Option<String>) -> Self {
+        Self {
+            spans: Vec::new(),
+            rest: url,
+        }
+    }
+
+    /// The link at column `x`.
+    fn at(&self, x: usize) -> Option<&str> {
+        self.spans
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&x))
+            .map(|(.., url)| url.as_str())
+            .or(self.rest.as_deref())
+    }
+}
+
+/// Stands in a frame for a running check's spinner, drawn at each step.
+const SPIN: char = '\u{1}';
+const SPIN_STEP: Duration = Duration::from_millis(120);
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Draws `frame` over the last one, spinners at `step`: line by line, each
+/// cleared to its end, so nothing flickers.
+fn draw(frame: &str, step: usize) {
+    let spin = SPINNER[step % SPINNER.len()].to_string();
+    let mut out = io::stdout();
+    let _ = write!(out, "\x1b[H");
+    for (i, line) in frame.lines().enumerate() {
+        if i > 0 {
+            let _ = write!(out, "\r\n");
+        }
+        let _ = write!(out, "{}\x1b[K", line.replace(SPIN, &spin));
+    }
+    let _ = write!(out, "\x1b[J");
+    let _ = out.flush();
 }
 
 /// What wakes the Changes loop besides its tick.
@@ -723,21 +740,6 @@ fn open_url(url: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-/// Puts `text` on the clipboard.
-fn copy(text: &str) {
-    let tool = if cfg!(target_os = "macos") {
-        "pbcopy"
-    } else {
-        "wl-copy"
-    };
-    if let Ok(mut child) = Command::new(tool).stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    }
 }
 
 /// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
@@ -962,4 +964,64 @@ fn cut(s: &str, n: usize) -> String {
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(checks: (usize, usize, usize)) -> Prs {
+        let url = "https://github.com/o/repo/pull/7".to_string();
+        let pr = Pr {
+            url: url.clone(),
+            repo: "repo".into(),
+            number: "7".into(),
+            title: "Title".into(),
+            state: "OPEN".into(),
+            draft: false,
+            additions: 3,
+            deletions: 1,
+            comments: 2,
+            checks: Some(checks),
+        };
+        HashMap::from([(url, (None, Some(pr)))])
+    }
+
+    #[test]
+    fn details_line_links_each_part() {
+        let prs = pr((1, 0, 2));
+        let urls: Vec<String> = prs.keys().cloned().collect();
+        let (frame, targets) = render(&urls, &prs, &[]);
+        let line = frame.lines().nth(1).unwrap();
+        let target = &targets[1];
+        let plain: String = {
+            let mut s = String::new();
+            let mut esc = false;
+            for c in line.chars() {
+                match c {
+                    '\x1b' => esc = true,
+                    'm' if esc => esc = false,
+                    _ if esc => {}
+                    _ => s.push(c),
+                }
+            }
+            s
+        };
+        let col = |needle: &str| {
+            plain
+                .find(needle)
+                .map(|i| plain[..i].chars().count() + 1)
+                .unwrap()
+        };
+        let pr = "https://github.com/o/repo/pull/7";
+        assert_eq!(target.at(col("repo")), Some("https://github.com/o/repo"));
+        assert_eq!(target.at(col("#7")), Some(pr));
+        assert_eq!(target.at(col("+3")), Some(&*format!("{pr}/files")));
+        assert_eq!(target.at(col("2")), Some(pr));
+        // Checks still running spin, and link to the checks page.
+        assert_eq!(
+            target.at(col(&SPIN.to_string())),
+            Some(&*format!("{pr}/checks"))
+        );
+    }
 }
