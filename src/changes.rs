@@ -201,10 +201,12 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
     let mut targets: Vec<Target> = Vec::new();
-    // Lines scrolled off the top, and the link under the pointer: its line
-    // in the frame and columns.
-    let mut scroll = 0usize;
-    let mut hover: Option<(usize, usize, usize)> = None;
+    let mut view = View {
+        scroll: 0,
+        rows: size().0,
+        step: 0,
+        hover: None,
+    };
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -276,54 +278,72 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             }
             None => "No agent focused yet.\n".to_string(),
         };
-        // Redraw only on change: no flicker, no work for the terminal.
-        if frame != last_frame {
-            scroll = scroll.min(max_scroll(&frame));
-            draw(&frame, scroll, 0, hover);
+        // Redraw only on change: no flicker, no work for the terminal. The
+        // pane's size is read once a tick, not per draw.
+        let rows = size().0;
+        if frame != last_frame || rows != view.rows {
+            view.rows = rows;
+            view.scroll = view.scroll.min(max_scroll(&frame, rows));
+            draw(&frame, view, None);
             last_frame = frame;
         }
+        // Lines with a running check's dot: the only ones a pulse redraws.
+        let pulsing: Vec<usize> = last_frame
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(PULSE))
+            .map(|(i, _)| i)
+            .collect();
         // Wake early when GitHub answers or a click comes, so either shows at
         // once. Meanwhile, running checks pulse.
         let deadline = Instant::now() + TICK;
-        let mut step = 0;
         let event = loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let spinning = last_frame.contains(PULSE);
-            let wait = if spinning { left.min(PULSE_STEP) } else { left };
+            let wait = if pulsing.is_empty() {
+                left
+            } else {
+                left.min(PULSE_STEP)
+            };
             match events.recv_timeout(wait) {
                 // The wheel moves the drawn frame; nothing needs reading again.
                 Ok(Event::Scroll(by)) => {
-                    let to = scroll
+                    let to = view
+                        .scroll
                         .saturating_add_signed(by)
-                        .min(max_scroll(&last_frame));
-                    if to != scroll {
-                        scroll = to;
-                        hover = None;
-                        draw(&last_frame, scroll, step, hover);
+                        .min(max_scroll(&last_frame, view.rows));
+                    if to != view.scroll {
+                        view.scroll = to;
+                        view.hover = None;
+                        draw(&last_frame, view, None);
                     }
                 }
-                // The link under the pointer is underlined.
+                // The link under the pointer is underlined; only the lines it
+                // leaves and enters are redrawn.
                 Ok(Event::Hover { x, y }) => {
-                    let line = y.saturating_sub(1) + scroll;
+                    let line = y.saturating_sub(1) + view.scroll;
                     let to = targets
                         .get(line)
                         .and_then(|t| t.span(x))
                         .map(|(start, end)| (line, start, end));
-                    if to != hover {
-                        hover = to;
-                        draw(&last_frame, scroll, step, hover);
+                    if to != view.hover {
+                        let lines: Vec<usize> =
+                            [view.hover, to].iter().flatten().map(|h| h.0).collect();
+                        view.hover = to;
+                        draw(&last_frame, view, Some(&lines));
                     }
                 }
                 Ok(event) => break Some(event),
                 Err(_) if Instant::now() >= deadline => break None,
                 Err(_) => {
-                    step += 1;
-                    draw(&last_frame, scroll, step, hover);
+                    view.step += 1;
+                    draw(&last_frame, view, Some(&pulsing));
                 }
             }
         };
         if let Some(Event::Click { x, y }) = event {
-            let target = y.checked_sub(1).and_then(|row| targets.get(row + scroll));
+            let target = y
+                .checked_sub(1)
+                .and_then(|row| targets.get(row + view.scroll));
             if let Some(url) = target.and_then(|t| t.at(x)) {
                 open_url(url);
             }
@@ -711,31 +731,50 @@ const PULSE_GREYS: [u8; 10] = [90, 110, 130, 150, 170, 185, 170, 150, 130, 110];
 const SCROLL_LINES: isize = 3;
 
 /// How far `frame` can scroll: the lines that do not fit the pane.
-fn max_scroll(frame: &str) -> usize {
-    frame.lines().count().saturating_sub(size().0)
+fn max_scroll(frame: &str, rows: usize) -> usize {
+    frame.lines().count().saturating_sub(rows)
 }
 
 /// Draws what of `frame` fits the pane from line `scroll`, pulsing dots at
 /// `step`: line by line over the last frame, each cleared to its end, so
 /// nothing flickers.
-fn draw(frame: &str, scroll: usize, step: usize, hover: Option<(usize, usize, usize)>) {
-    let grey = PULSE_GREYS[step % PULSE_GREYS.len()];
+fn draw(frame: &str, view: View, only: Option<&[usize]>) {
+    let grey = PULSE_GREYS[view.step % PULSE_GREYS.len()];
     let dot = format!("\x1b[38;2;{grey};{grey};{grey}m\u{25cf}");
-    let mut out = io::stdout();
-    let _ = write!(out, "\x1b[H");
-    let rows = size().0;
-    for (i, line) in frame.lines().enumerate().skip(scroll).take(rows) {
-        if i > scroll {
-            let _ = write!(out, "\r\n");
+    let mut out = String::new();
+    // No autowrap: a line one column too wide is cut, instead of wrapping
+    // and scrolling the whole pane.
+    out += "\x1b[?7l";
+    let lines: Vec<&str> = frame.lines().skip(view.scroll).take(view.rows).collect();
+    for row in 0..view.rows {
+        let i = row + view.scroll;
+        if only.is_some_and(|only| !only.contains(&i)) {
+            continue;
         }
-        let line = match hover {
+        let line = lines.get(row).copied().unwrap_or("");
+        let line = match view.hover {
             Some((at, start, end)) if at == i => underline(line, start, end),
             _ => line.to_string(),
         };
-        let _ = write!(out, "{}\x1b[K", line.replace(PULSE, &dot));
+        // Each row by its position, cleared to its end: nothing else moves.
+        out += &format!("\x1b[{};1H{}\x1b[K", row + 1, line.replace(PULSE, &dot));
     }
-    let _ = write!(out, "\x1b[J");
-    let _ = out.flush();
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// What part of a frame is drawn, and how.
+#[derive(Clone, Copy)]
+struct View {
+    /// Lines scrolled off the top.
+    scroll: usize,
+    /// The pane's height.
+    rows: usize,
+    /// Pulse step of running checks' dots.
+    step: usize,
+    /// The link under the pointer: its line in the frame, and columns.
+    hover: Option<(usize, usize, usize)>,
 }
 
 /// `line` with columns `[start, end)` (1-based) underlined, through any
@@ -1003,7 +1042,9 @@ fn environment(
         let gap = width.saturating_sub(2 + cols(&branch) + cols(label)).max(1);
         s += &format!("\u{ec6f} {branch}{}{DIM}{label}{RESET}\n", " ".repeat(gap));
     }
-    s + "\n" + &format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n")
+    // A rule sets the two sections apart, as Claude Code's cards are.
+    s + &format!("\n{DIM}{}{RESET}\n\n", "─".repeat(width))
+        + &format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n")
 }
 
 /// `s` cut to `n` columns by dropping its middle, as branch names keep their
