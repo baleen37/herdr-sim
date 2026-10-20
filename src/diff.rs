@@ -460,7 +460,13 @@ fn highlighting() -> &'static (SyntaxSet, Theme) {
 /// with its number, its text highlighted for the file's language when
 /// `colour`.
 fn diff_lines(file: &File, colour: bool) -> Vec<Shown> {
-    let mut colours = colour.then(|| {
+    // CSV and TSV: each column its own colour, as Rainbow CSV does.
+    let delimiter = match Path::new(&file.path).extension().and_then(|e| e.to_str()) {
+        Some(e) if e.eq_ignore_ascii_case("csv") => Some(','),
+        Some(e) if e.eq_ignore_ascii_case("tsv") => Some('\t'),
+        _ => None,
+    };
+    let mut colours = (colour && delimiter.is_none()).then(|| {
         let (syntaxes, theme) = highlighting();
         let syntax = Path::new(&file.path)
             .extension()
@@ -498,6 +504,13 @@ fn diff_lines(file: &File, colour: bool) -> Vec<Shown> {
         // Old and new lines run through one highlighter in diff order: close
         // enough for a diff, and what a reader sees.
         let plain = || vec![(String::new(), row.text.clone())];
+        if let Some(delimiter) = delimiter.filter(|_| colour) {
+            out.push(Shown {
+                row: row.clone(),
+                spans: columns(&row.text, delimiter),
+            });
+            continue;
+        }
         let Some((colours, syntaxes)) = colours.as_mut() else {
             out.push(Shown {
                 row: row.clone(),
@@ -530,6 +543,41 @@ fn diff_lines(file: &File, colour: bool) -> Vec<Shown> {
             spans,
         });
     }
+    out
+}
+
+/// Colours for CSV columns, in turn.
+const COLUMN_COLOURS: [&str; 6] = [
+    "\x1b[38;2;137;180;250m",
+    "\x1b[38;2;166;227;161m",
+    "\x1b[38;2;249;226;175m",
+    "\x1b[38;2;203;166;247m",
+    "\x1b[38;2;137;220;235m",
+    "\x1b[38;2;250;179;135m",
+];
+
+/// A CSV line as coloured runs, a colour per column, the delimiters dim.
+/// Quoted fields keep their delimiters.
+fn columns(line: &str, delimiter: char) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut column = 0;
+    for c in line.chars() {
+        if c == '"' {
+            quoted = !quoted;
+        }
+        if c == delimiter && !quoted {
+            let colour = COLUMN_COLOURS[column % COLUMN_COLOURS.len()];
+            out.push((colour.to_string(), std::mem::take(&mut field)));
+            out.push((DIM.to_string(), c.to_string()));
+            column += 1;
+        } else {
+            field.push(c);
+        }
+    }
+    let colour = COLUMN_COLOURS[column % COLUMN_COLOURS.len()];
+    out.push((colour.to_string(), field));
     out
 }
 
@@ -751,6 +799,14 @@ fn tree_row(file: &File, selected: bool, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_colour_each_field_and_keep_quoted_commas() {
+        let runs = columns("a,\"b,c\",d", ',');
+        let texts: Vec<&str> = runs.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, ["a", ",", "\"b,c\"", ",", "d"]);
+        assert_ne!(runs[0].0, runs[2].0);
+    }
 
     #[test]
     fn parse_numbers_lines_and_reads_status() {
