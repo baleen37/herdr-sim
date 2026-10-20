@@ -305,6 +305,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             .entry(top.clone())
                             .or_insert_with(|| (repo_name(top), github_slug(top)));
                         Some(Local {
+                            top: top.clone(),
                             repo: repo.clone()?,
                             diff: diff?,
                             url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
@@ -700,7 +701,8 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
             width.saturating_sub(4 + cols(&local.diff)).max(4),
         );
         items.push(Item {
-            key: format!("local:{}", local.repo),
+            // By checkout: linked worktrees of one repo share its name.
+            key: format!("local:{}", local.top),
             lines: (out.len(), out.len()),
             open: local.url.clone(),
             ..Item::default()
@@ -1118,7 +1120,25 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
                 buf.clear();
             }
             buf.push(byte[0]);
-            if !matches!(byte[0], b'M' | b'm') || !buf.starts_with(b"\x1b[<") {
+            // Any escape but a mouse report (an arrow key, a bare Esc) is
+            // dropped once complete, so keys after it still arrive.
+            if !buf.starts_with(b"\x1b[<") {
+                match buf.len() {
+                    1 => {}
+                    // A bare Esc: the byte after it is a key of its own.
+                    2 if buf[1] != b'[' => {
+                        buf.clear();
+                        if events.send(Event::Key(byte[0])).is_err() {
+                            return;
+                        }
+                    }
+                    2 => {}
+                    _ if (0x40..=0x7e).contains(&byte[0]) => buf.clear(),
+                    _ => {}
+                }
+                continue;
+            }
+            if !matches!(byte[0], b'M' | b'm') {
                 continue;
             }
             let seq = String::from_utf8_lossy(&buf[3..buf.len() - 1]).to_string();
@@ -1161,6 +1181,8 @@ fn open_url(url: &str) {
 
 /// Uncommitted changes in a checkout: its repo, `+a -d`, and its page.
 struct Local {
+    /// The checkout's top directory.
+    top: String,
     repo: String,
     diff: String,
     /// The repo on GitHub, if it is there.
