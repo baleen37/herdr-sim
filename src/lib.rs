@@ -570,14 +570,55 @@ pub const SPINNER: [char; 8] = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽',
 /// One spinner step: faster reads as a blur, slower as a stutter (herdr-radar).
 pub const SPIN_MS: u64 = 150;
 
-/// `$label_working` on spinner step `frame`: the step in place of `◐`, then
-/// the title from the agent's `$heading` (its logo, then the title).
-pub fn spinner_value(heading: &str, frame: usize) -> String {
-    let step = SPINNER[frame % SPINNER.len()];
-    match heading.split_once(' ') {
-        Some((_, title)) => format!("{step} {title}"),
-        None => step.to_string(),
-    }
+/// Spinner steps per half beat of the question mark's pulse, about 0.75 s.
+pub const PULSE_STEPS: usize = 5;
+
+/// The title in an agent's `$heading` (its logo, then the title).
+pub fn heading_title(heading: &str) -> &str {
+    heading.split_once(' ').map_or("", |(_, title)| title)
+}
+
+/// What the animator writes on step `frame` into one pane's `$label_*` or
+/// Space's `$header_*` tokens (`prefix`), given those tokens and the text
+/// behind the mark: a spinner step in the working token, as herdr-radar
+/// turns one; the question mark pulsing in the blocked token. A write that
+/// raced a state change leaves the token beside the new state's, so it is
+/// cleared instead. `None` when the state does not move.
+pub fn animation(
+    tokens: &Value,
+    prefix: &str,
+    text: &str,
+    frame: usize,
+) -> Option<(String, Option<String>)> {
+    let key = |state: &str| format!("{prefix}_{state}");
+    let (state, mark) = if !tokens[key("working")].is_null() {
+        ("working", SPINNER[frame % SPINNER.len()])
+    } else if !tokens[key("blocked")].is_null() {
+        // A braille blank keeps the title in place where `?` was.
+        let on = (frame / PULSE_STEPS).is_multiple_of(2);
+        ("blocked", if on { '?' } else { '\u{2800}' })
+    } else {
+        return None;
+    };
+    let others = [
+        "working",
+        "blocked",
+        "done",
+        "idle_fresh",
+        "idle",
+        "idle_stale",
+        "unknown",
+        "none",
+    ]
+    .into_iter()
+    .filter(|s| *s != state)
+    .any(|s| !tokens[key(s)].is_null());
+    let value = match (others, text) {
+        (true, _) => None,
+        (false, "") => Some(mark.to_string()),
+        (false, text) => Some(format!("{mark} {text}")),
+    };
+    Some((key(state), value))
 }
 
 /// What herdr-sim knows about one agent session.
@@ -1626,10 +1667,32 @@ mod tests {
     }
 
     #[test]
-    fn spinner_turns_ahead_of_the_title() {
-        assert_eq!(spinner_value("\u{ec82} Fix login", 0), "⣷ Fix login");
-        assert_eq!(spinner_value("\u{ec82} Fix login", 9), "⣯ Fix login");
-        assert_eq!(spinner_value("\u{ec82}", 3), "⡿");
+    fn animation_spins_work_pulses_questions_and_lets_go_after_a_race() {
+        let working = json!({ "label_working": "◐ Fix" });
+        assert_eq!(
+            animation(&working, "label", "Fix", 9),
+            Some(("label_working".into(), Some("⣯ Fix".into())))
+        );
+        let blocked = json!({ "header_blocked": "? search" });
+        assert_eq!(
+            animation(&blocked, "header", "search", 0),
+            Some(("header_blocked".into(), Some("? search".into())))
+        );
+        assert_eq!(
+            animation(&blocked, "header", "search", PULSE_STEPS),
+            Some(("header_blocked".into(), Some("\u{2800} search".into())))
+        );
+        let raced = json!({ "label_working": "⣷ Fix", "label_idle": "○ Fix" });
+        assert_eq!(
+            animation(&raced, "label", "Fix", 0),
+            Some(("label_working".into(), None))
+        );
+        assert_eq!(
+            animation(&json!({ "label_idle": "○ Fix" }), "label", "Fix", 0),
+            None
+        );
+        assert_eq!(heading_title("\u{ec82} Fix login"), "Fix login");
+        assert_eq!(heading_title("\u{ec82}"), "");
     }
 
     #[test]

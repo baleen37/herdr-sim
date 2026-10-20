@@ -27,14 +27,14 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
     DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, SPINNER, STALE_HEADING_TOKEN,
-    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
-    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
+    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS,
+    Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN, TREE_GROUP_STALE_TOKEN,
+    TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value, animation,
     checkout_headers, claude_session, claude_session_name, codex_session, diff_value, header_value,
-    heading_value, held_status, icon_token, indent,
+    heading_title, heading_value, held_status, icon_token, indent,
     layout::{self, Pane, Space},
-    project_name, resolve_claude_session, scope, space_header_value, space_status, spinner_value,
+    project_name, resolve_claude_session, scope, space_header_value, space_status,
     state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
@@ -558,9 +558,12 @@ impl Run {
             );
             self.report("pane", pane, "radar", None, &radar);
         }
-        // The spinner needs a process that outlives this run; it stops itself
-        // once nothing works.
-        if states.iter().any(|(status, _)| status == "working") {
+        // The spinner and pulse need a process that outlives this run; it
+        // stops itself once nothing works or asks.
+        if states
+            .iter()
+            .any(|(status, _)| status == "working" || status == "blocked")
+        {
             spawn_animator();
         }
     }
@@ -654,43 +657,35 @@ fn spawn_animator() {
     }
 }
 
-/// Turns the spinner ahead of each working title, as herdr-radar does, until
-/// no agent works. One animator at a time; it talks to Herdr's socket rather
-/// than spawning the CLI, since it writes every [`SPIN_MS`].
+/// Moves the marks Herdr cannot animate itself, as herdr-radar does: a
+/// spinner ahead of each working title and Space header, and a pulsing
+/// question mark where an agent asks. One animator at a time; it talks to
+/// Herdr's socket rather than spawning the CLI, since it steps every
+/// [`SPIN_MS`], and exits once nothing works or asks.
 fn animate(state_dir: &Path) -> Result<()> {
     let lock = File::create(state_dir.join("animate-lock"))?;
     if lock.try_lock().is_err() {
         return Ok(());
     }
-    let mut spinning: Vec<String> = Vec::new();
+    // What was last written, so a pulse that holds still costs no call.
+    let mut written: HashMap<(String, String), Option<String>> = HashMap::new();
     for frame in 0.. {
-        let list = socket_request("agent.list", json!({}))?;
-        let agents = list["agents"].as_array().cloned().unwrap_or_default();
-        let mut now = Vec::new();
-        for agent in &agents {
+        let mut moving = false;
+        let agents = socket_request("agent.list", json!({}))?;
+        for agent in agents["agents"].as_array().into_iter().flatten() {
             let tokens = &agent["tokens"];
-            let (Some(pane), Some(heading)) =
-                (agent["pane_id"].as_str(), tokens["heading"].as_str())
-            else {
+            let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
             };
-            // Only where a run put the working label: it owns the state.
-            if agent["agent_status"] != "working" || tokens[LABEL_WORKING].is_null() {
-                continue;
-            }
-            let value = spinner_value(heading, frame);
-            report_tokens(pane, json!({ LABEL_WORKING: value }));
-            now.push(pane.to_string());
-        }
-        // A turn that ended between this frame's list and its write would
-        // keep a spinner beside its new state; take it back.
-        for pane in spinning.iter().filter(|p| !now.contains(p)) {
-            let agent = agents.iter().find(|a| a["pane_id"] == pane.as_str());
-            if agent.is_some_and(|a| a["agent_status"] != "working") {
-                report_tokens(pane, json!({ LABEL_WORKING: null }));
+            let title = heading_title(tokens[HEADING_TOKEN].as_str().unwrap_or_default());
+            if let Some((key, value)) = animation(tokens, "label", title, frame) {
+                moving |= value.is_some();
+                if written.insert((pane.into(), key.clone()), value.clone()) != Some(value.clone())
+                {
+                    report_tokens("pane", pane, json!({ key: value }));
+                }
             }
         }
-        // The Spaces those agents work in turn with them.
         let spaces = socket_request("workspace.list", json!({}))?;
         for space in spaces["workspaces"].as_array().into_iter().flatten() {
             let tokens = &space["tokens"];
@@ -699,43 +694,27 @@ fn animate(state_dir: &Path) -> Result<()> {
             else {
                 continue;
             };
-            if tokens[HEADER_WORKING].is_null() {
-                continue;
-            }
-            // A Space whose last agent stopped under this frame lets go.
-            let working = agents
-                .iter()
-                .any(|a| a["workspace_id"] == id && a["agent_status"] == "working");
-            let step = SPINNER[frame % SPINNER.len()];
-            let tokens = match working {
-                true => json!({ HEADER_WORKING: format!("{step} {header}") }),
-                false => json!({ HEADER_WORKING: null }),
-            };
-            let params = json!({ "workspace_id": id, "source": "herdr-sim", "tokens": tokens });
-            if let Err(err) = socket_call("workspace.report_metadata", params) {
-                eprintln!("herdr-sim: {id}: {err:#}");
+            if let Some((key, value)) = animation(tokens, "header", header, frame) {
+                moving |= value.is_some();
+                if written.insert((id.into(), key.clone()), value.clone()) != Some(value.clone()) {
+                    report_tokens("workspace", id, json!({ key: value }));
+                }
             }
         }
-        if now.is_empty() {
+        if !moving {
             return Ok(());
         }
-        spinning = now;
         std::thread::sleep(Duration::from_millis(SPIN_MS));
     }
     Ok(())
 }
 
-/// The `$header_*` token a working Space's header sits in.
-const HEADER_WORKING: &str = "header_working";
-
-/// The `$label_*` token a working agent's title sits in.
-const LABEL_WORKING: &str = "label_working";
-
-/// Sets or clears pane tokens as herdr-sim, over the socket.
-fn report_tokens(pane: &str, tokens: Value) {
-    let params = json!({ "pane_id": pane, "source": "herdr-sim", "tokens": tokens });
-    if let Err(err) = socket_call("pane.report_metadata", params) {
-        eprintln!("herdr-sim: {pane}: {err:#}");
+/// Sets or clears a pane's or workspace's (`kind`) tokens as herdr-sim, over
+/// the socket.
+fn report_tokens(kind: &str, id: &str, tokens: Value) {
+    let params = json!({ format!("{kind}_id"): id, "source": "herdr-sim", "tokens": tokens });
+    if let Err(err) = socket_call(&format!("{kind}.report_metadata"), params) {
+        eprintln!("herdr-sim: {id}: {err:#}");
     }
 }
 
