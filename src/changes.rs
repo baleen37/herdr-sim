@@ -183,6 +183,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
     // Each directory's checkout, found once: sessions revisit the same few.
     let mut checkouts: HashMap<String, Option<String>> = HashMap::new();
+    // Each checkout's repo name, from its remote; asked once.
+    let mut names: HashMap<String, Option<String>> = HashMap::new();
     // The last details seen, so a reopened panel draws its PRs before GitHub
     // answers.
     let saved = state_dir.join("changes-prs.json");
@@ -251,18 +253,51 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     .map(String::from)
                     .into_iter()
                     .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
+                let dirs: Vec<String> = dirs.collect();
+                // Directories not seen before are looked up together.
+                let new: Vec<&String> = dirs
+                    .iter()
+                    .filter(|d| !checkouts.contains_key(*d))
+                    .collect();
+                let found: Vec<Option<String>> = std::thread::scope(|s| {
+                    let running: Vec<_> =
+                        new.iter().map(|dir| s.spawn(|| checkout_of(dir))).collect();
+                    running
+                        .into_iter()
+                        .map(|t| t.join().ok().flatten())
+                        .collect()
+                });
+                for (dir, top) in new.into_iter().zip(found) {
+                    checkouts.insert(dir.clone(), top);
+                }
                 let mut tops: Vec<String> = Vec::new();
-                for dir in dirs {
-                    let top = checkouts
-                        .entry(dir)
-                        .or_insert_with_key(|dir| checkout_of(dir));
-                    if let Some(top) = top
+                for dir in &dirs {
+                    if let Some(Some(top)) = checkouts.get(dir)
                         && !tops.contains(top)
                     {
                         tops.push(top.clone());
                     }
                 }
-                let local: Vec<Local> = tops.iter().filter_map(|top| local_changes(top)).collect();
+                // Every checkout's diff at once: git is the slow part of a tick.
+                let diffs: Vec<Option<String>> = std::thread::scope(|s| {
+                    let running: Vec<_> =
+                        tops.iter().map(|top| s.spawn(|| local_diff(top))).collect();
+                    running
+                        .into_iter()
+                        .map(|t| t.join().ok().flatten())
+                        .collect()
+                });
+                let local: Vec<Local> = tops
+                    .iter()
+                    .zip(diffs)
+                    .filter_map(|(top, diff)| {
+                        let repo = names.entry(top.clone()).or_insert_with(|| repo_name(top));
+                        Some(Local {
+                            repo: repo.clone()?,
+                            diff: diff?,
+                        })
+                    })
+                    .collect();
                 let (changes, clicks) = render(&list, &prs, &local);
                 targets = clicks;
                 changes
@@ -888,21 +923,9 @@ fn checkout_of(dir: &str) -> Option<String> {
     (out.status.success() && !top.is_empty()).then_some(top)
 }
 
-/// What the checkout at `cwd` has not committed; `None` when clean.
-fn local_changes(cwd: &str) -> Option<Local> {
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(cwd)
-            .args(args)
-            .output()
-            .ok()?;
-        let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-        (!s.is_empty()).then_some(s)
-    };
-    let diff = diff_value(&git(&["diff", "--shortstat", "HEAD"])?)?;
-    let repo = repo_name(cwd)?;
-    Some(Local { repo, diff })
+/// `+a -d` the checkout at `top` has not committed; `None` when clean.
+fn local_diff(top: &str) -> Option<String> {
+    diff_value(&git_in(top, &["diff", "--shortstat", "HEAD"])?)
 }
 
 /// `owner/repo` of the checkout's GitHub `origin`, if it has one.
