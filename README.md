@@ -6,12 +6,66 @@ sidebar. It works across repositories: a session that opened PRs in two repos
 shows both. Each Space (workspace) also gets the PR of the branch it has checked
 out, like a branch row in a Git client.
 
+It also adds a Changes panel (Claude Code's PR list in a right-hand split), a
+project › branch › session tree for the Agents list, and an activity order for
+it. Everything is drawn through Herdr's sidebar tokens, so you choose what shows
+in `config.toml`.
+
 ```
 ● search 
   SEARCH-14527 진행 상황
 ● search-data-batch 3
   배치 마이그레이션
 ```
+
+## Install
+
+Requires Herdr 0.9.0+, its Claude Code / Codex integrations
+(`herdr integration install claude`, `... codex`), `gh` signed in, and a
+[Nerd Font](https://www.nerdfonts.com/) for the icons.
+
+```sh
+herdr plugin install baleen37/herdr-sim
+```
+
+The install step downloads the prebuilt binary for the manifest's version from
+GitHub Releases (macOS arm64, Linux x86_64/arm64) and checks its sha256. On
+other platforms (Intel macOS, for one) build from source as below.
+
+With Nix:
+
+```sh
+herdr plugin link "$(nix build github:baleen37/herdr-sim --no-link --print-out-paths)"
+```
+
+The flake exposes only `packages.<system>.default` (aarch64-darwin,
+x86_64-linux, aarch64-linux), no overlay or module. Its output is the plugin
+root: `bin/herdr-sim`, wrapped with `gh` on `PATH`, beside `herdr-plugin.toml`.
+
+From source, put the binary where the manifest expects it and link the checkout:
+
+```sh
+cargo build --release
+mkdir -p bin && cp target/release/herdr-sim bin/
+herdr plugin link .
+```
+
+## Quick start
+
+1. Install the plugin (above).
+2. Add `$pr` to the Agent rows in Herdr's `config.toml`:
+
+   ```toml
+   [ui.sidebar.agents]
+   rows = [
+     ["state_icon", { token = "$heading" }],
+     [{ token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", dim = true }] }],
+   ]
+   ```
+
+3. Bind the Changes panel to a key (see [Changes panel](#changes-panel)).
+
+[Sidebar config](#sidebar-config) has a fuller layout and every token.
 
 ## How it finds PRs
 
@@ -34,35 +88,13 @@ are cached as below and killed after 10 seconds.
 
 States come from `gh pr view`. Open PRs are re-checked at most once a minute;
 merged and closed PRs are never re-checked. A branch without a PR is re-checked
-once a minute too. Herdr runs the plugin at server
-startup and whenever an agent's status changes.
+once a minute too. When GitHub's GraphQL budget drops below 1000 points, or a
+call is refused for the rate limit, every `gh` call stops until the budget
+resets (or for 5 minutes), leaving the rest for your own `gh` and agents.
 
-## Install
-
-Requires Herdr 0.9.0+, its Claude Code / Codex integrations
-(`herdr integration install claude`, `... codex`), `gh` signed in, and a
-[Nerd Font](https://www.nerdfonts.com/) for the icons.
-
-```sh
-herdr plugin install baleen37/herdr-sim
-```
-
-The install step downloads the prebuilt binary for the manifest's version from
-GitHub Releases (macOS arm64, Linux x86_64/arm64) and checks its sha256.
-
-With Nix:
-
-```sh
-herdr plugin link "$(nix build github:baleen37/herdr-sim --no-link --print-out-paths)"
-```
-
-From source, put the binary where the manifest expects it and link the checkout:
-
-```sh
-cargo build --release
-mkdir -p bin && cp target/release/herdr-sim bin/
-herdr plugin link .
-```
+Herdr runs the plugin at server startup, whenever an agent's status changes,
+when a pane is focused or closed, and when a workspace or worktree is created
+or opened.
 
 ## Changes panel
 
@@ -70,7 +102,13 @@ Claude Code's "Changes" panel as a right-hand split: the PRs the focused agent's
 session touched, newest first — state icon, title (a link), repo and number,
 lines changed, comments and checks. It starts on the pane the key was pressed
 in and then follows focus between agent panes. Open PRs are refetched every 30
-seconds while it is open, merged and closed ones every 10 minutes.
+seconds while it is open, merged and closed ones every 10 minutes, all in one
+GraphQL call; the last details are saved, so a reopened panel draws at once.
+
+When the focused checkout has uncommitted changes, a row above the PRs shows
+the repo and `+12 -3` with a `Create PR` link to GitHub's compare page for the
+branch. The panel opens about 42 columns wide without taking focus; the same
+key closes it.
 
 ```toml
 [[keys.command]]
