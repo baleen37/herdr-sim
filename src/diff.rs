@@ -1,10 +1,8 @@
-//! The diff pane: a checkout's uncommitted changes or a PR's, as Claude Code
-//! shows them — every file in one stream, each under a header that folds it,
-//! unchanged runs summarised, added and removed lines tinted. `d` in the
-//! Changes panel swaps the panel for it on the right half of the tab; `q`
-//! swaps the panel back.
+//! The diff pane, laid out like reviewr: a checkout's uncommitted changes or a
+//! PR's, the selected file's diff in one box and the changed files, as a
+//! tree, in another. `d` in the Changes panel swaps the panel for it on the
+//! right half of the tab; `q` swaps the panel back.
 
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::process::Command;
 use std::sync::mpsc;
@@ -21,6 +19,8 @@ pub const SOURCE: &str = "HERDR_SIM_DIFF_SOURCE";
 /// How often a checkout's diff is read again, so an agent's edits show up.
 const WATCH: Duration = Duration::from_secs(2);
 const CYAN: &str = "\x1b[38;2;137;220;235m";
+const YELLOW: &str = "\x1b[38;2;249;226;175m";
+const BOLD: &str = "\x1b[1m";
 /// Added and removed lines' backgrounds, as delta tints them.
 const ADDED_BG: &str = "\x1b[48;2;33;58;43m";
 const REMOVED_BG: &str = "\x1b[48;2;63;34;44m";
@@ -54,6 +54,13 @@ enum Kind {
     Removed,
 }
 
+/// Which box the keys move in.
+#[derive(PartialEq, Clone, Copy)]
+enum Focus {
+    Files,
+    Diff,
+}
+
 /// Runs the pane until `q`.
 pub fn run(herdr: &str) -> anyhow::Result<()> {
     let source = std::env::var(SOURCE).unwrap_or_default();
@@ -67,56 +74,65 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     listen_for_clicks(events_in);
     let title = title(&source);
     let mut files = read(&source);
-    let mut folded: HashSet<String> = HashSet::new();
+    let mut selected = 0usize;
     let mut scroll = 0usize;
+    let mut focus = Focus::Files;
     loop {
         let (rows, width) = size();
-        let body = rows.saturating_sub(2);
-        let lines = stream(&files, &folded, width);
-        scroll = scroll.min(lines.len().saturating_sub(body));
-        draw(&title, &files, &lines, scroll, rows, width);
-        let headers: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].1.is_some()).collect();
+        let body = rows.saturating_sub(4);
+        let diff = files.get(selected).map(diff_lines).unwrap_or_default();
+        scroll = scroll.min(diff.len().saturating_sub(body / 2));
+        let tree = tree(&files);
+        draw(
+            &title, &files, &tree, selected, &diff, scroll, focus, rows, width,
+        );
+        // A file picked in the list shows its diff from the top.
+        let pick = |to: usize, selected: &mut usize, scroll: &mut usize| {
+            if to < files.len() && to != *selected {
+                *selected = to;
+                *scroll = 0;
+            }
+        };
         match events.recv_timeout(WATCH) {
             Ok(Event::Key(b'q')) => break,
+            Ok(Event::Key(b'\t')) => {
+                focus = if focus == Focus::Files {
+                    Focus::Diff
+                } else {
+                    Focus::Files
+                };
+            }
+            Ok(Event::Key(b'j')) if focus == Focus::Files => {
+                pick(selected + 1, &mut selected, &mut scroll)
+            }
+            Ok(Event::Key(b'k')) if focus == Focus::Files => {
+                pick(selected.saturating_sub(1), &mut selected, &mut scroll)
+            }
             Ok(Event::Key(b'j')) => scroll += 1,
             Ok(Event::Key(b'k')) => scroll = scroll.saturating_sub(1),
-            Ok(Event::Key(4 | b'J' | b' ')) => scroll += body / 2,
-            Ok(Event::Key(21 | b'K')) => scroll = scroll.saturating_sub(body / 2),
-            Ok(Event::Key(b'g')) => scroll = 0,
-            Ok(Event::Key(b'G')) => scroll = usize::MAX,
-            // f / F: the next or previous file.
-            Ok(Event::Key(b'f')) => {
-                scroll = headers
-                    .iter()
-                    .copied()
-                    .find(|&h| h > scroll)
-                    .unwrap_or(scroll);
-            }
-            Ok(Event::Key(b'F')) => {
-                scroll = headers
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|&h| h < scroll)
-                    .unwrap_or(0);
-            }
-            // Enter or o folds the file at the top, or unfolds it.
-            Ok(Event::Key(b'\n' | b'\r' | b'o')) => {
-                let at = headers.iter().rev().copied().find(|&h| h <= scroll);
-                if let Some(path) = at.and_then(|h| lines[h].1).map(|i| files[i].path.clone()) {
-                    toggle(&mut folded, path);
-                }
-            }
+            Ok(Event::Key(4 | b' ')) => scroll += body / 2,
+            Ok(Event::Key(21)) => scroll = scroll.saturating_sub(body / 2),
+            // f / F: the next or previous file, whichever box has focus.
+            Ok(Event::Key(b'f')) => pick(selected + 1, &mut selected, &mut scroll),
+            Ok(Event::Key(b'F')) => pick(selected.saturating_sub(1), &mut selected, &mut scroll),
             Ok(Event::Scroll(by)) => scroll = scroll.saturating_add_signed(by),
-            // A click on a file's header folds or unfolds it.
-            Ok(Event::Press { y, .. }) => {
-                let line = (y + scroll).checked_sub(2);
-                if let Some(i) = line.and_then(|l| lines.get(l)).and_then(|l| l.1) {
-                    toggle(&mut folded, files[i].path.clone());
+            // A click picks a file in the tree, or focuses the diff.
+            Ok(Event::Press { x, y }) => {
+                if x > diff_width(width) {
+                    focus = Focus::Files;
+                    let at = (y + list_offset(&tree, selected, body)).checked_sub(3);
+                    if let Some(Some(i)) = at.and_then(|row| tree.get(row)).map(|t| t.1) {
+                        pick(i, &mut selected, &mut scroll);
+                    }
+                } else {
+                    focus = Focus::Diff;
                 }
             }
             Ok(_) => {}
-            Err(_) if source.starts_with("checkout:") => files = read(&source),
+            Err(_) if source.starts_with("checkout:") => {
+                files = read(&source);
+                selected = selected.min(files.len().saturating_sub(1));
+            }
             Err(_) => {}
         }
     }
@@ -125,12 +141,6 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
         reopen(herdr, &agent, &me);
     }
     Ok(())
-}
-
-fn toggle(folded: &mut HashSet<String>, path: String) {
-    if !folded.remove(&path) {
-        folded.insert(path);
-    }
 }
 
 /// The top bar: the branch and what it is compared with.
@@ -273,140 +283,206 @@ fn start(range: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
-/// Every file's lines, one under another, `width` columns wide; each line
-/// with the file it heads, if it is a file's header.
-fn stream(files: &[File], folded: &HashSet<String>, width: usize) -> Vec<(String, Option<usize>)> {
-    let digits = files
-        .iter()
-        .flat_map(|f| f.rows.iter().map(|r| r.old.max(r.new)))
-        .max()
-        .unwrap_or(0)
-        .to_string()
-        .len()
-        .max(2);
-    let mut out: Vec<(String, Option<usize>)> = Vec::new();
-    for (i, file) in files.iter().enumerate() {
-        let open = !folded.contains(&file.path);
-        out.push((header(file, open, width), Some(i)));
-        if !open {
+/// The diff box's width; the file tree takes the rest.
+fn diff_width(width: usize) -> usize {
+    width.saturating_sub((width * 2 / 5).clamp(24, 36))
+}
+
+/// A file's diff as reviewr shows it: unchanged runs summarised, each line
+/// with its number, changed ones marked.
+fn diff_lines(file: &File) -> Vec<Row> {
+    let mut out = Vec::new();
+    // Where the new file's lines stand after the last hunk shown.
+    let mut next = 1;
+    for row in &file.rows {
+        if row.kind == Kind::Hunk {
+            let skipped = row.new.saturating_sub(next);
+            if skipped > 0 {
+                out.push(Row {
+                    kind: Kind::Hunk,
+                    old: 0,
+                    new: skipped,
+                    text: String::new(),
+                });
+            }
             continue;
         }
-        // Where the new file's lines stand after the last hunk shown.
-        let mut next = 1;
-        for row in &file.rows {
-            if row.kind == Kind::Hunk {
-                let skipped = row.new.saturating_sub(next);
-                if skipped > 0 {
-                    let text = format!(
-                        "  {DIM}⌃ {skipped} unmodified line{}{RESET}",
-                        if skipped == 1 { "" } else { "s" }
-                    );
-                    out.push((text, None));
-                }
-                continue;
-            }
-            if row.kind != Kind::Removed {
-                next = row.new + 1;
-            }
-            out.push((line(row, digits, width), None));
+        if row.kind != Kind::Removed {
+            next = row.new + 1;
         }
-        out.push((String::new(), None));
+        out.push(Row {
+            kind: row.kind,
+            old: row.old,
+            new: row.new,
+            text: row.text.clone(),
+        });
     }
     out
 }
 
-/// A file's header: fold mark, name, its folder dimmed, and counts, on a
-/// raised background across the pane.
-fn header(file: &File, open: bool, width: usize) -> String {
-    let (dir, name) = match file.path.rsplit_once('/') {
-        Some((dir, name)) => (dir, name),
-        None => ("", file.path.as_str()),
-    };
-    let mark = if open { '▾' } else { '▸' };
-    let status = match file.status {
-        'A' => format!(" {GREEN}new{RESET}{SELECTED}"),
-        'D' => format!(" {RED}deleted{RESET}{SELECTED}"),
-        'R' => format!(" {CYAN}renamed{RESET}{SELECTED}"),
-        _ => String::new(),
-    };
-    let counts = format!("+{} -{}", file.added, file.removed);
-    let room = width.saturating_sub(cols(name) + cols(&counts) + 8);
-    let dir = cut(dir, room);
-    let text_cols = cols(name)
-        + cols(&dir)
-        + cols(&counts)
-        + 5
-        + match file.status {
-            'A' => 4,
-            'D' => 8,
-            'R' => 8,
-            _ => 0,
-        };
-    format!(
-        "{SELECTED} {DIM}{mark}{RESET}{SELECTED} {name} {DIM}{dir}{RESET}{SELECTED}{status} \
-         {GREEN}+{}{RESET}{SELECTED} {RED}-{}{RESET}{SELECTED}{}{RESET}",
-        file.added,
-        file.removed,
-        " ".repeat(width.saturating_sub(text_cols))
-    )
-}
-
-/// One diff line: its number, `+` or `-`, and the text, added and removed
-/// lines tinted across the pane with a bar at the edge.
-fn line(row: &Row, digits: usize, width: usize) -> String {
-    let text_cols = width.saturating_sub(digits + 4);
-    let text = cut(&row.text, text_cols);
-    match row.kind {
-        Kind::Added | Kind::Removed => {
-            let (bar, bg, sign, number) = if row.kind == Kind::Added {
-                (GREEN, ADDED_BG, '+', row.new)
-            } else {
-                (RED, REMOVED_BG, '-', row.old)
-            };
-            let pad = " ".repeat(text_cols.saturating_sub(cols(&text)));
-            format!(
-                "{bar}▌{RESET}{bg}{DIM}{number:>digits$}{RESET}{bg} {bar}{sign}{RESET}{bg} {text}{pad}{RESET}"
-            )
+/// The changed files as a tree: a row per folder, then its files, each row
+/// with the file it is, if any.
+fn tree(files: &[File]) -> Vec<(String, Option<usize>)> {
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by(|&a, &b| files[a].path.cmp(&files[b].path));
+    let mut out = Vec::new();
+    let mut dir_shown: Option<&str> = None;
+    for i in order {
+        let (dir, _) = files[i].path.rsplit_once('/').unwrap_or(("", ""));
+        if !dir.is_empty() && dir_shown != Some(dir) {
+            out.push((format!("{dir}/"), None));
         }
-        _ => format!(" {DIM}{:>digits$}{RESET}   {text}", row.new),
+        dir_shown = Some(dir);
+        out.push((String::new(), Some(i)));
     }
+    out
 }
 
-/// Draws the top bar, the stream from line `scroll`, and the key hints.
+/// The first tree row shown, so the selected file is in view.
+fn list_offset(tree: &[(String, Option<usize>)], selected: usize, body: usize) -> usize {
+    let at = tree.iter().position(|t| t.1 == Some(selected)).unwrap_or(0);
+    at.saturating_sub(body.saturating_sub(1))
+}
+
+/// A box's top or bottom: `┌ title ───┐`, the title bright when the box has
+/// focus.
+fn edge(left: char, title: &str, right: char, width: usize, focused: bool) -> String {
+    let inner = width.saturating_sub(2);
+    let title = if title.is_empty() {
+        String::new()
+    } else {
+        format!(" {} ", cut(title, inner.saturating_sub(3)))
+    };
+    let fill = "─".repeat(inner.saturating_sub(cols(&title) + 1));
+    let style = if focused { BOLD } else { DIM };
+    format!("{DIM}{left}─{RESET}{style}{title}{RESET}{DIM}{fill}{right}{RESET}")
+}
+
+/// Draws the header, the diff and file boxes, and the key hints.
+#[allow(clippy::too_many_arguments)]
 fn draw(
     title: &str,
     files: &[File],
-    lines: &[(String, Option<usize>)],
+    tree: &[(String, Option<usize>)],
+    selected: usize,
+    diff: &[Row],
     scroll: usize,
+    focus: Focus,
     rows: usize,
     width: usize,
 ) {
+    let dw = diff_width(width);
+    let fw = width - dw;
+    let body = rows.saturating_sub(4);
     let (added, removed) = files
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
-    let stats = format!("{} files  +{added} -{removed}", files.len());
+    let stats = format!("{} changed  +{added} −{removed}", files.len());
     let gap = width.saturating_sub(cols(title) + cols(&stats) + 2);
-    let mut out = String::from("\x1b[?7l");
-    out += &format!(
-        "\x1b[1;1H\x1b[K {title}{}{DIM}{} files{RESET}  {GREEN}+{added}{RESET} {RED}-{removed}{RESET}",
+    let mut lines = vec![format!(
+        " {title}{}{DIM}{} changed{RESET}  {GREEN}+{added}{RESET} {RED}−{removed}{RESET}",
         " ".repeat(gap),
         files.len()
+    )];
+    let path = files.get(selected).map_or("Diff", |f| f.path.as_str());
+    lines.push(
+        edge('┌', path, '┐', dw, focus == Focus::Diff)
+            + &edge('┌', "Files", '┐', fw, focus == Focus::Files),
     );
-    let body = rows.saturating_sub(2);
+    let digits = diff
+        .iter()
+        .map(|r| r.old.max(r.new))
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .len()
+        .max(3);
+    let offset = list_offset(tree, selected, body);
     for i in 0..body {
-        let text = match lines.get(scroll + i) {
-            Some((text, _)) => text.as_str(),
-            None if i == 0 && files.is_empty() => "  No changes.",
-            None => "",
+        let left = match diff.get(scroll + i) {
+            Some(r) => diff_row(r, digits, dw - 2),
+            None if i == 0 && files.is_empty() => format!("{DIM}no changes{RESET}"),
+            None => String::new(),
         };
-        out += &format!("\x1b[{};1H\x1b[K{text}", i + 2);
+        let right = match tree.get(offset + i) {
+            Some((dir, None)) => format!("{DIM}▾ {}{RESET}", cut(dir, fw - 4)),
+            Some((_, Some(f))) => tree_row(&files[*f], *f == selected, fw - 2),
+            None => String::new(),
+        };
+        lines.push(format!(
+            "{DIM}│{RESET}{left}\x1b[{row};{dw}H{DIM}│{RESET}{DIM}│{RESET}{right}\x1b[{row};{width}H{DIM}│{RESET}",
+            row = i + 3,
+        ));
     }
-    out += &format!(
-        "\x1b[{rows};1H\x1b[K {DIM}j/k scroll · f/F file · o fold · q back to Changes{RESET}"
-    );
+    lines.push(edge('└', "", '┘', dw, false) + &edge('└', "", '┘', fw, false));
+    let hints = if focus == Focus::Files {
+        "j/k file · tab diff · q back to Changes"
+    } else {
+        "j/k scroll · f/F file · tab files · q back to Changes"
+    };
+    lines.push(format!(" {DIM}{hints}{RESET}"));
+
+    let mut out = String::from("\x1b[?7l");
+    for (i, line) in lines.iter().enumerate() {
+        out += &format!("\x1b[{};1H\x1b[K{line}", i + 1);
+    }
     let mut stdout = io::stdout();
     let _ = stdout.write_all(out.as_bytes());
     let _ = stdout.flush();
+}
+
+/// One diff line, `width` columns wide: changed lines get a bar and a tint,
+/// and every line its number.
+fn diff_row(row: &Row, digits: usize, width: usize) -> String {
+    let text_cols = width.saturating_sub(digits + 3);
+    let text = cut(&row.text, text_cols);
+    match row.kind {
+        Kind::Hunk => format!(
+            "  {DIM}⋯  {} unmodified line{}{RESET}",
+            row.new,
+            if row.new == 1 { "" } else { "s" }
+        ),
+        Kind::Context => format!(" {DIM}{:>digits$}{RESET}  {text}", row.new),
+        Kind::Added | Kind::Removed => {
+            let (bar, bg, number) = if row.kind == Kind::Added {
+                (GREEN, ADDED_BG, row.new)
+            } else {
+                (RED, REMOVED_BG, row.old)
+            };
+            let pad = " ".repeat(text_cols.saturating_sub(cols(&text)));
+            format!("{bar}▌{RESET}{bg}{DIM}{number:>digits$}{RESET}{bg}  {text}{pad}{RESET}")
+        }
+    }
+}
+
+/// A file in the tree, `width` columns wide: status, name, counts.
+fn tree_row(file: &File, selected: bool, width: usize) -> String {
+    let colour = match file.status {
+        'A' => GREEN,
+        'D' => RED,
+        'R' => CYAN,
+        _ => YELLOW,
+    };
+    let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+    let indent = if file.path.contains('/') { "  " } else { "" };
+    let counts = format!("+{} −{}", file.added, file.removed);
+    let room = width.saturating_sub(cols(indent) + cols(&counts) + 4);
+    // A long name keeps its end, as reviewr does.
+    let name = if cols(name) > room {
+        let tail: Vec<char> = name.chars().rev().take(room.saturating_sub(1)).collect();
+        format!("…{}", tail.into_iter().rev().collect::<String>())
+    } else {
+        name.to_string()
+    };
+    let gap = width.saturating_sub(cols(indent) + cols(&name) + cols(&counts) + 3);
+    let bg = if selected { SELECTED } else { "" };
+    format!(
+        "{bg}{indent}{colour}{}{RESET}{bg} {name}{}{GREEN}+{}{RESET}{bg} {RED}−{}{RESET}{bg} {RESET}",
+        file.status,
+        " ".repeat(gap),
+        file.added,
+        file.removed
+    )
 }
 
 #[cfg(test)]
