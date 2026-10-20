@@ -25,16 +25,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
-    AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
-    Ci, DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
+    AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
+    DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
     SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, SPINNER, STALE_HEADING_TOKEN,
-    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN,
-    TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN, TREE_GROUP_STALE_TOKEN,
-    TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
-    agent_icon, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
-    group_rows, header_value, heading_value, held_status, icon_token, indent, project_name,
-    resolve_claude_session, scope, space_header_value, space_status, spinner_value, split_marks,
+    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
+    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
+    checkout_headers, claude_session, claude_session_name, codex_session, diff_value, header_value,
+    heading_value, held_status, icon_token, indent,
+    layout::{self, Pane, Space},
+    project_name, resolve_claude_session, scope, space_header_value, space_status, spinner_value,
     state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
@@ -187,101 +187,81 @@ impl Run {
         }
 
         let states = self.states(&agents);
+        let workspaces = self.json(&["workspace", "list"]);
         // A turn start or a focus changes only colours; tree order and
         // headers wait for a turn's end, as before.
         if scope == &Scope::Status {
             self.report_states(&agents, &states);
-            self.report_space_states(&agents, &states);
+            self.report_space_states(&agents, &states, &workspaces);
             return;
         }
 
-        // Project and checkout (branch) headers over the Agents list. Herdr
-        // shows it in the same order as `agent list` when sorted by Space; in
-        // activity order the view sorts on the ranks set here, so the headers
-        // follow the same order.
-        let activity: Vec<Activity> = agents
+        // herdr-radar's tree: a group per workspace, worktrees under their
+        // checkout, ordered by when each session last worked.
+        let spaces: Vec<Space> = workspaces["result"]["workspaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| Space {
+                id: w["workspace_id"].as_str().unwrap_or_default().to_string(),
+                label: w["label"].as_str().unwrap_or_default().to_string(),
+                repo_key: w["worktree"]["repo_key"].as_str().map(String::from),
+                linked: w["worktree"]["is_linked_worktree"].as_bool() == Some(true),
+                repo_name: w["worktree"]["repo_name"].as_str().map(String::from),
+            })
+            .collect();
+        let panes: Vec<Pane> = agents
             .iter()
             .zip(&states)
-            .map(|(agent, (_, state))| Activity {
-                place: agent["cwd"].as_str().map(|cwd| self.place(cwd)),
+            .map(|(agent, (_, state))| Pane {
+                workspace: agent["workspace_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 tab: agent["tab_id"].as_str().unwrap_or_default().to_string(),
-                seq: agent["state_change_seq"].as_u64().unwrap_or(0),
+                last_minute: self
+                    .session_of(agent)
+                    .and_then(|session| session.last_activity)
+                    .map(|at| at / 60),
                 stale: *state == STALE_HEADING_TOKEN,
             })
             .collect();
-        // Agents without a place get no rank, so the view lists them last.
-        let (order, ranked) = if self.ordered {
-            let placed = activity.iter().filter(|a| a.place.is_some()).count();
-            (activity_order(&activity), placed)
-        } else {
-            ((0..agents.len()).collect(), 0)
-        };
-        let places: Vec<Option<Place>> = order.iter().map(|&i| activity[i].place.clone()).collect();
-        let tabs: Vec<&str> = order.iter().map(|&i| activity[i].tab.as_str()).collect();
-        let marks = split_marks(&tabs);
-        let stale: Vec<bool> = order.iter().map(|&i| activity[i].stale).collect();
+        let (order, rows) = layout::layout(&panes, &spaces, self.ordered);
+        let places: Vec<Option<Place>> = order
+            .iter()
+            .map(|&i| agents[i]["cwd"].as_str().map(|cwd| self.place(cwd)))
+            .collect();
         let headers = tree_headers(&places)
             .into_iter()
             .zip(checkout_headers(&places))
-            .zip(group_rows(&places, &stale));
+            .zip(rows);
         for (pos, (((project, worktree), header), row)) in headers.enumerate() {
             let agent = &agents[order[pos]];
             let Some(pane) = agent["pane_id"].as_str() else {
                 continue;
             };
-            // The indent goes on the row's first cell: the split mark when
-            // there is one, else the heading.
-            // Herdr indents every row of an entry but its first. A session
-            // under a checkout's header row sits indented already; one
-            // without (a second session of that checkout) would start at the
-            // edge, so it gets the same indent itself.
-            // The indent leads the row: in the split mark's cell if there is
-            // one, else in the heading, which then carries the state mark.
-            // Sessions stand alone, one row each: no indent. Only the
-            // tree's `$icon_*` sits in, under its branch.
-            let depth = 0;
-            let split = marks[pos].map(|mark| format!("{}{mark}", indent(depth)));
+            // The indent rides on the session row's first cell, the logo.
             self.cache.set_depth(pane, row.depth);
-            let fade = |stale: bool, header: Option<String>| {
-                if stale {
-                    (None, header)
-                } else {
-                    (header, None)
-                }
-            };
-            let (group_project, group_project_stale) = fade(row.project_stale, row.project);
-            let (group, group_stale) = fade(row.stale, row.group);
-            // The branch PR rides on the worktree's header, from the same
-            // cache the Space pass fills, so it costs no extra gh call.
-            let card_pr = match (group.as_ref().or(group_stale.as_ref()), &places[pos]) {
-                (Some(_), Some(place)) => {
-                    let (repo, branch) = (place.checkout.clone(), place.label.clone());
-                    let key = format!("{repo}#{branch}");
-                    let pr = self
-                        .cache
-                        .branch_state(&key, self.now, || gh_branch_pr(&repo, &branch));
-                    pr.state.and_then(|state| token_value(state, 1))
-                }
-                _ => None,
+            let (group, group_stale) = if row.group_stale {
+                (None, row.group)
+            } else {
+                (row.group, None)
             };
             let tokens = [
                 (TREE_PROJECT_TOKEN.to_string(), project),
                 (TREE_WORKTREE_TOKEN.to_string(), worktree),
-                (TREE_PR_TOKEN.to_string(), card_pr),
                 (TREE_HEADER_TOKEN.to_string(), header),
-                (TREE_GROUP_PROJECT_TOKEN.to_string(), group_project),
-                (
-                    TREE_GROUP_PROJECT_STALE_TOKEN.to_string(),
-                    group_project_stale,
-                ),
+                (TREE_GROUP_PARENT_TOKEN.to_string(), row.group_parent),
                 (TREE_GROUP_TOKEN.to_string(), group),
                 (TREE_GROUP_STALE_TOKEN.to_string(), group_stale),
-                (TREE_GAP_TOKEN.to_string(), row.gap),
+                (
+                    TREE_GAP_TOKEN.to_string(),
+                    row.gap.then(|| ZWSP.to_string()),
+                ),
                 (AGE_TOKEN.to_string(), self.age_secs(agent).map(age_value)),
-                (TREE_SPLIT_TOKEN.to_string(), split),
                 (
                     SORT_RANK_TOKEN.to_string(),
-                    (pos < ranked).then(|| format!("{pos:04}")),
+                    self.ordered.then(|| format!("{pos:04}")),
                 ),
             ];
             self.report("pane", pane, "tree", None, &tokens);
@@ -350,7 +330,10 @@ impl Run {
                 .iter()
                 .map(|kind| {
                     let count = kinds.and_then(|k| k.get(*kind)).copied().unwrap_or(0);
-                    (workspace_agent_token(kind), agent_count_value(kind, count))
+                    (
+                        workspace_agent_token(kind),
+                        agent_logo_value(kind, count > 0),
+                    )
                 })
                 .collect();
             let project = projects.remove(&workspace);
@@ -371,15 +354,18 @@ impl Run {
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
             self.report("workspace", &workspace, "space", Some(&prs), &tokens);
         }
-        self.report_space_states(&agents, &states);
+        self.report_space_states(&agents, &states, &workspaces);
     }
 
-    /// Puts each Space's header in the `$header_*` token for the state of
-    /// its agents, reading the header back from the Space's own tokens, so a
-    /// turn's start needs no git call.
-    fn report_space_states(&mut self, agents: &[Value], states: &[(String, &'static str)]) {
-        let spaces = self.json(&["workspace", "list"]);
-        for space in spaces["result"]["workspaces"]
+    /// Puts each Space's name in the `$header_*` token for the state of its
+    /// agents.
+    fn report_space_states(
+        &mut self,
+        agents: &[Value],
+        states: &[(String, &'static str)],
+        workspaces: &Value,
+    ) {
+        for space in workspaces["result"]["workspaces"]
             .as_array()
             .into_iter()
             .flatten()
@@ -387,11 +373,9 @@ impl Run {
             let Some(id) = space["workspace_id"].as_str() else {
                 continue;
             };
-            let tokens = &space["tokens"];
-            let Some(header) = tokens[TREE_HEADER_TOKEN]
-                .as_str()
-                .or(tokens[TREE_HEADER_IDLE_TOKEN].as_str())
-            else {
+            // The workspace's own name, as herdr-radar: a Space is picked by
+            // what runs in it, not by its branch.
+            let Some(header) = space["label"].as_str() else {
                 continue;
             };
             let status = space_status(
@@ -710,10 +694,9 @@ fn animate(state_dir: &Path) -> Result<()> {
         let spaces = socket_request("workspace.list", json!({}))?;
         for space in spaces["workspaces"].as_array().into_iter().flatten() {
             let tokens = &space["tokens"];
-            let (Some(id), Some(header)) = (
-                space["workspace_id"].as_str(),
-                tokens[TREE_HEADER_TOKEN].as_str(),
-            ) else {
+            let (Some(id), Some(header)) =
+                (space["workspace_id"].as_str(), space["label"].as_str())
+            else {
                 continue;
             };
             if tokens[HEADER_WORKING].is_null() {
