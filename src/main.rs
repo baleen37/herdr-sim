@@ -17,6 +17,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, mpsc};
@@ -26,13 +27,14 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, Activity, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache,
     Ci, DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN,
-    TREE_GAP_TOKEN, TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
-    TREE_PR_TOKEN, TREE_PROJECT_TOKEN, TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order,
-    age_value, agent_count_value, agent_icon, checkout_headers, claude_session,
-    claude_session_name, codex_session, diff_value, group_rows, header_value, heading_value,
-    held_status, icon_token, indent, project_name, resolve_claude_session, scope, split_marks,
+    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, SPINNER, STALE_HEADING_TOKEN,
+    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN,
+    TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN, TREE_GROUP_STALE_TOKEN,
+    TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
+    TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
+    agent_icon, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
+    group_rows, header_value, heading_value, held_status, icon_token, indent, project_name,
+    resolve_claude_session, scope, space_header_value, space_status, spinner_value, split_marks,
     state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
@@ -86,6 +88,9 @@ fn main() -> Result<()> {
     }
     if env::args().any(|a| a == "--diff-pane") {
         return diff::run(&herdr_bin);
+    }
+    if env::args().any(|a| a == "--animate") {
+        return animate(&state_dir);
     }
     if env::args().any(|a| a == "--toggle-changes") {
         return changes::toggle(&herdr_bin, &state_dir);
@@ -186,6 +191,7 @@ impl Run {
         // headers wait for a turn's end, as before.
         if scope == &Scope::Status {
             self.report_states(&agents, &states);
+            self.report_space_states(&agents, &states);
             return;
         }
 
@@ -365,6 +371,44 @@ impl Run {
             let prs = branch_prs.remove(&workspace).unwrap_or_default();
             self.report("workspace", &workspace, "space", Some(&prs), &tokens);
         }
+        self.report_space_states(&agents, &states);
+    }
+
+    /// Puts each Space's header in the `$header_*` token for the state of
+    /// its agents, reading the header back from the Space's own tokens, so a
+    /// turn's start needs no git call.
+    fn report_space_states(&mut self, agents: &[Value], states: &[(String, &'static str)]) {
+        let spaces = self.json(&["workspace", "list"]);
+        for space in spaces["result"]["workspaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = space["workspace_id"].as_str() else {
+                continue;
+            };
+            let tokens = &space["tokens"];
+            let Some(header) = tokens[TREE_HEADER_TOKEN]
+                .as_str()
+                .or(tokens[TREE_HEADER_IDLE_TOKEN].as_str())
+            else {
+                continue;
+            };
+            let status = space_status(
+                agents
+                    .iter()
+                    .zip(states)
+                    .filter(|(a, _)| a["workspace_id"] == id)
+                    .map(|(_, (status, _))| status.as_str()),
+            );
+            let token = format!("header_{status}");
+            let value = space_header_value(header, status);
+            let tokens: Vec<(String, Option<String>)> = SPACE_HEADER_TOKENS
+                .iter()
+                .map(|t| (t.to_string(), (*t == token).then(|| value.clone())))
+                .collect();
+            self.report("workspace", id, "space-state", None, &tokens);
+        }
     }
 
     fn agent(&mut self, agent: &Value) {
@@ -530,6 +574,11 @@ impl Run {
             );
             self.report("pane", pane, "radar", None, &radar);
         }
+        // The spinner needs a process that outlives this run; it stops itself
+        // once nothing works.
+        if states.iter().any(|(status, _)| status == "working") {
+            spawn_animator();
+        }
     }
 
     /// The agent's session as of now; reading it again only reads what was
@@ -601,6 +650,109 @@ fn set_agent_view(on: bool) {
     };
     if let Err(err) = socket_call(method, params) {
         eprintln!("herdr-sim: {method}: {err:#}");
+    }
+}
+
+/// Starts `--animate` in its own process group, so it outlives this run.
+fn spawn_animator() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let spawned = Command::new(exe)
+        .arg("--animate")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    if let Err(err) = spawned {
+        eprintln!("herdr-sim: --animate: {err}");
+    }
+}
+
+/// Turns the spinner ahead of each working title, as herdr-radar does, until
+/// no agent works. One animator at a time; it talks to Herdr's socket rather
+/// than spawning the CLI, since it writes every [`SPIN_MS`].
+fn animate(state_dir: &Path) -> Result<()> {
+    let lock = File::create(state_dir.join("animate-lock"))?;
+    if lock.try_lock().is_err() {
+        return Ok(());
+    }
+    let mut spinning: Vec<String> = Vec::new();
+    for frame in 0.. {
+        let list = socket_request("agent.list", json!({}))?;
+        let agents = list["agents"].as_array().cloned().unwrap_or_default();
+        let mut now = Vec::new();
+        for agent in &agents {
+            let tokens = &agent["tokens"];
+            let (Some(pane), Some(heading)) =
+                (agent["pane_id"].as_str(), tokens["heading"].as_str())
+            else {
+                continue;
+            };
+            // Only where a run put the working label: it owns the state.
+            if agent["agent_status"] != "working" || tokens[LABEL_WORKING].is_null() {
+                continue;
+            }
+            let value = spinner_value(heading, frame);
+            report_tokens(pane, json!({ LABEL_WORKING: value }));
+            now.push(pane.to_string());
+        }
+        // A turn that ended between this frame's list and its write would
+        // keep a spinner beside its new state; take it back.
+        for pane in spinning.iter().filter(|p| !now.contains(p)) {
+            let agent = agents.iter().find(|a| a["pane_id"] == pane.as_str());
+            if agent.is_some_and(|a| a["agent_status"] != "working") {
+                report_tokens(pane, json!({ LABEL_WORKING: null }));
+            }
+        }
+        // The Spaces those agents work in turn with them.
+        let spaces = socket_request("workspace.list", json!({}))?;
+        for space in spaces["workspaces"].as_array().into_iter().flatten() {
+            let tokens = &space["tokens"];
+            let (Some(id), Some(header)) = (
+                space["workspace_id"].as_str(),
+                tokens[TREE_HEADER_TOKEN].as_str(),
+            ) else {
+                continue;
+            };
+            if tokens[HEADER_WORKING].is_null() {
+                continue;
+            }
+            // A Space whose last agent stopped under this frame lets go.
+            let working = agents
+                .iter()
+                .any(|a| a["workspace_id"] == id && a["agent_status"] == "working");
+            let step = SPINNER[frame % SPINNER.len()];
+            let tokens = match working {
+                true => json!({ HEADER_WORKING: format!("{step} {header}") }),
+                false => json!({ HEADER_WORKING: null }),
+            };
+            let params = json!({ "workspace_id": id, "source": "herdr-sim", "tokens": tokens });
+            if let Err(err) = socket_call("workspace.report_metadata", params) {
+                eprintln!("herdr-sim: {id}: {err:#}");
+            }
+        }
+        if now.is_empty() {
+            return Ok(());
+        }
+        spinning = now;
+        std::thread::sleep(Duration::from_millis(SPIN_MS));
+    }
+    Ok(())
+}
+
+/// The `$header_*` token a working Space's header sits in.
+const HEADER_WORKING: &str = "header_working";
+
+/// The `$label_*` token a working agent's title sits in.
+const LABEL_WORKING: &str = "label_working";
+
+/// Sets or clears pane tokens as herdr-sim, over the socket.
+fn report_tokens(pane: &str, tokens: Value) {
+    let params = json!({ "pane_id": pane, "source": "herdr-sim", "tokens": tokens });
+    if let Err(err) = socket_call("pane.report_metadata", params) {
+        eprintln!("herdr-sim: {pane}: {err:#}");
     }
 }
 
