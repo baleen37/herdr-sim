@@ -77,15 +77,22 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     let mut selected = 0usize;
     let mut scroll = 0usize;
     let mut focus = Focus::Files;
+    let mut tree_shown = true;
     loop {
         let (rows, width) = size();
         let body = rows.saturating_sub(4);
         let diff = files.get(selected).map(diff_lines).unwrap_or_default();
         scroll = scroll.min(diff.len().saturating_sub(body / 2));
         let tree = tree(&files);
-        draw(
-            &title, &files, &tree, selected, &diff, scroll, focus, rows, width,
-        );
+        let view = View {
+            selected,
+            scroll,
+            focus,
+            tree_shown,
+            rows,
+            width,
+        };
+        draw(&title, &files, &tree, &diff, view);
         // A file picked in the list shows its diff from the top.
         let pick = |to: usize, selected: &mut usize, scroll: &mut usize| {
             if to < files.len() && to != *selected {
@@ -95,7 +102,26 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
         };
         match events.recv_timeout(WATCH) {
             Ok(Event::Key(b'q')) => break,
-            Ok(Event::Key(b'\t')) => {
+            // e: the file in the editor, at the first line on screen.
+            Ok(Event::Key(b'e')) => {
+                if let (Some(dir), Some(file)) =
+                    (source.strip_prefix("checkout:"), files.get(selected))
+                {
+                    let line = diff[scroll..]
+                        .iter()
+                        .find(|r| r.kind != Kind::Hunk)
+                        .map_or(1, |r| r.new.max(r.old).max(1));
+                    edit(herdr, dir, &file.path, line);
+                }
+            }
+            // z hides the file tree, or shows it again.
+            Ok(Event::Key(b'z')) => {
+                tree_shown = !tree_shown;
+                if !tree_shown {
+                    focus = Focus::Diff;
+                }
+            }
+            Ok(Event::Key(b'\t')) if tree_shown => {
                 focus = if focus == Focus::Files {
                     Focus::Diff
                 } else {
@@ -118,7 +144,7 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             Ok(Event::Scroll(by)) => scroll = scroll.saturating_add_signed(by),
             // A click picks a file in the tree, or focuses the diff.
             Ok(Event::Press { x, y }) => {
-                if x > diff_width(width) {
+                if x > diff_width(width, tree_shown) {
                     focus = Focus::Files;
                     let at = (y + list_offset(&tree, selected, body)).checked_sub(3);
                     if let Some(Some(i)) = at.and_then(|row| tree.get(row)).map(|t| t.1) {
@@ -283,8 +309,26 @@ fn start(range: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
-/// The diff box's width; the file tree takes the rest.
-fn diff_width(width: usize) -> usize {
+/// Opens `path` in `dir` at `line` in the user's editor, zoomed over this
+/// pane; quitting the editor comes back here, the diff already re-read.
+fn edit(herdr: &str, dir: &str, path: &str, line: usize) {
+    let Ok(me) = std::env::var("HERDR_PANE_ID") else {
+        return;
+    };
+    let _ = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", "baleen37.herdr-sim"])
+        .args(["--entrypoint", "edit", "--placement", "zoomed", "--focus"])
+        .args(["--target-pane", &me, "--cwd", dir])
+        .args(["--env", &format!("HERDR_SIM_EDIT_FILE={path}")])
+        .args(["--env", &format!("HERDR_SIM_EDIT_LINE={line}")])
+        .output();
+}
+
+/// The diff box's width; the file tree, if shown, takes the rest.
+fn diff_width(width: usize, tree_shown: bool) -> usize {
+    if !tree_shown {
+        return width;
+    }
     width.saturating_sub((width * 2 / 5).clamp(24, 36))
 }
 
@@ -358,20 +402,28 @@ fn edge(left: char, title: &str, right: char, width: usize, focused: bool) -> St
     format!("{DIM}{left}─{RESET}{style}{title}{RESET}{DIM}{fill}{right}{RESET}")
 }
 
-/// Draws the header, the diff and file boxes, and the key hints.
-#[allow(clippy::too_many_arguments)]
-fn draw(
-    title: &str,
-    files: &[File],
-    tree: &[(String, Option<usize>)],
+/// What the pane draws, beside the files themselves.
+#[derive(Clone, Copy)]
+struct View {
     selected: usize,
-    diff: &[Row],
     scroll: usize,
     focus: Focus,
+    tree_shown: bool,
     rows: usize,
     width: usize,
-) {
-    let dw = diff_width(width);
+}
+
+/// Draws the header, the diff and file boxes, and the key hints.
+fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[Row], view: View) {
+    let View {
+        selected,
+        scroll,
+        focus,
+        tree_shown,
+        rows,
+        width,
+    } = view;
+    let dw = diff_width(width, tree_shown);
     let fw = width - dw;
     let body = rows.saturating_sub(4);
     let (added, removed) = files
@@ -387,7 +439,11 @@ fn draw(
     let path = files.get(selected).map_or("Diff", |f| f.path.as_str());
     lines.push(
         edge('┌', path, '┐', dw, focus == Focus::Diff)
-            + &edge('┌', "Files", '┐', fw, focus == Focus::Files),
+            + &if tree_shown {
+                edge('┌', "Files", '┐', fw, focus == Focus::Files)
+            } else {
+                String::new()
+            },
     );
     let digits = diff
         .iter()
@@ -400,25 +456,35 @@ fn draw(
     let offset = list_offset(tree, selected, body);
     for i in 0..body {
         let left = match diff.get(scroll + i) {
-            Some(r) => diff_row(r, digits, dw - 2),
+            Some(r) => diff_row(r, digits, dw.saturating_sub(2)),
             None if i == 0 && files.is_empty() => format!("{DIM}no changes{RESET}"),
             None => String::new(),
         };
-        let right = match tree.get(offset + i) {
-            Some((dir, None)) => format!("{DIM}▾ {}{RESET}", cut(dir, fw - 4)),
-            Some((_, Some(f))) => tree_row(&files[*f], *f == selected, fw - 2),
-            None => String::new(),
+        let right = match tree.get(offset + i).filter(|_| tree_shown) {
+            Some((dir, None)) => format!("{DIM}▾ {}{RESET}", cut(dir, fw.saturating_sub(4))),
+            Some((_, Some(f))) => tree_row(&files[*f], *f == selected, fw.saturating_sub(2)),
+            _ => String::new(),
         };
         lines.push(format!(
-            "{DIM}│{RESET}{left}\x1b[{row};{dw}H{DIM}│{RESET}{DIM}│{RESET}{right}\x1b[{row};{width}H{DIM}│{RESET}",
+            "{DIM}│{RESET}{left}\x1b[{row};{dw}H{DIM}│{RESET}{}",
+            if tree_shown {
+                format!("{DIM}│{RESET}{right}\x1b[{};{width}H{DIM}│{RESET}", i + 3)
+            } else {
+                String::new()
+            },
             row = i + 3,
         ));
     }
-    lines.push(edge('└', "", '┘', dw, false) + &edge('└', "", '┘', fw, false));
-    let hints = if focus == Focus::Files {
-        "j/k file · tab diff · q back to Changes"
+    let bottom = if tree_shown {
+        edge('└', "", '┘', fw, false)
     } else {
-        "j/k scroll · f/F file · tab files · q back to Changes"
+        String::new()
+    };
+    lines.push(edge('└', "", '┘', dw, false) + &bottom);
+    let hints = if focus == Focus::Files {
+        "j/k file · e edit · z hide files · tab diff · q back to Changes"
+    } else {
+        "j/k scroll · f/F file · e edit · z files · tab · q back to Changes"
     };
     lines.push(format!(" {DIM}{hints}{RESET}"));
 
