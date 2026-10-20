@@ -634,21 +634,58 @@ pub fn held_status<'a>(
     }
 }
 
-/// A state token's value: the indent, the state's mark — `◐` working, `✓` a
-/// finished turn not yet seen, `?` a question, `○` idle, none when unknown —
-/// then the heading.
+/// The state's mark — `◐` working, `✓` a finished turn not yet seen, `?` a
+/// question, `○` idle — or none when Herdr cannot tell, rather than one that
+/// says idle.
+fn state_mark(status: &str) -> Option<&'static str> {
+    match status {
+        "working" => Some("◐"),
+        "done" => Some("✓"),
+        "blocked" => Some("?"),
+        "idle" => Some("○"),
+        _ => None,
+    }
+}
+
+/// A state token's value: the indent, the state's mark, then the heading.
 pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String {
     // The state leads, as Herdr's own state icon would: the heading then
     // stands alone in its row, so an indent before it opens no gap.
-    let mark = match status {
-        "working" => "◐",
-        "done" => "✓",
-        "blocked" => "?",
-        "idle" => "○",
-        // Herdr cannot tell: no mark rather than one that says idle.
-        _ => return format!("{}{heading}", indent(depth)),
-    };
-    format!("{}{mark} {heading}", indent(depth))
+    match state_mark(status) {
+        Some(mark) => format!("{}{mark} {heading}", indent(depth)),
+        None => format!("{}{heading}", indent(depth)),
+    }
+}
+
+/// The logo in a token of its own, as in herdr-radar: the logo says whose
+/// agent it is in its vendor's colour, and the title beside it, in a
+/// `$label_*` token, says what it is doing. Referenced as `$icon_claude` and
+/// `$icon_codex`, or `$icon_stale` for a session idle over two hours, so the
+/// whole row can dim. The value leads with the row's tree indent.
+pub const ICON_TOKENS: [&str; 3] = ["icon_claude", "icon_codex", "icon_stale"];
+
+/// Which of [`ICON_TOKENS`] holds an agent's logo.
+pub fn icon_token(kind: &str, stale: bool) -> String {
+    if stale {
+        "icon_stale".into()
+    } else {
+        format!("icon_{kind}")
+    }
+}
+
+/// `$heading_*` without the logo, for rows that put it in `$icon_*`:
+/// `$label_working` and so on, one per state heading token.
+pub fn state_label_token(state: &str) -> String {
+    state.replacen("heading", "label", 1)
+}
+
+/// A `$label_*` value: the state's mark and the title. `None` when there is
+/// neither, which clears the token.
+pub fn state_label_value(title: Option<&str>, status: &str) -> Option<String> {
+    match (state_mark(status), title) {
+        (Some(mark), Some(title)) => Some(format!("{mark} {title}")),
+        (mark, title) => mark.or(title).map(String::from),
+    }
 }
 
 /// What herdr-sim knows about one agent session.
@@ -1667,6 +1704,20 @@ mod tests {
         assert_eq!(state_heading_value("L", "blocked", 0), "? L");
         assert_eq!(state_heading_value("L Fix", "idle", 1), "\u{200b}  ○ L Fix");
         assert_eq!(state_heading_value("L Fix", "unknown", 0), "L Fix");
+    }
+
+    #[test]
+    fn label_is_the_mark_then_the_title_and_the_logo_stands_apart() {
+        assert_eq!(state_label_value(Some("Fix"), "done"), Some("✓ Fix".into()));
+        assert_eq!(state_label_value(None, "blocked"), Some("?".into()));
+        assert_eq!(
+            state_label_value(Some("Fix"), "unknown"),
+            Some("Fix".into())
+        );
+        assert_eq!(state_label_value(None, "unknown"), None);
+        assert_eq!(state_label_token("heading_idle_stale"), "label_idle_stale");
+        assert_eq!(icon_token("codex", false), "icon_codex");
+        assert_eq!(icon_token("claude", true), "icon_stale");
     }
 
     #[test]
