@@ -198,8 +198,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // stays put as the list changes.
     let mut items: Vec<Item> = Vec::new();
     let mut selected: Option<String> = None;
-    // Where a left drag started, as a line in the frame.
-    let mut drag_from: Option<usize> = None;
+    // Where the left button went down: its column and line in the frame.
+    let mut drag_from: Option<(usize, usize)> = None;
     let mut view = View {
         scroll: 0,
         rows: size().0,
@@ -369,15 +369,17 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                 // The link under the pointer is underlined; only the lines it
                 // leaves and enters are redrawn.
                 // A drag marks whole rows; letting go copies their text.
-                Ok(Event::Press(y)) => {
+                Ok(Event::Press { x, y }) => {
                     let line = y.saturating_sub(1) + view.scroll;
                     view.dragged = None;
-                    drag_from = Some(line);
+                    drag_from = Some((x, line));
                 }
+                // Leaving the row it started on makes it a drag, not a click.
                 Ok(Event::Drag(y)) => {
-                    if let Some(from) = drag_from {
+                    if let Some((_, from)) = drag_from {
                         let to = y.saturating_sub(1) + view.scroll;
-                        let range = Some((from.min(to), from.max(to)));
+                        let range = (to != from || view.dragged.is_some())
+                            .then_some((from.min(to), from.max(to)));
                         if range != view.dragged {
                             view.dragged = range;
                             draw(&last_frame, view, None);
@@ -385,10 +387,15 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     }
                 }
                 Ok(Event::Release) => {
-                    drag_from = None;
+                    let from = drag_from.take();
                     if let Some((first, last)) = view.dragged.take() {
                         copy(&plain_lines(&last_frame, first, last));
                         draw(&last_frame, view, None);
+                    } else if let Some((x, line)) = from
+                        && let Some(url) = targets.get(line).and_then(|t| t.at(x))
+                    {
+                        // A plain click opens what it is on, as Ctrl+click does.
+                        open_url(url);
                     }
                 }
                 Ok(Event::Hover { x, y }) => {
@@ -1073,7 +1080,10 @@ enum Event {
     /// A key pressed in the pane.
     Key(u8),
     /// Left button pressed or dragged, on a 1-based row, or released.
-    Press(usize),
+    Press {
+        x: usize,
+        y: usize,
+    },
     Drag(usize),
     Release,
 }
@@ -1116,11 +1126,10 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
             buf.clear();
             let n: Vec<usize> = seq.split(';').filter_map(|n| n.parse().ok()).collect();
             let event = match n[..] {
-                // Ctrl adds 16 to the button: links open on Ctrl+click only,
-                // so a plain click just focuses the pane.
+                // Ctrl adds 16 to the button: Ctrl+click opens at once.
                 [16, x, y] if press => Event::Click { x, y },
-                // A plain left drag selects rows to copy.
-                [0, _, y] if press => Event::Press(y),
+                // A plain click opens what it is on; a drag across rows copies.
+                [0, x, y] if press => Event::Press { x, y },
                 [32, _, y] => Event::Drag(y),
                 [0, ..] => Event::Release,
                 // Motion with no button (32 + 3), with or without Ctrl.
