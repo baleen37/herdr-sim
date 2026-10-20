@@ -24,7 +24,7 @@ const DONE_TTL: Duration = Duration::from_secs(600);
 
 const PLUGIN: &str = "baleen37.herdr-sim";
 /// The pane the panel starts on, set by the toggle.
-const FOR_PANE: &str = "HERDR_SIM_CHANGES_FOR";
+pub(crate) const FOR_PANE: &str = "HERDR_SIM_CHANGES_FOR";
 const ENTRYPOINT: &str = "changes";
 
 pub(crate) struct Pr {
@@ -135,23 +135,57 @@ fn changes_panes(herdr: &str, workspace: Option<&str>) -> Vec<String> {
 /// Width the panel aims for, in columns.
 const PANEL_COLS: f64 = 42.0;
 
-/// The `pane resize --amount` that brings `pane` down to about PANEL_COLS:
-/// the fraction of the tab's width to move its left edge by.
-fn shrink_amount(herdr: &str, pane: &str) -> Option<f64> {
-    let out = Command::new(herdr)
-        .args(["pane", "layout", "--pane", pane])
-        .output()
-        .ok()?;
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let layout = &v["result"]["layout"];
-    let area = layout["area"]["width"].as_f64()?;
-    let width = layout["panes"]
-        .as_array()?
-        .iter()
-        .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
-        .as_f64()?;
-    let amount = (width - PANEL_COLS) / area;
-    (amount > 0.0).then_some(amount)
+/// Names the pane a newly opened panel takes the place of; it waits for it
+/// to close before sizing itself.
+pub(crate) const REPLACES: &str = "HERDR_SIM_REPLACES";
+
+/// Waits, a second at most, for the pane in `REPLACES` to close.
+pub(crate) fn wait_gone(herdr: &str) {
+    let Ok(pane) = std::env::var(REPLACES) else {
+        return;
+    };
+    for _ in 0..20 {
+        let alive = Command::new(herdr)
+            .args(["pane", "get", &pane])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Moves `pane`'s left edge so it is about `target` columns wide, or half
+/// the tab when `None`.
+pub(crate) fn fit_width(herdr: &str, pane: &str, target: Option<f64>) {
+    let Some((width, area)) = (|| {
+        let out = Command::new(herdr)
+            .args(["pane", "layout", "--pane", pane])
+            .output()
+            .ok()?;
+        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+        let layout = &v["result"]["layout"];
+        let width = layout["panes"]
+            .as_array()?
+            .iter()
+            .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
+            .as_f64()?;
+        Some((width, layout["area"]["width"].as_f64()?))
+    })() else {
+        return;
+    };
+    let by = width - target.unwrap_or(area / 2.0);
+    if by.abs() < 1.0 {
+        return;
+    }
+    // `right` moves the edge right, narrowing the pane; `left` widens it.
+    let direction = if by > 0.0 { "right" } else { "left" };
+    let _ = Command::new(herdr)
+        .args(["pane", "resize", "--pane", pane, "--direction", direction])
+        .arg("--amount")
+        .arg(format!("{:.3}", by.abs() / area))
+        .output();
 }
 
 /// PR details by URL, with when they were fetched; `None` for details read
@@ -173,14 +207,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut prs = load_prs(&saved);
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
         // A side panel, not half the screen. Sized here, before the first
-        // frame, so nothing is drawn for the wider pane.
-        if let Some(amount) = shrink_amount(herdr, &pane) {
-            let _ = Command::new(herdr)
-                .args(["pane", "resize", "--pane", &pane, "--direction", "right"])
-                .arg("--amount")
-                .arg(format!("{amount:.3}"))
-                .output();
-        }
+        // frame, so nothing is drawn for the wider pane — once the diff pane
+        // it replaces has gone and left its space.
+        wait_gone(herdr);
+        fit_width(herdr, &pane, Some(PANEL_COLS));
         // Tell the toggle which pane is the panel in this workspace.
         if let Some(ws) = workspace_id() {
             let _ = std::fs::write(marker(state_dir, &ws), pane);
@@ -438,9 +468,12 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some(url) = url {
                                 open_url(url);
                             }
-                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i)) {
+                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i))
+                                && let Some(agent) =
+                                    last_agent.as_ref().and_then(|a| a["pane_id"].as_str())
+                            {
                                 let cwd = cwd.unwrap_or_else(|| home.display().to_string());
-                                view_diff(herdr, &source, &cwd);
+                                view_diff(herdr, &source, &cwd, agent);
                             }
                             None
                         }
@@ -902,17 +935,50 @@ fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
     Some((format!("pr:{}", item.pr.as_deref()?), None))
 }
 
-/// Opens the diff pane on `source` in `cwd`, zoomed over this one; quitting it
-/// closes the pane and brings the panel back.
-fn view_diff(herdr: &str, source: &str, cwd: &str) {
+/// Swaps this panel for the diff pane on `source`: the diff opens on the
+/// right half beside `agent`, and this panel closes. Quitting the diff brings
+/// the panel back.
+fn view_diff(herdr: &str, source: &str, cwd: &str, agent: &str) {
     let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
         return;
     };
+    let opened = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
+        .args([
+            "--entrypoint",
+            "diff",
+            "--placement",
+            "split",
+            "--direction",
+            "right",
+        ])
+        .args(["--focus", "--target-pane", agent, "--cwd", cwd])
+        .args(["--env", &format!("{}={source}", crate::diff::SOURCE)])
+        .args(["--env", &format!("{FOR_PANE}={agent}")])
+        .args(["--env", &format!("{REPLACES}={pane}")])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if opened {
+        // Ends this process too.
+        let _ = Command::new(herdr).args(["pane", "close", &pane]).output();
+    }
+}
+
+/// Opens the Changes panel beside `agent` in place of `replaces`.
+pub(crate) fn reopen(herdr: &str, agent: &str, replaces: &str) {
     let _ = Command::new(herdr)
         .args(["plugin", "pane", "open", "--plugin", PLUGIN])
-        .args(["--entrypoint", "diff", "--placement", "zoomed", "--focus"])
-        .args(["--target-pane", &pane, "--cwd", cwd])
-        .args(["--env", &format!("{}={source}", crate::diff::SOURCE)])
+        .args([
+            "--entrypoint",
+            ENTRYPOINT,
+            "--placement",
+            "split",
+            "--direction",
+            "right",
+        ])
+        .args(["--focus", "--target-pane", agent])
+        .args(["--env", &format!("{FOR_PANE}={agent}")])
+        .args(["--env", &format!("{REPLACES}={replaces}")])
         .output();
 }
 

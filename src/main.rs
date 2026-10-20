@@ -75,7 +75,7 @@ fn main() -> Result<()> {
         return changes::run(&herdr_bin, &home, &state_dir);
     }
     if env::args().any(|a| a == "--diff-pane") {
-        return diff::run();
+        return diff::run(&herdr_bin);
     }
     if env::args().any(|a| a == "--toggle-changes") {
         return changes::toggle(&herdr_bin, &state_dir);
