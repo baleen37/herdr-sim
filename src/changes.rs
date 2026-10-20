@@ -228,6 +228,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // stays put as the list changes.
     let mut items: Vec<Item> = Vec::new();
     let mut selected: Option<String> = None;
+    let mut pending_g = false;
     // Where the left button went down: its column and line in the frame.
     let mut drag_from: Option<(usize, usize)> = None;
     let mut view = View {
@@ -448,7 +449,19 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     let at = selected
                         .as_ref()
                         .and_then(|key| items.iter().position(|i| &i.key == key));
+                    // gg: a first g waits for the second.
+                    let after_g = std::mem::take(&mut pending_g);
+                    // Ctrl-d/u move half a screen of rows.
+                    let half = (view.rows / 4).max(1);
                     let to = match (key, at) {
+                        (b'g', _) if !after_g => {
+                            pending_g = true;
+                            None
+                        }
+                        (b'g', _) => items.first(),
+                        (b'G', _) => items.last(),
+                        (4, Some(i)) => items.get((i + half).min(items.len().saturating_sub(1))),
+                        (21, Some(i)) => items.get(i.saturating_sub(half)),
                         (b'j', Some(i)) => items.get(i + 1),
                         (b'k', Some(i)) => i.checked_sub(1).and_then(|i| items.get(i)),
                         // Nothing selected yet: the first or last row on screen.

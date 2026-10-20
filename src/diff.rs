@@ -97,6 +97,7 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     let mut scroll = 0usize;
     let mut focus = Focus::Files;
     let mut tree_shown = true;
+    let mut pending_g = false;
     // The selected file's highlighted lines, kept until it or the diff
     // changes: highlighting is the costly part of a frame.
     let mut shown: Option<(usize, Vec<Shown>)> = None;
@@ -145,8 +146,20 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                 *scroll = 0;
             }
         };
-        match events.recv_timeout(WATCH) {
+        let event = events.recv_timeout(WATCH);
+        // gg: a first g waits for the second.
+        let after_g = std::mem::take(&mut pending_g);
+        match event {
             Ok(Event::Key(b'q')) => break,
+            Ok(Event::Key(b'g')) if !after_g => pending_g = true,
+            // gg / G: the first or last file in the tree, the top or end of
+            // the diff.
+            Ok(Event::Key(b'g')) if focus == Focus::Files => pick(0, &mut selected, &mut scroll),
+            Ok(Event::Key(b'g')) => scroll = 0,
+            Ok(Event::Key(b'G')) if focus == Focus::Files => {
+                pick(files.len().saturating_sub(1), &mut selected, &mut scroll)
+            }
+            Ok(Event::Key(b'G')) => scroll = usize::MAX,
             // e: the file in the editor, at the first line on screen.
             Ok(Event::Key(b'e')) => {
                 if let (Some(dir), Some(file)) =
@@ -181,8 +194,23 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             }
             Ok(Event::Key(b'j')) => scroll += 1,
             Ok(Event::Key(b'k')) => scroll = scroll.saturating_sub(1),
-            Ok(Event::Key(4 | b' ')) => scroll += body / 2,
-            Ok(Event::Key(21)) => scroll = scroll.saturating_sub(body / 2),
+            // Vim's scrolling, wherever the focus: Ctrl-d/u (or d/u) half a
+            // screen, Ctrl-f/b (or space) a screen, Ctrl-e/y a line; ]/[
+            // the next or previous hunk.
+            Ok(Event::Key(4 | b'd')) => scroll += body / 2,
+            Ok(Event::Key(21 | b'u')) => scroll = scroll.saturating_sub(body / 2),
+            Ok(Event::Key(6 | b' ')) => scroll += body,
+            Ok(Event::Key(2)) => scroll = scroll.saturating_sub(body),
+            Ok(Event::Key(5)) => scroll += 1,
+            Ok(Event::Key(25)) => scroll = scroll.saturating_sub(1),
+            Ok(Event::Key(b']')) => {
+                let next = (scroll + 1..diff.len()).find(|&i| diff[i].row.kind == Kind::Hunk);
+                scroll = next.unwrap_or(scroll);
+            }
+            Ok(Event::Key(b'[')) => {
+                let prev = (0..scroll).rev().find(|&i| diff[i].row.kind == Kind::Hunk);
+                scroll = prev.unwrap_or(0);
+            }
             // f / F: the next or previous file, whichever box has focus.
             Ok(Event::Key(b'f')) => pick(selected + 1, &mut selected, &mut scroll),
             Ok(Event::Key(b'F')) => pick(selected.saturating_sub(1), &mut selected, &mut scroll),
@@ -617,9 +645,9 @@ fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[S
     };
     lines.push(edge('└', "", '┘', dw, false) + &bottom);
     let hints = if focus == Focus::Files {
-        "j/k file · e edit · z hide files · tab diff · q back to Changes"
+        "j/k file · gg/G · ^d/^u scroll · e edit · z hide · tab diff · q"
     } else {
-        "j/k scroll · f/F file · e edit · z files · tab · q back to Changes"
+        "j/k · ^d/^u · gg/G · ]/[ hunk · f/F file · e edit · z · tab · q"
     };
     lines.push(format!(" {DIM}{hints}{RESET}"));
 
