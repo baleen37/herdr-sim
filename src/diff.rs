@@ -734,7 +734,9 @@ fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[S
         out += &format!("\x1b[{};1H\x1b[K{line}", i + 1);
     }
     let mut stdout = io::stdout();
-    let _ = stdout.write_all(out.as_bytes());
+    // One synchronized update (DEC mode 2026): terminals that know it show
+    // the frame whole, never half drawn.
+    let _ = stdout.write_all(format!("\x1b[?2026h{out}\x1b[?2026l").as_bytes());
     let _ = stdout.flush();
 }
 

@@ -57,6 +57,10 @@ struct Run {
 }
 
 fn main() -> Result<()> {
+    // Every git this plugin runs only reads: never take the index lock an
+    // agent's own git may want (git status's --no-optional-locks).
+    // SAFETY: set before any thread starts.
+    unsafe { env::set_var("GIT_OPTIONAL_LOCKS", "0") };
     let event = env::var("HERDR_PLUGIN_EVENT").ok();
     let mut scope = scope(
         event.as_deref(),
