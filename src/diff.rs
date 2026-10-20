@@ -177,7 +177,14 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                     let line = diff[scroll..]
                         .iter()
                         .find(|r| r.row.kind != Kind::Hunk)
-                        .map_or(1, |r| r.row.new.max(r.row.old).max(1));
+                        // The working tree's number; a removed line has none.
+                        .map_or(1, |r| {
+                            if r.row.new > 0 {
+                                r.row.new
+                            } else {
+                                r.row.old.max(1)
+                            }
+                        });
                     edit(herdr, dir, &file.path, line);
                 }
             }
@@ -315,31 +322,35 @@ fn fingerprint(dir: &str, files: &[File]) -> u64 {
 }
 
 /// The unified diff `source` names, split into files.
+/// In path order, as the tree shows them, so keys move through the tree.
 fn read(source: &str) -> Vec<File> {
-    if let Some(dir) = source.strip_prefix("checkout:") {
-        return parse(&checkout_diff(dir));
-    }
-    let Some(url) = source.strip_prefix("pr:") else {
-        return Vec::new();
+    let mut files = if let Some(dir) = source.strip_prefix("checkout:") {
+        parse(&checkout_diff(dir))
+    } else if let Some(url) = source.strip_prefix("pr:") {
+        crate::gh(&["pr", "diff", url, "--color", "never"], None)
+            .map_or_else(Vec::new, |o| parse(&String::from_utf8_lossy(&o.stdout)))
+    } else {
+        Vec::new()
     };
-    crate::gh(&["pr", "diff", url, "--color", "never"], None)
-        .map_or_else(Vec::new, |o| parse(&String::from_utf8_lossy(&o.stdout)))
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
 }
 
 /// The checkout's uncommitted changes against `HEAD`, new untracked files
 /// included, as one unified diff.
 fn checkout_diff(dir: &str) -> String {
+    // Paths as they are, not C-quoted, so non-ASCII names parse.
     let git = |args: &[&str]| {
         Command::new("git")
-            .arg("-C")
-            .arg(dir)
+            .args(["-c", "core.quotePath=false", "-C", dir])
             .args(args)
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default()
     };
     let mut diff = git(&["diff", "HEAD", "--no-color", "--no-ext-diff"]);
-    for file in git(&["ls-files", "--others", "--exclude-standard"]).lines() {
+    let untracked = git(&["ls-files", "-z", "--others", "--exclude-standard"]);
+    for file in untracked.split('\0').filter(|f| !f.is_empty()) {
         diff += &git(&["diff", "--no-index", "--no-color", "--", "/dev/null", file]);
     }
     diff
@@ -352,7 +363,8 @@ fn parse(diff: &str) -> Vec<File> {
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             // `a/path b/path`; the `+++` line, if any, names it better.
-            let path = rest.split(" b/").last().unwrap_or(rest).to_string();
+            let path = rest.rsplit(" b/").next().unwrap_or(rest);
+            let path = clean(&unquote(path.trim_start_matches("\"b/")));
             files.push(File {
                 path,
                 status: 'M',
@@ -373,17 +385,22 @@ fn parse(diff: &str) -> Vec<File> {
                 file.status = 'D';
             } else if line.starts_with("rename from") {
                 file.status = 'R';
-            } else if let Some(path) = line.strip_prefix("+++ b/") {
-                file.path = path.to_string();
-            } else if let Some(path) = line.strip_prefix("--- a/")
+            } else if let Some(path) = line
+                .strip_prefix("+++ b/")
+                .or_else(|| line.strip_prefix("+++ \"b/"))
+            {
+                file.path = clean(&unquote(path));
+            } else if let Some(path) = line
+                .strip_prefix("--- a/")
+                .or_else(|| line.strip_prefix("--- \"a/"))
                 && file.status == 'D'
             {
-                file.path = path.to_string();
+                file.path = clean(&unquote(path));
             }
             continue;
         }
         // Tabs stay: TSV columns are split on them; drawing expands them.
-        let text = line.get(1..).unwrap_or("").to_string();
+        let text = clean(line.get(1..).unwrap_or(""));
         let row = |kind, old, new, text| Row {
             kind,
             old,
@@ -420,6 +437,53 @@ fn parse(diff: &str) -> Vec<File> {
     files
 }
 
+/// `text` safe to draw: control characters (bar tab) become `�`, so a file
+/// cannot send escape sequences to the terminal or break the layout.
+fn clean(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() && c != '\t' {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// A path git C-quoted (the rest of `"…"`, opening quote already gone):
+/// octal byte escapes and `\"`, `\\`, `\t`, `\n` undone. Others as is.
+fn unquote(path: &str) -> String {
+    let Some(inner) = path.strip_suffix('"') else {
+        return path.to_string();
+    };
+    let mut bytes = Vec::new();
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(d @ b'0'..=b'7') => {
+                let mut n = u32::from(d - b'0');
+                for _ in 0..2 {
+                    if let Some(&d @ b'0'..=b'7') = chars.peek() {
+                        n = n * 8 + u32::from(d - b'0');
+                        chars.next();
+                    }
+                }
+                bytes.push(n as u8);
+            }
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'n') => bytes.push(b'\n'),
+            Some(other) => bytes.push(other),
+            None => {}
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 /// The first line number in a hunk header's `-12,3` or `+12,3`.
 fn start(range: Option<&str>) -> usize {
     range
@@ -440,6 +504,39 @@ fn edit(herdr: &str, dir: &str, path: &str, line: usize) {
         .args(["--env", &format!("HERDR_SIM_EDIT_FILE={path}")])
         .args(["--env", &format!("HERDR_SIM_EDIT_LINE={line}")])
         .output();
+}
+
+/// The `edit` pane: the file in the user's editor at the line. The login
+/// shell gives PATH, VISUAL and EDITOR as the user set them, whatever the
+/// shell is; the editor itself runs without a shell, so no quoting matters.
+pub fn edit_pane() -> anyhow::Result<()> {
+    let file = std::env::var("HERDR_SIM_EDIT_FILE")?;
+    let line = std::env::var("HERDR_SIM_EDIT_LINE").unwrap_or_else(|_| "1".into());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let login = Command::new(&shell)
+        .args(["-l", "-c", "env"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let var = |name: &str| {
+        login
+            .lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix('=').map(String::from))
+            .or_else(|| std::env::var(name).ok())
+            .filter(|v| !v.is_empty())
+    };
+    let editor = var("VISUAL")
+        .or_else(|| var("EDITOR"))
+        .unwrap_or_else(|| "vi".into());
+    let mut words = editor.split_whitespace();
+    let program = words.next().unwrap_or("vi");
+    let mut command = Command::new(program);
+    command.args(words).arg(format!("+{line}")).arg(&file);
+    if let Some(path) = var("PATH") {
+        command.env("PATH", path);
+    }
+    command.status()?;
+    Ok(())
 }
 
 /// The diff box's width; the file tree, if shown, takes the rest.
@@ -818,6 +915,16 @@ fn tree_row(file: &File, selected: bool, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_paths_and_control_characters() {
+        let diff = "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\n\
+                    --- \"a/caf\\303\\251.txt\"\n+++ \"b/caf\\303\\251.txt\"\n\
+                    @@ -1 +1 @@\n-a\n+b\u{1b}]52;c;x\u{7}\n";
+        let files = parse(diff);
+        assert_eq!(files[0].path, "café.txt");
+        assert_eq!(files[0].rows[2].text, "b\u{fffd}]52;c;x\u{fffd}");
+    }
 
     #[test]
     fn tsv_keeps_its_tabs_to_split_columns() {

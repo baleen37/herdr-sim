@@ -69,12 +69,12 @@ placement = "zoomed"
 command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --diff-pane"]
 
 # `e` in the diff pane: the file in the user's editor, at the line, zoomed
-# over the diff. A login shell, for EDITOR and PATH.
+# over the diff.
 [[panes]]
 id = "edit"
 title = "Edit"
 placement = "zoomed"
-command = ["sh", "-c", "exec \"${SHELL:-/bin/sh}\" -lc '${VISUAL:-${EDITOR:-vi}} +\"$HERDR_SIM_EDIT_LINE\" \"$HERDR_SIM_EDIT_FILE\"'"]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --edit-pane"]
 
 [[actions]]
 id = "toggle-changes"

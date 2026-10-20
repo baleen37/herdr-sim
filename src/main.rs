@@ -79,6 +79,9 @@ fn main() -> Result<()> {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         return changes::run(&herdr_bin, &home, &state_dir);
     }
+    if env::args().any(|a| a == "--edit-pane") {
+        return diff::edit_pane();
+    }
     if env::args().any(|a| a == "--diff-pane") {
         return diff::run(&herdr_bin);
     }
