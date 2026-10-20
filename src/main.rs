@@ -30,10 +30,10 @@ use herdr_sim::{
     TREE_GAP_TOKEN, TREE_GROUP_PROJECT_STALE_TOKEN, TREE_GROUP_PROJECT_TOKEN,
     TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_TOKEN, TREE_PR_TOKEN, TREE_PROJECT_TOKEN,
     TREE_SPLIT_TOKEN, TREE_WORKTREE_TOKEN, activity_order, age_value, agent_count_value,
-    agent_icon, checkout_headers, claude_session, codex_session, diff_value, group_rows,
-    header_value, heading_value, held_status, indent, project_name, resolve_claude_session, scope,
-    split_marks, state_heading_token, state_heading_value, summary_value, token_value,
-    tree_headers, workspace_agent_token,
+    agent_icon, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
+    group_rows, header_value, heading_value, held_status, indent, project_name,
+    resolve_claude_session, scope, split_marks, state_heading_token, state_heading_value,
+    summary_value, token_value, tree_headers, workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -223,9 +223,16 @@ impl Run {
             };
             // The indent goes on the row's first cell: the split mark when
             // there is one, else the heading.
-            let split = marks[pos].map(|mark| format!("{}{mark}", indent(row.depth)));
+            // Herdr indents every row of an entry but its first. A session
+            // under a checkout's header row sits indented already; one
+            // without (a second session of that checkout) would start at the
+            // edge, so it gets the same indent itself.
+            // The indent leads the row: in the split mark's cell if there is
+            // one, else in the heading, which then carries the state mark.
+            let depth = usize::from(header.is_none());
+            let split = marks[pos].map(|mark| format!("{}{mark}", indent(depth)));
             self.cache
-                .set_depth(pane, if split.is_some() { 0 } else { row.depth });
+                .set_depth(pane, if split.is_some() { 0 } else { depth });
             let fade = |stale: bool, header: Option<String>| {
                 if stale {
                     (None, header)
@@ -373,7 +380,7 @@ impl Run {
             (BRANCH_TOKEN.to_string(), branch),
         ];
         // The logo needs no session; the PRs and title do, so leave those be.
-        let Some(session) = agent["agent_session"]["value"].as_str() else {
+        if agent["agent_session"]["value"].as_str().is_none() {
             let heading = self
                 .cache
                 .heading(pane)
@@ -382,12 +389,10 @@ impl Run {
             tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
             self.report("pane", pane, "agent", None, &tokens);
             return;
-        };
-        let session = if kind == "claude" {
-            let session = resolve_claude_session(&self.home, session);
-            claude_session(&self.home, &session, &mut self.cache)
-        } else {
-            codex_session(&self.home, session, &mut self.cache)
+        }
+        // The same session lookup as the state pass, name fallback included.
+        let Some(session) = self.session_of(agent) else {
+            return;
         };
         let mut counts: HashMap<PrState, usize> = HashMap::new();
         for url in &session.prs {
@@ -506,8 +511,14 @@ impl Run {
         let kind = agent["agent"].as_str()?;
         let session = agent["agent_session"]["value"].as_str()?;
         Some(if kind == "claude" {
-            let session = resolve_claude_session(&self.home, session);
-            claude_session(&self.home, &session, &mut self.cache)
+            let resolved = resolve_claude_session(&self.home, session);
+            let mut found = claude_session(&self.home, &resolved, &mut self.cache);
+            // No title and no question yet: Claude Code's own name for it,
+            // rather than a bare logo.
+            if found.title.is_none() {
+                found.title = claude_session_name(&self.home, session);
+            }
+            found
         } else {
             codex_session(&self.home, session, &mut self.cache)
         })
