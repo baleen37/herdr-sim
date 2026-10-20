@@ -98,17 +98,26 @@ or opened.
 
 ## Changes panel
 
-Claude Code's "Changes" panel as a right-hand split: the PRs the focused agent's
-session touched, newest first — state icon, title (a link), repo and number,
-lines changed, comments and checks. It starts on the pane the key was pressed
-in and then follows focus between agent panes. Open PRs are refetched every 30
-seconds while it is open, merged and closed ones every 10 minutes, all in one
-GraphQL call; the last details are saved, so a reopened panel draws at once.
+Claude Code's "Changes" panel as a right-hand split.
 
-When the focused checkout has uncommitted changes, a row above the PRs shows
-the repo and `+12 -3` with a `Create PR` link to GitHub's compare page for the
-branch. The panel opens about 42 columns wide without taking focus; the same
-key closes it.
+- **Rows.** Above, a `± repo +12 -3` row for each checkout the session worked
+  in that has uncommitted changes. Below, the PRs the session touched, newest
+  first: state icon, title, repo and number, lines changed, comments, checks.
+  An approved open PR shows a green check. Running checks show a pulsing grey
+  dot and `8/11`.
+- **Focus.** It starts on the pane the key was pressed in, then follows the
+  focused agent in its own workspace.
+- **Keys.** `j`/`k` move between rows. `Enter` opens the row, `p` its PR, `d`
+  its files, `c` its latest comment.
+- **Mouse.** A click opens what it is on: the repo, the PR, its files,
+  comments, or checks. The wheel scrolls. A drag across rows copies their
+  text.
+- **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
+  every 10 minutes, all in one GraphQL call. The last details are saved, so a
+  reopened panel draws at once. Calls back off when GitHub's rate limit is
+  near.
+
+The panel opens about 42 columns wide and focused; the same key closes it.
 
 ```toml
 [[keys.command]]
