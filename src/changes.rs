@@ -1178,6 +1178,8 @@ pub(crate) enum Event {
     },
     /// A key pressed in the pane.
     Key(u8),
+    /// Work finished off the drawing thread; draw again.
+    Wake,
     /// Left button pressed or dragged, on a 1-based row, or released.
     Press {
         x: usize,

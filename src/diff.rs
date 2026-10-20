@@ -4,9 +4,15 @@
 //! right half of the tab; `q` swaps the panel back.
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use std::time::Duration;
+
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
 
 use crate::changes::{
     DIM, Event, FOR_PANE, GREEN, RED, RESET, SELECTED, cols, cut, fit_width, listen_for_clicks,
@@ -26,7 +32,7 @@ const ADDED_BG: &str = "\x1b[48;2;33;58;43m";
 const REMOVED_BG: &str = "\x1b[48;2;63;34;44m";
 
 /// One file of a unified diff.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct File {
     path: String,
     /// `M`odified, `A`dded, `D`eleted or `R`enamed.
@@ -37,7 +43,7 @@ struct File {
 }
 
 /// A line of a file's diff, with its numbers in the old and new file.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 struct Row {
     kind: Kind,
     old: usize,
@@ -71,17 +77,56 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
         fit_width(herdr, me, None);
     }
     let (events_in, events) = mpsc::channel::<Event>();
+    let wake = events_in.clone();
     listen_for_clicks(events_in);
-    let title = title(&source);
+    // Loading the syntaxes takes a moment; start now, off this thread.
+    std::thread::spawn(|| {
+        highlighting();
+    });
+    // Highlighted lines come back from a worker, for a file and the version
+    // of the diff they were made from.
+    let (coloured_in, coloured) = mpsc::channel::<(usize, u64, Vec<Shown>)>();
+    let mut version = 0u64;
+    // The title and the diff come from separate git or gh calls; ask both at
+    // once.
+    let asked = source.clone();
+    let title = std::thread::spawn(move || title(&asked));
     let mut files = read(&source);
+    let title = title.join().unwrap_or_default();
     let mut selected = 0usize;
     let mut scroll = 0usize;
     let mut focus = Focus::Files;
     let mut tree_shown = true;
+    // The selected file's highlighted lines, kept until it or the diff
+    // changes: highlighting is the costly part of a frame.
+    let mut shown: Option<(usize, Vec<Shown>)> = None;
     loop {
         let (rows, width) = size();
         let body = rows.saturating_sub(4);
-        let diff = files.get(selected).map(diff_lines).unwrap_or_default();
+        while let Ok((at, made_from, lines)) = coloured.try_recv() {
+            if at == selected && made_from == version {
+                shown = Some((at, lines));
+            }
+        }
+        // A file not shown yet: plain at once, highlighted when ready.
+        if shown.as_ref().is_none_or(|(at, _)| *at != selected) {
+            let file = files.get(selected).cloned();
+            shown = Some((
+                selected,
+                file.as_ref()
+                    .map(|f| diff_lines(f, false))
+                    .unwrap_or_default(),
+            ));
+            if let Some(file) = file {
+                let (done, wake, at, made_from) =
+                    (coloured_in.clone(), wake.clone(), selected, version);
+                std::thread::spawn(move || {
+                    let _ = done.send((at, made_from, diff_lines(&file, true)));
+                    let _ = wake.send(Event::Wake);
+                });
+            }
+        }
+        let diff = shown.as_ref().map_or(&[][..], |(_, lines)| &lines[..]);
         scroll = scroll.min(diff.len().saturating_sub(body / 2));
         let tree = tree(&files);
         let view = View {
@@ -92,7 +137,7 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             rows,
             width,
         };
-        draw(&title, &files, &tree, &diff, view);
+        draw(&title, &files, &tree, diff, view);
         // A file picked in the list shows its diff from the top.
         let pick = |to: usize, selected: &mut usize, scroll: &mut usize| {
             if to < files.len() && to != *selected {
@@ -109,8 +154,8 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                 {
                     let line = diff[scroll..]
                         .iter()
-                        .find(|r| r.kind != Kind::Hunk)
-                        .map_or(1, |r| r.new.max(r.old).max(1));
+                        .find(|r| r.row.kind != Kind::Hunk)
+                        .map_or(1, |r| r.row.new.max(r.row.old).max(1));
                     edit(herdr, dir, &file.path, line);
                 }
             }
@@ -156,7 +201,12 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             }
             Ok(_) => {}
             Err(_) if source.starts_with("checkout:") => {
-                files = read(&source);
+                let fresh = read(&source);
+                if fresh != files {
+                    files = fresh;
+                    shown = None;
+                    version += 1;
+                }
                 selected = selected.min(files.len().saturating_sub(1));
             }
             Err(_) => {}
@@ -332,9 +382,38 @@ fn diff_width(width: usize, tree_shown: bool) -> usize {
     width.saturating_sub((width * 2 / 5).clamp(24, 36))
 }
 
+/// A diff line as drawn: the row, and its text split into coloured runs.
+struct Shown {
+    row: Row,
+    spans: Vec<(String, String)>,
+}
+
+/// The syntaxes and colour theme highlighting uses, loaded once.
+fn highlighting() -> &'static (SyntaxSet, Theme) {
+    static LOADED: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let themes = ThemeSet::load_defaults();
+        let theme = themes.themes["base16-ocean.dark"].clone();
+        (SyntaxSet::load_defaults_newlines(), theme)
+    })
+}
+
 /// A file's diff as reviewr shows it: unchanged runs summarised, each line
-/// with its number, changed ones marked.
-fn diff_lines(file: &File) -> Vec<Row> {
+/// with its number, its text highlighted for the file's language when
+/// `colour`.
+fn diff_lines(file: &File, colour: bool) -> Vec<Shown> {
+    let mut colours = colour.then(|| {
+        let (syntaxes, theme) = highlighting();
+        let syntax = Path::new(&file.path)
+            .extension()
+            .and_then(|e| syntaxes.find_syntax_by_extension(&e.to_string_lossy()))
+            .or_else(|| {
+                let name = file.path.rsplit('/').next().unwrap_or(&file.path);
+                syntaxes.find_syntax_by_extension(name)
+            })
+            .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
+        (HighlightLines::new(syntax, theme), syntaxes)
+    });
     let mut out = Vec::new();
     // Where the new file's lines stand after the last hunk shown.
     let mut next = 1;
@@ -342,11 +421,15 @@ fn diff_lines(file: &File) -> Vec<Row> {
         if row.kind == Kind::Hunk {
             let skipped = row.new.saturating_sub(next);
             if skipped > 0 {
-                out.push(Row {
+                let row = Row {
                     kind: Kind::Hunk,
                     old: 0,
                     new: skipped,
                     text: String::new(),
+                };
+                out.push(Shown {
+                    row,
+                    spans: Vec::new(),
                 });
             }
             continue;
@@ -354,14 +437,66 @@ fn diff_lines(file: &File) -> Vec<Row> {
         if row.kind != Kind::Removed {
             next = row.new + 1;
         }
-        out.push(Row {
-            kind: row.kind,
-            old: row.old,
-            new: row.new,
-            text: row.text.clone(),
+        // Old and new lines run through one highlighter in diff order: close
+        // enough for a diff, and what a reader sees.
+        let plain = || vec![(String::new(), row.text.clone())];
+        let Some((colours, syntaxes)) = colours.as_mut() else {
+            out.push(Shown {
+                row: row.clone(),
+                spans: plain(),
+            });
+            continue;
+        };
+        let line = format!("{}\n", row.text);
+        let spans = colours
+            .highlight_line(&line, syntaxes)
+            .map(|runs| {
+                runs.into_iter()
+                    .map(|(style, text)| {
+                        let c = style.foreground;
+                        (
+                            format!("\x1b[38;2;{};{};{}m", c.r, c.g, c.b),
+                            text.trim_end_matches('\n').to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|_| plain());
+        out.push(Shown {
+            row: Row {
+                kind: row.kind,
+                old: row.old,
+                new: row.new,
+                text: row.text.clone(),
+            },
+            spans,
         });
     }
     out
+}
+
+/// Coloured runs cut to `width` columns, each run's colour on `bg`; and the
+/// columns used.
+fn paint(spans: &[(String, String)], width: usize, bg: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut used = 0;
+    for (colour, text) in spans {
+        out += &format!("{colour}{bg}");
+        for c in text.chars() {
+            let w = if c.is_ascii() {
+                1
+            } else {
+                cols(&c.to_string())
+            };
+            if used + w > width {
+                out += "…";
+                return (out + RESET, width);
+            }
+            out.push(c);
+            used += w;
+        }
+    }
+    (out + RESET, used)
 }
 
 /// The changed files as a tree: a row per folder, then its files, each row
@@ -414,7 +549,7 @@ struct View {
 }
 
 /// Draws the header, the diff and file boxes, and the key hints.
-fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[Row], view: View) {
+fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[Shown], view: View) {
     let View {
         selected,
         scroll,
@@ -447,7 +582,7 @@ fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[R
     );
     let digits = diff
         .iter()
-        .map(|r| r.old.max(r.new))
+        .map(|r| r.row.old.max(r.row.new))
         .max()
         .unwrap_or(0)
         .to_string()
@@ -499,24 +634,28 @@ fn draw(title: &str, files: &[File], tree: &[(String, Option<usize>)], diff: &[R
 
 /// One diff line, `width` columns wide: changed lines get a bar and a tint,
 /// and every line its number.
-fn diff_row(row: &Row, digits: usize, width: usize) -> String {
+fn diff_row(shown: &Shown, digits: usize, width: usize) -> String {
+    let row = &shown.row;
     let text_cols = width.saturating_sub(digits + 3);
-    let text = cut(&row.text, text_cols);
     match row.kind {
         Kind::Hunk => format!(
             "  {DIM}⋯  {} unmodified line{}{RESET}",
             row.new,
             if row.new == 1 { "" } else { "s" }
         ),
-        Kind::Context => format!(" {DIM}{:>digits$}{RESET}  {text}", row.new),
+        Kind::Context => {
+            let (text, _) = paint(&shown.spans, text_cols, "");
+            format!(" {DIM}{:>digits$}{RESET}  {text}", row.new)
+        }
         Kind::Added | Kind::Removed => {
             let (bar, bg, number) = if row.kind == Kind::Added {
                 (GREEN, ADDED_BG, row.new)
             } else {
                 (RED, REMOVED_BG, row.old)
             };
-            let pad = " ".repeat(text_cols.saturating_sub(cols(&text)));
-            format!("{bar}▌{RESET}{bg}{DIM}{number:>digits$}{RESET}{bg}  {text}{pad}{RESET}")
+            let (text, used) = paint(&shown.spans, text_cols, bg);
+            let pad = " ".repeat(text_cols.saturating_sub(used));
+            format!("{bar}▌{RESET}{bg}{DIM}{number:>digits$}{RESET}{bg}  {text}{bg}{pad}{RESET}")
         }
     }
 }
