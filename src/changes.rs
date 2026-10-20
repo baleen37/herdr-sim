@@ -201,8 +201,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
     let mut targets: Vec<Target> = Vec::new();
-    // Lines scrolled off the top.
+    // Lines scrolled off the top, and the link under the pointer: its line
+    // in the frame and columns.
     let mut scroll = 0usize;
+    let mut hover: Option<(usize, usize, usize)> = None;
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -277,7 +279,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         // Redraw only on change: no flicker, no work for the terminal.
         if frame != last_frame {
             scroll = scroll.min(max_scroll(&frame));
-            draw(&frame, scroll, 0);
+            draw(&frame, scroll, 0, hover);
             last_frame = frame;
         }
         // Wake early when GitHub answers or a click comes, so either shows at
@@ -296,14 +298,27 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         .min(max_scroll(&last_frame));
                     if to != scroll {
                         scroll = to;
-                        draw(&last_frame, scroll, step);
+                        hover = None;
+                        draw(&last_frame, scroll, step, hover);
+                    }
+                }
+                // The link under the pointer is underlined.
+                Ok(Event::Hover { x, y }) => {
+                    let line = y.saturating_sub(1) + scroll;
+                    let to = targets
+                        .get(line)
+                        .and_then(|t| t.span(x))
+                        .map(|(start, end)| (line, start, end));
+                    if to != hover {
+                        hover = to;
+                        draw(&last_frame, scroll, step, hover);
                     }
                 }
                 Ok(event) => break Some(event),
                 Err(_) if Instant::now() >= deadline => break None,
                 Err(_) => {
                     step += 1;
-                    draw(&last_frame, scroll, step);
+                    draw(&last_frame, scroll, step, hover);
                 }
             }
         };
@@ -662,6 +677,20 @@ impl Target {
         }
     }
 
+    /// The columns `[start, end)` of the link at column `x`.
+    fn span(&self, x: usize) -> Option<(usize, usize)> {
+        match self
+            .spans
+            .iter()
+            .find(|(start, end, _)| (*start..*end).contains(&x))
+        {
+            Some((start, end, _)) => Some((*start, *end)),
+            // A line of parts underlines only its parts.
+            None if self.spans.is_empty() => self.rest.as_ref().map(|_| (1, usize::MAX)),
+            None => None,
+        }
+    }
+
     /// The link at column `x`.
     fn at(&self, x: usize) -> Option<&str> {
         self.spans
@@ -689,20 +718,66 @@ fn max_scroll(frame: &str) -> usize {
 /// Draws what of `frame` fits the pane from line `scroll`, pulsing dots at
 /// `step`: line by line over the last frame, each cleared to its end, so
 /// nothing flickers.
-fn draw(frame: &str, scroll: usize, step: usize) {
+fn draw(frame: &str, scroll: usize, step: usize, hover: Option<(usize, usize, usize)>) {
     let grey = PULSE_GREYS[step % PULSE_GREYS.len()];
     let dot = format!("\x1b[38;2;{grey};{grey};{grey}m\u{25cf}");
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[H");
     let rows = size().0;
-    for (i, line) in frame.lines().skip(scroll).take(rows).enumerate() {
-        if i > 0 {
+    for (i, line) in frame.lines().enumerate().skip(scroll).take(rows) {
+        if i > scroll {
             let _ = write!(out, "\r\n");
         }
+        let line = match hover {
+            Some((at, start, end)) if at == i => underline(line, start, end),
+            _ => line.to_string(),
+        };
         let _ = write!(out, "{}\x1b[K", line.replace(PULSE, &dot));
     }
     let _ = write!(out, "\x1b[J");
     let _ = out.flush();
+}
+
+/// `line` with columns `[start, end)` (1-based) underlined, through any
+/// colour resets inside.
+fn underline(line: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    let mut col = 1;
+    let mut on = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Copy the escape whole; a reset inside the span turns the
+            // underline off, so turn it back on.
+            out.push(c);
+            let mut sgr = false;
+            for e in chars.by_ref() {
+                out.push(e);
+                if e.is_ascii_alphabetic() || e == '\\' {
+                    sgr = e == 'm';
+                    break;
+                }
+            }
+            if sgr && on {
+                out += "\x1b[4m";
+            }
+            continue;
+        }
+        if !on && col >= start && col < end && c != ' ' {
+            on = true;
+            out += "\x1b[4m";
+        }
+        if on && col >= end {
+            on = false;
+            out += "\x1b[24m";
+        }
+        out.push(c);
+        col += if c == PULSE { 1 } else { char_cols(c) };
+    }
+    if on {
+        out += "\x1b[24m";
+    }
+    out
 }
 
 /// What wakes the Changes loop besides its tick.
@@ -714,6 +789,11 @@ enum Event {
     },
     /// Wheel: lines to move down (negative: up).
     Scroll(isize),
+    /// The pointer moved, no button held.
+    Hover {
+        x: usize,
+        y: usize,
+    },
 }
 
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
@@ -724,8 +804,8 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
         .args(["-icanon", "-echo"])
         .stdin(Stdio::inherit())
         .status();
-    // Button events, in SGR encoding.
-    print!("\x1b[?1000h\x1b[?1006h");
+    // Button and motion events, in SGR encoding.
+    print!("\x1b[?1003h\x1b[?1006h");
     let _ = io::stdout().flush();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -748,6 +828,8 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
                 // Ctrl adds 16 to the button: links open on Ctrl+click only,
                 // so a plain click just focuses the pane.
                 [16, x, y] if press => Event::Click { x, y },
+                // Motion with no button (32 + 3), with or without Ctrl.
+                [35 | 51, x, y] => Event::Hover { x, y },
                 [64, ..] => Event::Scroll(-SCROLL_LINES),
                 [65, ..] => Event::Scroll(SCROLL_LINES),
                 _ => continue,
@@ -1016,6 +1098,21 @@ mod tests {
             checks: Some(checks),
         };
         HashMap::from([(url, (None, Some(pr)))])
+    }
+
+    #[test]
+    fn underline_marks_only_its_columns() {
+        let line = format!("  {DIM}repo #7{RESET}  x");
+        assert_eq!(
+            underline(&line, 3, 7),
+            format!("  {DIM}\x1b[4mrepo\x1b[24m #7{RESET}  x")
+        );
+        // A reset inside the span keeps the underline on.
+        let line = format!("{GREEN}+3{RESET} {RED}-1{RESET}");
+        assert_eq!(
+            underline(&line, 1, 6),
+            format!("{GREEN}\x1b[4m+3{RESET}\x1b[4m {RED}\x1b[4m-1{RESET}\x1b[4m\x1b[24m")
+        );
     }
 
     #[test]
