@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use herdr_sim::{
@@ -78,28 +77,6 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
     }
     open.output()?;
-    // The panel's process starts just after the open returns; find it to size
-    // it as a side panel, not half the screen.
-    for _ in 0..20 {
-        if let Some(pane) = changes_panes(herdr, workspace.as_deref()).first() {
-            if let Some(amount) = shrink_amount(herdr, pane) {
-                let _ = Command::new(herdr)
-                    .args([
-                        "pane",
-                        "resize",
-                        "--pane",
-                        pane,
-                        "--direction",
-                        "right",
-                        "--amount",
-                    ])
-                    .arg(format!("{amount:.3}"))
-                    .output();
-            }
-            break;
-        }
-        sleep(Duration::from_millis(50));
-    }
     Ok(())
 }
 
@@ -189,9 +166,20 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // answers.
     let saved = state_dir.join("changes-prs.json");
     let mut prs = load_prs(&saved);
-    // Tell the toggle which pane is the panel in this workspace.
-    if let (Some(ws), Ok(pane)) = (workspace_id(), std::env::var("HERDR_PANE_ID")) {
-        let _ = std::fs::write(marker(state_dir, &ws), pane);
+    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+        // A side panel, not half the screen. Sized here, before the first
+        // frame, so nothing is drawn for the wider pane.
+        if let Some(amount) = shrink_amount(herdr, &pane) {
+            let _ = Command::new(herdr)
+                .args(["pane", "resize", "--pane", &pane, "--direction", "right"])
+                .arg("--amount")
+                .arg(format!("{amount:.3}"))
+                .output();
+        }
+        // Tell the toggle which pane is the panel in this workspace.
+        if let Some(ws) = workspace_id() {
+            let _ = std::fs::write(marker(state_dir, &ws), pane);
+        }
     }
     // GitHub is asked off the drawing thread; one request at a time. Clicks
     // arrive on the same channel.
@@ -356,6 +344,53 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             [view.hover, to].iter().flatten().map(|h| h.0).collect();
                         view.hover = to;
                         draw(&last_frame, view, Some(&lines));
+                    }
+                }
+                // hjkl moves a selection over the links, Enter opens it; it
+                // is drawn as the pointer's is.
+                Ok(Event::Key(key)) => {
+                    let at = links(&targets);
+                    let current = view.hover.and_then(|h| at.iter().position(|l| *l == h));
+                    let line = view.hover.map(|h| h.0);
+                    let to = match key {
+                        b'j' => match line {
+                            Some(line) => at.iter().find(|l| l.0 > line),
+                            None => at.iter().find(|l| l.0 >= view.scroll),
+                        },
+                        b'k' => match line {
+                            Some(line) => {
+                                let prev = at.iter().rev().find(|l| l.0 < line);
+                                prev.and_then(|p| at.iter().find(|l| l.0 == p.0))
+                            }
+                            None => at.iter().rev().find(|l| l.0 < view.scroll + view.rows),
+                        },
+                        b'l' => current
+                            .and_then(|i| at.get(i + 1))
+                            .filter(|l| Some(l.0) == line),
+                        b'h' => current
+                            .and_then(|i| i.checked_sub(1))
+                            .and_then(|i| at.get(i))
+                            .filter(|l| Some(l.0) == line),
+                        b'\r' | b'\n' => {
+                            if let Some((line, start, _)) = view.hover
+                                && let Some(url) = targets.get(line).and_then(|t| t.at(start))
+                            {
+                                open_url(url);
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                    .copied();
+                    if let Some(to) = to {
+                        // Keep the selection on screen.
+                        if to.0 < view.scroll {
+                            view.scroll = to.0;
+                        } else if to.0 >= view.scroll + view.rows {
+                            view.scroll = to.0 + 1 - view.rows;
+                        }
+                        view.hover = Some(to);
+                        draw(&last_frame, view, None);
                     }
                 }
                 Ok(event) => break Some(event),
@@ -734,6 +769,23 @@ impl Target {
     }
 }
 
+/// Every link in the frame, in reading order: its line and columns. A line
+/// of parts has one per part; a whole-line link spans the line.
+fn links(targets: &[Target]) -> Vec<(usize, usize, usize)> {
+    targets
+        .iter()
+        .enumerate()
+        .flat_map(|(i, t)| {
+            let parts: Vec<(usize, usize, usize)> = if t.spans.is_empty() {
+                t.rest.iter().map(|_| (i, 1, usize::MAX)).collect()
+            } else {
+                t.spans.iter().map(|(s, e, _)| (i, *s, *e)).collect()
+            };
+            parts
+        })
+        .collect()
+}
+
 /// Stands in a frame for a running check's dot, drawn at each step.
 const PULSE: char = '\u{1}';
 const PULSE_STEP: Duration = Duration::from_millis(120);
@@ -846,6 +898,8 @@ enum Event {
         x: usize,
         y: usize,
     },
+    /// A key pressed in the pane.
+    Key(u8),
 }
 
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
@@ -864,6 +918,13 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];
         while io::stdin().read(&mut byte).is_ok_and(|n| n == 1) {
+            // A plain key, outside any escape sequence.
+            if buf.is_empty() && byte[0] != 0x1b {
+                if events.send(Event::Key(byte[0])).is_err() {
+                    return;
+                }
+                continue;
+            }
             // ESC [ < button ; x ; y M  — a press; `m` is a release.
             if byte[0] == 0x1b {
                 buf.clear();
