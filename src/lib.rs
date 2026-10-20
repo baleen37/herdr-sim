@@ -633,7 +633,8 @@ pub fn held_status<'a>(
 }
 
 /// A state token's value: the indent, the state's mark — `◐` working, `✓` a
-/// finished turn not yet seen, `?` a question, `○` idle — then the heading.
+/// finished turn not yet seen, `?` a question, `○` idle, none when unknown —
+/// then the heading.
 pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String {
     // The state leads, as Herdr's own state icon would: the heading then
     // stands alone in its row, so an indent before it opens no gap.
@@ -641,7 +642,9 @@ pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String 
         "working" => "◐",
         "done" => "✓",
         "blocked" => "?",
-        _ => "○",
+        "idle" => "○",
+        // Herdr cannot tell: no mark rather than one that says idle.
+        _ => return format!("{}{heading}", indent(depth)),
     };
     format!("{}{mark} {heading}", indent(depth))
 }
@@ -1661,6 +1664,7 @@ mod tests {
         assert_eq!(state_heading_value("L Fix", "done", 0), "✓ L Fix");
         assert_eq!(state_heading_value("L", "blocked", 0), "? L");
         assert_eq!(state_heading_value("L Fix", "idle", 1), "\u{200b}  ○ L Fix");
+        assert_eq!(state_heading_value("L Fix", "unknown", 0), "L Fix");
     }
 
     #[test]

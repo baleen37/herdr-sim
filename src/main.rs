@@ -380,7 +380,7 @@ impl Run {
             (BRANCH_TOKEN.to_string(), branch),
         ];
         // The logo needs no session; the PRs and title do, so leave those be.
-        let Some(session) = agent["agent_session"]["value"].as_str() else {
+        if agent["agent_session"]["value"].as_str().is_none() {
             let heading = self
                 .cache
                 .heading(pane)
@@ -389,12 +389,10 @@ impl Run {
             tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
             self.report("pane", pane, "agent", None, &tokens);
             return;
-        };
-        let session = if kind == "claude" {
-            let session = resolve_claude_session(&self.home, session);
-            claude_session(&self.home, &session, &mut self.cache)
-        } else {
-            codex_session(&self.home, session, &mut self.cache)
+        }
+        // The same session lookup as the state pass, name fallback included.
+        let Some(session) = self.session_of(agent) else {
+            return;
         };
         let mut counts: HashMap<PrState, usize> = HashMap::new();
         for url in &session.prs {
