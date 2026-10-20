@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
+pub mod layout;
+
 /// Seconds an open PR's state is trusted. Merged and closed PRs never change.
 pub const OPEN_TTL_SECS: u64 = 60;
 
@@ -260,11 +262,6 @@ pub const TREE_HEADER_TOKEN: &str = "tree_header";
 /// `$tree_header` on a Space with no agent in it, so it can be dimmed.
 pub const TREE_HEADER_IDLE_TOKEN: &str = "tree_header_idle";
 
-/// Sidebar token with the PR of a checkout's branch, as an icon on the same
-/// agent as `$tree_worktree` (Orca puts the PR on the worktree card),
-/// referenced as `$tree_pr`.
-pub const TREE_PR_TOKEN: &str = "tree_pr";
-
 /// The header text shared by Agent and Space rows: the project, then branch
 /// icon and branch when there is one.
 pub fn header_value(project: &str, branch: Option<&str>) -> String {
@@ -318,195 +315,23 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
         .collect()
 }
 
-/// Sidebar tokens for a project › worktree › session tree after herdr-radar,
-/// referenced as `$tree_group_project`, `$tree_group` and `$tree_gap`: the
-/// project over its first agent, `├─`/`└─ <branch>` over each worktree's
-/// first agent (the main checkout's sessions sit right under the project),
-/// and a blank row after the project. A header whose sessions
-/// have all gone stale moves to its `_stale` token instead.
-pub const TREE_GROUP_PROJECT_TOKEN: &str = "tree_group_project";
-pub const TREE_GROUP_PROJECT_STALE_TOKEN: &str = "tree_group_project_stale";
-pub const TREE_GROUP_TOKEN: &str = "tree_group";
-pub const TREE_GROUP_STALE_TOKEN: &str = "tree_group_stale";
-pub const TREE_GAP_TOKEN: &str = "tree_gap";
-
-/// Herdr trims leading whitespace off token values, so the indent and the
-/// blank gap row both lean on a zero-width space.
-const ZWSP: &str = "\u{200b}";
-
-/// The indent `depth` levels deep, two columns a level, as herdr-radar.
-pub fn indent(depth: usize) -> String {
-    if depth == 0 {
-        String::new()
-    } else {
-        format!("{ZWSP}{}", "  ".repeat(depth))
-    }
-}
-
-/// What [`group_rows`] gives one agent.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct GroupRow {
-    /// The project header, if this agent heads a project.
-    pub project: Option<String>,
-    /// Whether every session of that project has gone stale.
-    pub project_stale: bool,
-    /// The branch header, if this agent heads a worktree.
-    pub group: Option<String>,
-    /// Whether every session of that worktree has gone stale.
-    pub stale: bool,
-    /// The blank row after a project's last agent.
-    pub gap: Option<String>,
-    /// How far the agent's own row sits in, on top of Herdr's. Herdr indents
-    /// an entry's continuation rows one level itself, so a worktree's session
-    /// under its header needs one more level of ours to sit under the branch,
-    /// and one that is its entry's first row needs two; a main checkout's
-    /// session one level less.
-    pub depth: usize,
-}
-
-/// [`GroupRow`]s for agents listed in sidebar order, given whether each one's
-/// session is stale. The gap goes on a project's last agent: one above a
-/// header would make the header a continuation row, which Herdr indents.
-/// Agents without a place get nothing.
-pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
-    let mut seen_projects = std::collections::HashSet::new();
-    let mut seen_checkouts = std::collections::HashSet::new();
-    let all_stale = |same: &dyn Fn(&Place) -> bool| {
-        places
-            .iter()
-            .zip(stale)
-            .all(|(other, &stale)| other.as_ref().is_none_or(|o| !same(o)) || stale)
-    };
-    places
-        .iter()
-        .enumerate()
-        .map(|(i, place)| {
-            let Some(place) = place else {
-                return GroupRow::default();
-            };
-            let later = &places[i + 1..];
-            let first_of_project = seen_projects.insert(place.project.clone());
-            let first_of_checkout = seen_checkouts.insert(place.checkout.clone());
-            let project = first_of_project.then(|| place.project.clone());
-            // The worktree's header is a continuation row under the project
-            // header on the project's first agent, which Herdr indents itself.
-            let group = (first_of_checkout && place.worktree).then(|| {
-                let last = !later.iter().flatten().any(|next| {
-                    next.worktree
-                        && next.project == place.project
-                        && next.checkout != place.checkout
-                });
-                let corner = if last { "└─" } else { "├─" };
-                let indent = if first_of_project {
-                    String::new()
-                } else {
-                    indent(1)
-                };
-                format!("{indent}{corner} \u{f418} {}", place.label)
-            });
-            let last_of_project = !later
-                .iter()
-                .flatten()
-                .any(|next| next.project == place.project);
-            GroupRow {
-                project_stale: project.is_some() && all_stale(&|o| o.project == place.project),
-                project,
-                stale: group.is_some() && all_stale(&|o| o.checkout == place.checkout),
-                depth: match (place.worktree, group.is_some(), first_of_project) {
-                    (true, true, _) | (false, _, false) => 1,
-                    (true, false, _) => 2,
-                    (false, _, true) => 0,
-                },
-                group,
-                gap: last_of_project.then(|| ZWSP.to_string()),
-            }
-        })
-        .collect()
-}
-
-/// Sidebar token marking the second and later agents of a split tab, referenced
-/// as `$tree_split`: `├─`, and `└─` on the last, so a split screen reads as one
-/// unit under its first agent.
-pub const TREE_SPLIT_TOKEN: &str = "tree_split";
-
-/// Split marks for agents listed in sidebar order, given each agent's tab.
-pub fn split_marks(tabs: &[&str]) -> Vec<Option<&'static str>> {
-    (0..tabs.len())
-        .map(|i| {
-            if i == 0 || tabs[i - 1] != tabs[i] {
-                None
-            } else if tabs.get(i + 1) == Some(&tabs[i]) {
-                Some("├─")
-            } else {
-                Some("└─")
-            }
-        })
-        .collect()
-}
-
 /// Pane token the activity order sorts on, referenced as `$sort_rank`: the
-/// agent's position in [`activity_order`], zero-padded since the Agents view
+/// agent's position in [`layout::layout`], zero-padded since the Agents view
 /// sorts tokens as strings. Herdr shows exactly the order computed here, and
 /// the token only changes when the order does.
 pub const SORT_RANK_TOKEN: &str = "sort_rank";
 
-/// One agent as the activity order sees it.
-pub struct Activity {
-    pub place: Option<Place>,
-    pub tab: String,
-    /// Herdr's `state_change_seq`: higher changed state more recently.
-    pub seq: u64,
-    /// Whether the session has been idle over two hours.
-    pub stale: bool,
-}
+/// Sidebar tokens for herdr-radar's tree over the Agents list (see [`layout`]):
+/// `$tree_group` the workspace header on its first session (`$tree_group_stale`
+/// once every session in it is stale), `$tree_group_parent` the repository on
+/// a row of its own over a worktree whose checkout has no session, and
+/// `$tree_gap` a blank row after the group.
+pub const TREE_GROUP_TOKEN: &str = "tree_group";
+pub const TREE_GROUP_STALE_TOKEN: &str = "tree_group_stale";
+pub const TREE_GROUP_PARENT_TOKEN: &str = "tree_group_parent";
+pub const TREE_GAP_TOKEN: &str = "tree_gap";
 
-/// Indices of the agents in activity order: projects by their most recent
-/// agent, then the main checkout, then worktrees and tabs within them the
-/// same way; names break ties, then list order. A tab whose sessions
-/// have all gone stale sinks to the bottom of its checkout, as in herdr-radar.
-/// Agents without a place come last, in list order.
-pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
-    fn groups(agent: &Activity) -> Option<[&str; 3]> {
-        let place = agent.place.as_ref()?;
-        Some([&place.project, &place.checkout, &agent.tab])
-    }
-    let mut latest: [HashMap<&str, u64>; 3] = Default::default();
-    for agent in agents {
-        for (level, name) in groups(agent).into_iter().flatten().enumerate() {
-            let seq = latest[level].entry(name).or_default();
-            *seq = (*seq).max(agent.seq);
-        }
-    }
-    let mut fresh_tabs = std::collections::HashSet::new();
-    for agent in agents.iter().filter(|a| !a.stale) {
-        fresh_tabs.insert(agent.tab.as_str());
-    }
-    let key = |level: usize, name| (std::cmp::Reverse(latest[level][name]), name);
-    let mut placed: Vec<_> = agents
-        .iter()
-        .enumerate()
-        .filter_map(|(i, agent)| {
-            let [project, checkout, tab] = groups(agent)?;
-            let sunk = !fresh_tabs.contains(tab);
-            // The main checkout leads its project: its worktrees hang off it.
-            let worktree = agent.place.as_ref().is_some_and(|p| p.worktree);
-            Some((
-                i,
-                (
-                    key(0, project),
-                    worktree,
-                    key(1, checkout),
-                    sunk,
-                    key(2, tab),
-                ),
-            ))
-        })
-        .collect();
-    placed.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut order: Vec<usize> = placed.into_iter().map(|(i, _)| i).collect();
-    order.extend((0..agents.len()).filter(|&i| agents[i].place.is_none()));
-    order
-}
+pub use layout::{ZWSP, indent};
 
 /// Sidebar token with how long ago an agent's session last changed,
 /// referenced as `$age`.
@@ -549,20 +374,17 @@ pub fn session_files(home: &Path, kind: &str, session_id: &str) -> Vec<PathBuf> 
 /// The agents herdr-sim knows, as Herdr agent ids.
 pub const AGENT_KINDS: [&str; 2] = ["claude", "codex"];
 
-/// Workspace token for how many agents of one kind run there, referenced as
+/// Workspace token for whether agents of one kind run there, referenced as
 /// `$agent_claude` / `$agent_codex` so each can have its own colour.
 pub fn workspace_agent_token(kind: &str) -> String {
     format!("agent_{kind}")
 }
 
-/// The kind's logo, plus the count when more than one runs. `None` clears it.
-pub fn agent_count_value(kind: &str, count: usize) -> Option<String> {
+/// The kind's logo and name when any of it runs, as herdr-radar's Spaces
+/// list does. `None` clears it.
+pub fn agent_logo_value(kind: &str, running: bool) -> Option<String> {
     let icon = agent_icon(kind)?;
-    match count {
-        0 => None,
-        1 => Some(icon.to_string()),
-        n => Some(format!("{icon} {n}")),
-    }
+    running.then(|| format!("{icon} {kind}"))
 }
 
 /// Sidebar token summarising all PRs, referenced as `$pr`.
@@ -711,7 +533,7 @@ pub fn state_label_value(title: Option<&str>, status: &str) -> Option<String> {
 /// A Space's header in a token per the state of the agents in it, so the
 /// Spaces list reads like the Agents list: `$header_working` and so on, and
 /// `$header_none` for a Space without an agent. Each leads with the state's
-/// mark (`·` for none), so leave Herdr's `state_icon` out of that row.
+/// mark (`◦` for none), so leave Herdr's `state_icon` out of that row.
 pub const SPACE_HEADER_TOKENS: [&str; 6] = [
     "header_working",
     "header_blocked",
@@ -738,7 +560,7 @@ pub fn space_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static
 
 /// A `$header_*` value: the state's mark, then the header.
 pub fn space_header_value(header: &str, status: &str) -> String {
-    let mark = state_mark(status).unwrap_or("·");
+    let mark = state_mark(status).unwrap_or("◦");
     format!("{mark} {header}")
 }
 
@@ -1800,7 +1622,7 @@ mod tests {
         assert_eq!(space_status(["idle", "done"]), "done");
         assert_eq!(space_status([]), "none");
         assert_eq!(space_header_value("search", "done"), "✓ search");
-        assert_eq!(space_header_value("search", "none"), "· search");
+        assert_eq!(space_header_value("search", "none"), "◦ search");
     }
 
     #[test]
@@ -1835,83 +1657,6 @@ mod tests {
     }
 
     #[test]
-    fn group_rows_draw_project_worktree_session_and_fade_stale_groups() {
-        let at = |project: &str, checkout: &str, label: &str| {
-            Some(Place {
-                project: project.into(),
-                checkout: checkout.into(),
-                label: label.into(),
-                worktree: checkout.contains("/wt"),
-            })
-        };
-        let rows = group_rows(
-            &[
-                at("search", "/s", "main"),
-                at("search", "/s", "main"),
-                at("search", "/s/wt", "fix-x"),
-                at("search", "/s/wt", "fix-x"),
-                None,
-                at("dotfiles", "/d", "main"),
-                at("infra", "/i/wt", "feat"),
-            ],
-            &[false, true, true, true, false, true, false],
-        );
-        let s = |v: &str| Some(v.to_string());
-        let gap = s("\u{200b}");
-        assert_eq!(
-            rows,
-            [
-                // The main checkout's sessions sit right under the project.
-                GroupRow {
-                    project: s("search"),
-                    depth: 0,
-                    ..Default::default()
-                },
-                GroupRow {
-                    depth: 1,
-                    ..Default::default()
-                },
-                GroupRow {
-                    group: s("\u{200b}  └─ \u{f418} fix-x"),
-                    stale: true,
-                    depth: 1,
-                    ..Default::default()
-                },
-                GroupRow {
-                    gap: gap.clone(),
-                    depth: 2,
-                    ..Default::default()
-                },
-                GroupRow::default(),
-                GroupRow {
-                    project: s("dotfiles"),
-                    project_stale: true,
-                    gap: gap.clone(),
-                    depth: 0,
-                    ..Default::default()
-                },
-                // A worktree whose main checkout runs nothing still hangs
-                // under its project.
-                GroupRow {
-                    project: s("infra"),
-                    group: s("└─ \u{f418} feat"),
-                    gap,
-                    depth: 1,
-                    ..Default::default()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn split_marks_branch_off_the_first_agent_of_a_tab() {
-        assert_eq!(
-            split_marks(&["t1", "t2", "t2", "t2", "t3", "t3"]),
-            [None, None, Some("├─"), Some("└─"), None, Some("└─")]
-        );
-    }
-
-    #[test]
     fn checkout_headers_mark_each_checkouts_first_agent() {
         let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
@@ -1936,61 +1681,6 @@ mod tests {
                 None,
             ]
         );
-    }
-
-    #[test]
-    fn activity_order_puts_recent_groups_first() {
-        let at = |project: &str, checkout: &str, tab: &str, seq: u64| Activity {
-            place: Some(Place {
-                project: project.into(),
-                checkout: checkout.into(),
-                label: "main".into(),
-                worktree: checkout.matches('/').count() > 1,
-            }),
-            tab: tab.into(),
-            seq,
-            stale: false,
-        };
-        let agents = [
-            at("search", "/s", "t1", 1),
-            at("search", "/s/status", "t2", 9),
-            at("dotfiles", "/d", "t3", 5),
-            Activity {
-                place: None,
-                tab: "t4".into(),
-                seq: 20,
-                stale: false,
-            },
-            at("search", "/s/batch", "t5", 3),
-            at("search", "/s/status", "t6", 2),
-            at("search", "/s/status", "t2", 0),
-            // Two idle projects keep apart despite equal seqs.
-            at("infra", "/i", "t7", 0),
-            at("api", "/a", "t8", 0),
-            at("infra", "/i", "t9", 0),
-        ];
-        // search (latest 9): the main checkout first, as the root its
-        // worktrees hang off, then status (9: tab t2 then t6), batch (3);
-        // dotfiles (5); the two idle projects and their tabs by name; last the
-        // agent without a place.
-        assert_eq!(activity_order(&agents), [0, 1, 6, 5, 4, 2, 8, 7, 9, 3]);
-    }
-
-    #[test]
-    fn activity_order_sinks_stale_tabs_within_their_checkout() {
-        let at = |tab: &str, seq: u64, stale: bool| Activity {
-            place: Some(Place {
-                project: "search".into(),
-                checkout: "/s".into(),
-                label: "main".into(),
-                worktree: false,
-            }),
-            tab: tab.into(),
-            seq,
-            stale,
-        };
-        let agents = [at("t1", 9, true), at("t2", 1, false), at("t3", 5, false)];
-        assert_eq!(activity_order(&agents), [2, 1, 0]);
     }
 
     #[test]
@@ -2097,11 +1787,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_count_value_shows_count_only_above_one() {
-        assert_eq!(agent_count_value("claude", 0), None);
-        assert_eq!(agent_count_value("claude", 1).unwrap(), "\u{ec82}");
-        assert_eq!(agent_count_value("codex", 2).unwrap(), "\u{ec81} 2");
-        assert_eq!(agent_count_value("pi", 1), None);
+    fn agent_logo_value_is_the_logo_and_name_when_any_run() {
+        assert_eq!(agent_logo_value("claude", false), None);
+        assert_eq!(agent_logo_value("claude", true).unwrap(), "\u{ec82} claude");
+        assert_eq!(agent_logo_value("codex", true).unwrap(), "\u{ec81} codex");
+        assert_eq!(agent_logo_value("pi", true), None);
     }
 
     #[test]
