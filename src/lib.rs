@@ -708,6 +708,22 @@ pub fn state_label_value(title: Option<&str>, status: &str) -> Option<String> {
     }
 }
 
+/// The braille spinner herdr-radar turns ahead of a working title, one step
+/// per [`SPIN_MS`].
+pub const SPINNER: [char; 8] = ['⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽', '⣾'];
+/// One spinner step: faster reads as a blur, slower as a stutter (herdr-radar).
+pub const SPIN_MS: u64 = 150;
+
+/// `$label_working` on spinner step `frame`: the step in place of `◐`, then
+/// the title from the agent's `$heading` (its logo, then the title).
+pub fn spinner_value(heading: &str, frame: usize) -> String {
+    let step = SPINNER[frame % SPINNER.len()];
+    match heading.split_once(' ') {
+        Some((_, title)) => format!("{step} {title}"),
+        None => step.to_string(),
+    }
+}
+
 /// What herdr-sim knows about one agent session.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Session {
@@ -1741,6 +1757,13 @@ mod tests {
         assert_eq!(state_label_token("heading_idle_stale"), "label_idle_stale");
         assert_eq!(icon_token("codex", false), "icon_codex");
         assert_eq!(icon_token("claude", true), "icon_stale");
+    }
+
+    #[test]
+    fn spinner_turns_ahead_of_the_title() {
+        assert_eq!(spinner_value("\u{ec82} Fix login", 0), "⣷ Fix login");
+        assert_eq!(spinner_value("\u{ec82} Fix login", 9), "⣯ Fix login");
+        assert_eq!(spinner_value("\u{ec82}", 3), "⡿");
     }
 
     #[test]
