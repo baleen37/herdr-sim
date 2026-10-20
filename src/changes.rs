@@ -39,6 +39,8 @@ struct Pr {
     additions: u64,
     deletions: u64,
     comments: usize,
+    /// The latest comment, to open with `c`.
+    comment_url: Option<String>,
     /// Checks passed, failed, and in all.
     checks: Option<(usize, usize, usize)>,
 }
@@ -191,11 +193,16 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
     let mut targets: Vec<Target> = Vec::new();
+    // The rows the keys move between, and the selected one, by key so it
+    // stays put as the list changes.
+    let mut items: Vec<Item> = Vec::new();
+    let mut selected: Option<String> = None;
     let mut view = View {
         scroll: 0,
         rows: size().0,
         step: 0,
         hover: None,
+        selected: None,
     };
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
@@ -291,8 +298,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         })
                     })
                     .collect();
-                let (changes, clicks) = render(&list, &prs, &local);
+                let (changes, clicks, rows) = render(&list, &prs, &local);
                 targets = clicks;
+                items = rows;
                 changes
             }
             None => "No agent focused yet.\n".to_string(),
@@ -303,6 +311,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         if frame != last_frame || rows != view.rows {
             view.rows = rows;
             view.scroll = view.scroll.min(max_scroll(&frame, rows));
+            view.selected = selected
+                .as_ref()
+                .and_then(|key| items.iter().find(|i| &i.key == key))
+                .map(|i| i.lines);
             draw(&frame, view, None);
             last_frame = frame;
         }
@@ -351,50 +363,46 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         draw(&last_frame, view, Some(&lines));
                     }
                 }
-                // hjkl moves a selection over the links, Enter opens it; it
-                // is drawn as the pointer's is.
+                // j/k move between rows; Enter opens the row, p its PR, d its
+                // diff, c its latest comment.
                 Ok(Event::Key(key)) => {
-                    let at = links(&targets);
-                    let current = view.hover.and_then(|h| at.iter().position(|l| *l == h));
-                    let line = view.hover.map(|h| h.0);
-                    let to = match key {
-                        b'j' => match line {
-                            Some(line) => at.iter().find(|l| l.0 > line),
-                            None => at.iter().find(|l| l.0 >= view.scroll),
-                        },
-                        b'k' => match line {
-                            Some(line) => {
-                                let prev = at.iter().rev().find(|l| l.0 < line);
-                                prev.and_then(|p| at.iter().find(|l| l.0 == p.0))
-                            }
-                            None => at.iter().rev().find(|l| l.0 < view.scroll + view.rows),
-                        },
-                        b'l' => current
-                            .and_then(|i| at.get(i + 1))
-                            .filter(|l| Some(l.0) == line),
-                        b'h' => current
-                            .and_then(|i| i.checked_sub(1))
-                            .and_then(|i| at.get(i))
-                            .filter(|l| Some(l.0) == line),
-                        b'\r' | b'\n' => {
-                            if let Some((line, start, _)) = view.hover
-                                && let Some(url) = targets.get(line).and_then(|t| t.at(start))
-                            {
+                    let at = selected
+                        .as_ref()
+                        .and_then(|key| items.iter().position(|i| &i.key == key));
+                    let to = match (key, at) {
+                        (b'j', Some(i)) => items.get(i + 1),
+                        (b'k', Some(i)) => i.checked_sub(1).and_then(|i| items.get(i)),
+                        // Nothing selected yet: the first or last row on screen.
+                        (b'j', None) => items.iter().find(|i| i.lines.0 >= view.scroll),
+                        (b'k', None) => items
+                            .iter()
+                            .rev()
+                            .find(|i| i.lines.1 < view.scroll + view.rows),
+                        _ => {
+                            let item = at.and_then(|i| items.get(i));
+                            let url = item.and_then(|item| match key {
+                                b'\r' | b'\n' => item.open.as_deref(),
+                                b'p' => item.pr.as_deref(),
+                                b'd' => item.diff.as_deref(),
+                                b'c' => item.comment.as_deref(),
+                                _ => None,
+                            });
+                            if let Some(url) = url {
                                 open_url(url);
                             }
                             None
                         }
-                        _ => None,
-                    }
-                    .copied();
+                    };
                     if let Some(to) = to {
-                        // Keep the selection on screen.
-                        if to.0 < view.scroll {
-                            view.scroll = to.0;
-                        } else if to.0 >= view.scroll + view.rows {
-                            view.scroll = to.0 + 1 - view.rows;
+                        // Keep the row on screen.
+                        let (first, last) = to.lines;
+                        if first < view.scroll {
+                            view.scroll = first;
+                        } else if last >= view.scroll + view.rows {
+                            view.scroll = last + 1 - view.rows;
                         }
-                        view.hover = Some(to);
+                        selected = Some(to.key.clone());
+                        view.selected = Some(to.lines);
                         draw(&last_frame, view, None);
                     }
                 }
@@ -453,6 +461,7 @@ fn load_prs(path: &Path) -> Prs {
                 additions: p["additions"].as_u64().unwrap_or(0),
                 deletions: p["deletions"].as_u64().unwrap_or(0),
                 comments: p["comments"].as_u64().unwrap_or(0) as usize,
+                comment_url: p["comment_url"].as_str().map(String::from),
                 checks: p["checks"].as_array().and_then(|c| {
                     let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
                     Some((n(0)?, n(1)?, n(2)?))
@@ -475,7 +484,7 @@ fn save_prs(path: &Path, prs: &Prs) {
                 json!({
                     "repo": p.repo, "number": p.number, "title": p.title,
                     "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
-                    "deletions": p.deletions, "comments": p.comments,
+                    "deletions": p.deletions, "comments": p.comments, "comment_url": p.comment_url,
                     "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
                 }),
             ))
@@ -510,7 +519,7 @@ fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> 
 
 /// What the panel asks GitHub for each PR.
 const PR_FIELDS: &str = "title number state isDraft reviewDecision additions deletions \
-    comments { totalCount } \
+    comments(last: 1) { totalCount nodes { url } } \
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts { \
     checkRunCountsByState { state count } statusContextCountsByState { state count } \
     } } } } }";
@@ -597,6 +606,7 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
                 additions: pr["additions"].as_u64().unwrap_or(0),
                 deletions: pr["deletions"].as_u64().unwrap_or(0),
                 comments: pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize,
+                comment_url: pr["comments"]["nodes"][0]["url"].as_str().map(String::from),
                 checks: (total > 0).then_some((passed, failed, total)),
                 url: url.clone(),
             };
@@ -618,9 +628,10 @@ const RESET: &str = "\x1b[0m";
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) {
+fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, Vec<Item>) {
     let width = size().1.saturating_sub(1).max(20);
     let mut out: Vec<(String, Target)> = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     let blank = |out: &mut Vec<(String, Target)>| out.push((String::new(), Target::default()));
     // What the session's checkouts have not committed yet, above its PRs.
     for local in local {
@@ -636,6 +647,12 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
             &local.repo,
             width.saturating_sub(4 + cols(&local.diff)).max(4),
         );
+        items.push(Item {
+            key: format!("local:{}", local.repo),
+            lines: (out.len(), out.len()),
+            open: local.url.clone(),
+            ..Item::default()
+        });
         out.push((
             format!("{DIM}±{RESET} {DIM}{repo}{RESET} {}", lines.join(" ")),
             // The row opens the repo, and so is a stop for hjkl too.
@@ -655,6 +672,13 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
                 (Some(repo), Some(n)) => format!("{repo} #{n}"),
                 _ => url.clone(),
             };
+            items.push(Item {
+                key: url.clone(),
+                lines: (out.len(), out.len()),
+                open: Some(url.clone()),
+                pr: Some(url.clone()),
+                ..Item::default()
+            });
             out.push((
                 format!("{DIM}\u{f407} {}{RESET}", cut(&name, width - 2)),
                 Target::all(Some(url.clone())),
@@ -672,6 +696,14 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
             _ => ("\u{f407}", GREEN),
         };
         let title = cut(&pr.title, width - 2);
+        items.push(Item {
+            key: pr.url.clone(),
+            lines: (out.len(), out.len() + 1),
+            open: Some(pr.url.clone()),
+            pr: Some(pr.url.clone()),
+            diff: Some(format!("{}/files", pr.url)),
+            comment: Some(pr.comment_url.clone().unwrap_or_else(|| pr.url.clone())),
+        });
         out.push((
             format!("{colour}{icon}{RESET} {title}"),
             Target::all(Some(pr.url.clone())),
@@ -739,7 +771,7 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
         blank(&mut out);
     }
     let (lines, targets): (Vec<String>, Vec<Target>) = out.into_iter().unzip();
-    (lines.join("\n"), targets)
+    (lines.join("\n"), targets, items)
 }
 
 /// The links a click on a drawn line opens: by column, else the line's own.
@@ -783,21 +815,20 @@ impl Target {
     }
 }
 
-/// Every link in the frame, in reading order: its line and columns. A line
-/// of parts has one per part; a whole-line link spans the line.
-fn links(targets: &[Target]) -> Vec<(usize, usize, usize)> {
-    targets
-        .iter()
-        .enumerate()
-        .flat_map(|(i, t)| {
-            let parts: Vec<(usize, usize, usize)> = if t.spans.is_empty() {
-                t.rest.iter().map(|_| (i, 1, usize::MAX)).collect()
-            } else {
-                t.spans.iter().map(|(s, e, _)| (i, *s, *e)).collect()
-            };
-            parts
-        })
-        .collect()
+/// A row the keys move between: a PR or a checkout's changes, with the
+/// pages its keys open.
+#[derive(Default)]
+struct Item {
+    /// What it is, to keep it selected as the list changes.
+    key: String,
+    /// Its first and last lines in the frame.
+    lines: (usize, usize),
+    /// Enter.
+    open: Option<String>,
+    /// p, d, c.
+    pr: Option<String>,
+    diff: Option<String>,
+    comment: Option<String>,
 }
 
 /// Stands in a frame for a running check's dot, drawn at each step.
@@ -831,8 +862,11 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
             continue;
         }
         let line = lines.get(row).copied().unwrap_or("");
-        let line = match view.hover {
-            Some((at, start, end)) if at == i => highlight(line, start, end),
+        let line = match (view.selected, view.hover) {
+            (Some((first, last)), _) if (first..=last).contains(&i) => {
+                highlight(line, 1, usize::MAX)
+            }
+            (_, Some((at, start, end))) if at == i => highlight(line, start, end),
             _ => line.to_string(),
         };
         // Each row by its position, cleared to its end: nothing else moves.
@@ -854,6 +888,8 @@ struct View {
     step: usize,
     /// The link under the pointer: its line in the frame, and columns.
     hover: Option<(usize, usize, usize)>,
+    /// The selected row's first and last lines in the frame.
+    selected: Option<(usize, usize)>,
 }
 
 /// `line` with columns `[start, end)` (1-based) highlighted, through any
@@ -1109,6 +1145,7 @@ mod tests {
             state: "OPEN".into(),
             draft: false,
             approved: false,
+            comment_url: Some("https://github.com/o/repo/pull/7#issuecomment-1".into()),
             additions: 3,
             deletions: 1,
             comments: 2,
@@ -1136,7 +1173,19 @@ mod tests {
     fn details_line_links_each_part() {
         let prs = pr((1, 0, 2));
         let urls: Vec<String> = prs.keys().cloned().collect();
-        let (frame, targets) = render(&urls, &prs, &[]);
+        let (frame, targets, items) = render(&urls, &prs, &[]);
+        // One row for the PR, over its title and details; d and c open its
+        // files and latest comment.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].lines, (0, 1));
+        assert_eq!(
+            items[0].diff.as_deref(),
+            Some("https://github.com/o/repo/pull/7/files")
+        );
+        assert_eq!(
+            items[0].comment.as_deref(),
+            Some("https://github.com/o/repo/pull/7#issuecomment-1")
+        );
         let line = frame.lines().nth(1).unwrap();
         let target = &targets[1];
         let plain: String = {
