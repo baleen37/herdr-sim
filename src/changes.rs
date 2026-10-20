@@ -260,95 +260,108 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
             last_agent = Some(agent.clone());
         }
-        let frame = match &last_agent {
-            Some(agent) => {
-                let session = session_of(agent, home, &mut cache);
-                // Newest first, as in Claude Code's Changes panel.
-                let list: Vec<String> = session
-                    .as_ref()
-                    .map(|s| s.prs.iter().rev().cloned().collect())
-                    .unwrap_or_default();
-                let stale: Vec<String> = list
-                    .iter()
-                    .filter(|url| {
-                        !prs.get(*url).is_some_and(|(at, pr)| {
-                            let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
-                            at.is_some_and(|at| {
-                                at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
+        // A panel in a workspace not on screen keeps its last frame: no git,
+        // no transcripts, no redraw. Only the cheap agent list runs, so it
+        // catches up within a tick of coming back on screen.
+        let hidden = agents.iter().any(|a| {
+            a["focused"].as_bool() == Some(true)
+                && workspace
+                    .as_deref()
+                    .is_some_and(|ws| a["workspace_id"].as_str() != Some(ws))
+        });
+        let frame = if hidden && !last_frame.is_empty() {
+            last_frame.clone()
+        } else {
+            match &last_agent {
+                Some(agent) => {
+                    let session = session_of(agent, home, &mut cache);
+                    // Newest first, as in Claude Code's Changes panel.
+                    let list: Vec<String> = session
+                        .as_ref()
+                        .map(|s| s.prs.iter().rev().cloned().collect())
+                        .unwrap_or_default();
+                    let stale: Vec<String> = list
+                        .iter()
+                        .filter(|url| {
+                            !prs.get(*url).is_some_and(|(at, pr)| {
+                                let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
+                                at.is_some_and(|at| {
+                                    at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
+                                })
                             })
                         })
-                    })
-                    .cloned()
-                    .collect();
-                if !stale.is_empty() && !fetching {
-                    fetching = true;
-                    let done = done.clone();
-                    std::thread::spawn(move || {
-                        let got = fetch_all(&stale);
-                        let _ = done.send(Event::Fetched(stale, got));
-                    });
-                }
-                // Every checkout the session worked in, where it runs first.
-                let dirs = agent["cwd"]
-                    .as_str()
-                    .map(String::from)
-                    .into_iter()
-                    .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
-                let dirs: Vec<String> = dirs.collect();
-                // Directories not seen before are looked up together.
-                let new: Vec<&String> = dirs
-                    .iter()
-                    .filter(|d| !checkouts.contains_key(*d))
-                    .collect();
-                let found: Vec<Option<String>> = std::thread::scope(|s| {
-                    let running: Vec<_> =
-                        new.iter().map(|dir| s.spawn(|| checkout_of(dir))).collect();
-                    running
-                        .into_iter()
-                        .map(|t| t.join().ok().flatten())
-                        .collect()
-                });
-                for (dir, top) in new.into_iter().zip(found) {
-                    checkouts.insert(dir.clone(), top);
-                }
-                let mut tops: Vec<String> = Vec::new();
-                for dir in &dirs {
-                    if let Some(Some(top)) = checkouts.get(dir)
-                        && !tops.contains(top)
-                    {
-                        tops.push(top.clone());
+                        .cloned()
+                        .collect();
+                    if !stale.is_empty() && !fetching {
+                        fetching = true;
+                        let done = done.clone();
+                        std::thread::spawn(move || {
+                            let got = fetch_all(&stale);
+                            let _ = done.send(Event::Fetched(stale, got));
+                        });
                     }
-                }
-                // Every checkout's diff at once: git is the slow part of a tick.
-                let diffs: Vec<Option<String>> = std::thread::scope(|s| {
-                    let running: Vec<_> =
-                        tops.iter().map(|top| s.spawn(|| local_diff(top))).collect();
-                    running
+                    // Every checkout the session worked in, where it runs first.
+                    let dirs = agent["cwd"]
+                        .as_str()
+                        .map(String::from)
                         .into_iter()
-                        .map(|t| t.join().ok().flatten())
-                        .collect()
-                });
-                let local: Vec<Local> = tops
-                    .iter()
-                    .zip(diffs)
-                    .filter_map(|(top, diff)| {
-                        let (repo, slug) = names
-                            .entry(top.clone())
-                            .or_insert_with(|| (repo_name(top), github_slug(top)));
-                        Some(Local {
-                            top: top.clone(),
-                            repo: repo.clone()?,
-                            diff: diff?,
-                            url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
+                        .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
+                    let dirs: Vec<String> = dirs.collect();
+                    // Directories not seen before are looked up together.
+                    let new: Vec<&String> = dirs
+                        .iter()
+                        .filter(|d| !checkouts.contains_key(*d))
+                        .collect();
+                    let found: Vec<Option<String>> = std::thread::scope(|s| {
+                        let running: Vec<_> =
+                            new.iter().map(|dir| s.spawn(|| checkout_of(dir))).collect();
+                        running
+                            .into_iter()
+                            .map(|t| t.join().ok().flatten())
+                            .collect()
+                    });
+                    for (dir, top) in new.into_iter().zip(found) {
+                        checkouts.insert(dir.clone(), top);
+                    }
+                    let mut tops: Vec<String> = Vec::new();
+                    for dir in &dirs {
+                        if let Some(Some(top)) = checkouts.get(dir)
+                            && !tops.contains(top)
+                        {
+                            tops.push(top.clone());
+                        }
+                    }
+                    // Every checkout's diff at once: git is the slow part of a tick.
+                    let diffs: Vec<Option<String>> = std::thread::scope(|s| {
+                        let running: Vec<_> =
+                            tops.iter().map(|top| s.spawn(|| local_diff(top))).collect();
+                        running
+                            .into_iter()
+                            .map(|t| t.join().ok().flatten())
+                            .collect()
+                    });
+                    let local: Vec<Local> = tops
+                        .iter()
+                        .zip(diffs)
+                        .filter_map(|(top, diff)| {
+                            let (repo, slug) = names
+                                .entry(top.clone())
+                                .or_insert_with(|| (repo_name(top), github_slug(top)));
+                            Some(Local {
+                                top: top.clone(),
+                                repo: repo.clone()?,
+                                diff: diff?,
+                                url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
+                            })
                         })
-                    })
-                    .collect();
-                let (changes, clicks, rows) = render(&list, &prs, &local);
-                targets = clicks;
-                items = rows;
-                changes
+                        .collect();
+                    let (changes, clicks, rows) = render(&list, &prs, &local);
+                    targets = clicks;
+                    items = rows;
+                    changes
+                }
+                None => "No agent focused yet.\n".to_string(),
             }
-            None => "No agent focused yet.\n".to_string(),
         };
         // Redraw only on change: no flicker, no work for the terminal. The
         // pane's size is read once a tick, not per draw.
@@ -1349,18 +1362,53 @@ fn git_in(dir: &str, args: &[&str]) -> Option<String> {
 
 /// The pane's size as (rows, columns), from the terminal it runs in.
 pub(crate) fn size() -> (usize, usize) {
-    let out = Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let mut n = out.split_whitespace().map(|n| n.parse().ok());
-    (
-        n.next().flatten().unwrap_or(40),
-        n.next().flatten().unwrap_or(40),
-    )
+    window_size().unwrap_or_else(|| {
+        let out = Command::new("stty")
+            .arg("size")
+            .stdin(Stdio::inherit())
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let mut n = out.split_whitespace().map(|n| n.parse().ok());
+        (
+            n.next().flatten().unwrap_or(40),
+            n.next().flatten().unwrap_or(40),
+        )
+    })
+}
+
+/// The terminal's rows and columns from the kernel (TIOCGWINSZ on stdout),
+/// without spawning `stty`; `None` where that is not available.
+fn window_size() -> Option<(usize, usize)> {
+    #[cfg(target_os = "macos")]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x4008_7468;
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x5413;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[repr(C)]
+        struct Winsize {
+            rows: u16,
+            cols: u16,
+            xpixel: u16,
+            ypixel: u16,
+        }
+        unsafe extern "C" {
+            fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+        }
+        let mut size = Winsize {
+            rows: 0,
+            cols: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ writes one Winsize through the pointer given.
+        let ok = unsafe { ioctl(1, TIOCGWINSZ, &mut size as *mut Winsize) } == 0;
+        (ok && size.rows > 0).then_some((size.rows as usize, size.cols as usize))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    None
 }
 
 /// Terminal columns `c` takes: two for Hangul and other East Asian wide

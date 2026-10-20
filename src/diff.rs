@@ -24,6 +24,8 @@ use crate::changes::{
 pub const SOURCE: &str = "HERDR_SIM_DIFF_SOURCE";
 /// How often a checkout's diff is read again, so an agent's edits show up.
 const WATCH: Duration = Duration::from_secs(2);
+/// Quiet ticks between full re-reads, which also find new untracked files.
+const RESCAN_TICKS: u32 = 5;
 const CYAN: &str = "\x1b[38;2;137;220;235m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const BOLD: &str = "\x1b[1m";
@@ -98,6 +100,9 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     let mut focus = Focus::Files;
     let mut tree_shown = true;
     let mut pending_g = false;
+    // What a checkout looked like when last read, and quiet ticks since.
+    let mut last_print = 0u64;
+    let mut quiet = 0u32;
     // The selected file's highlighted lines, kept until it or the diff
     // changes: highlighting is the costly part of a frame.
     let mut shown: Option<(usize, Vec<Shown>)> = None;
@@ -229,6 +234,16 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             }
             Ok(_) => {}
             Err(_) if source.starts_with("checkout:") => {
+                // git runs only when something it reads has moved: a file
+                // in the diff, the index, or (every few ticks) a new file.
+                let dir = source.trim_start_matches("checkout:");
+                let print = fingerprint(dir, &files);
+                quiet += 1;
+                if print == last_print && quiet < RESCAN_TICKS {
+                    continue;
+                }
+                last_print = print;
+                quiet = 0;
                 let fresh = read(&source);
                 if fresh != files {
                     files = fresh;
@@ -273,6 +288,21 @@ fn title(source: &str) -> String {
         ),
         None => url.to_string(),
     }
+}
+
+/// A cheap summary of a checkout's state: the modification times of its
+/// index and of the files in its diff. Unchanged, the diff is too (bar new
+/// untracked files).
+fn fingerprint(dir: &str, files: &[File]) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hash = DefaultHasher::new();
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    modified(&Path::new(dir).join(".git/index")).hash(&mut hash);
+    for file in files {
+        file.path.hash(&mut hash);
+        modified(&Path::new(dir).join(&file.path)).hash(&mut hash);
+    }
+    hash.finish()
 }
 
 /// The unified diff `source` names, split into files.
