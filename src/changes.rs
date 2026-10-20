@@ -181,6 +181,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // Read the main pass's scan cache once and keep scanning in memory; never
     // write it back, so this pane cannot race the plugin's own runs.
     let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
+    // Each directory's checkout, found once: sessions revisit the same few.
+    let mut checkouts: HashMap<String, Option<String>> = HashMap::new();
     // The last details seen, so a reopened panel draws its PRs before GitHub
     // answers.
     let saved = state_dir.join("changes-prs.json");
@@ -233,8 +235,25 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         let _ = done.send((stale, got));
                     });
                 }
-                let local = agent["cwd"].as_str().and_then(local_changes);
-                render(&list, &prs, local)
+                // Every checkout the session worked in, where it runs first.
+                let dirs = agent["cwd"]
+                    .as_str()
+                    .map(String::from)
+                    .into_iter()
+                    .chain(session.iter().flat_map(|s| s.dirs.iter().cloned()));
+                let mut tops: Vec<String> = Vec::new();
+                for dir in dirs {
+                    let top = checkouts
+                        .entry(dir)
+                        .or_insert_with_key(|dir| checkout_of(dir));
+                    if let Some(top) = top
+                        && !tops.contains(top)
+                    {
+                        tops.push(top.clone());
+                    }
+                }
+                let local: Vec<Local> = tops.iter().filter_map(|top| local_changes(top)).collect();
+                render(&list, &prs, &local)
             }
             None => "No agent focused yet.\n".to_string(),
         };
@@ -441,17 +460,17 @@ const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
-    let width = columns().saturating_sub(1).max(20);
-    let mut s = format!("{BOLD}Changes{RESET} {DIM}\u{f47c}{RESET}\n\n");
-    // What the focused checkout has not committed yet, above its PRs.
-    if let Some(local) = local {
+fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
+    let (rows, columns) = size();
+    let width = columns.saturating_sub(1).max(20);
+    let mut s = String::new();
+    // What the session's checkouts have not committed yet, above its PRs.
+    for local in local {
         let lines: Vec<String> = local
             .diff
             .split(' ')
@@ -463,7 +482,7 @@ fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
         // "Create PR" opens GitHub's compare page for the branch.
         let button = "\u{f407} Create PR";
         let button_cols = cols(button);
-        let button = match local.compare {
+        let button = match &local.compare {
             Some(url) => format!("\x1b]8;;{url}\x1b\\{button}\x1b]8;;\x1b\\"),
             None => button.to_string(),
         };
@@ -477,10 +496,13 @@ fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
             .saturating_sub(3 + cols(&repo) + cols(&local.diff) + button_cols)
             .max(1);
         s += &format!(
-            "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n\n",
+            "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n",
             lines.join(" "),
             " ".repeat(gap)
         );
+    }
+    if !local.is_empty() {
+        s += "\n";
     } else if urls.is_empty() {
         s += &format!("{DIM}No changes.{RESET}\n");
     }
@@ -542,7 +564,8 @@ fn render(urls: &[String], prs: &Prs, local: Option<Local>) -> String {
         let gap = (width - 2).saturating_sub(left_cols + right_cols).max(1);
         s += &format!("  {left}{}{right}\n\n", " ".repeat(gap));
     }
-    s
+    // Only what fits: a longer frame scrolls the newest rows off the top.
+    s.lines().take(rows).collect::<Vec<_>>().join("\n")
 }
 
 /// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
@@ -551,6 +574,16 @@ struct Local {
     repo: String,
     diff: String,
     compare: Option<String>,
+}
+
+/// The top of the git checkout holding `dir`, if any.
+fn checkout_of(dir: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    let top = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !top.is_empty()).then_some(top)
 }
 
 /// What the checkout at `cwd` has not committed; `None` when clean.
@@ -604,16 +637,20 @@ fn local_changes(cwd: &str) -> Option<Local> {
     })
 }
 
-/// The pane's width in columns, from the terminal it runs in.
-fn columns() -> usize {
-    Command::new("stty")
+/// The pane's size as (rows, columns), from the terminal it runs in.
+fn size() -> (usize, usize) {
+    let out = Command::new("stty")
         .arg("size")
         .stdin(Stdio::inherit())
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.split_whitespace().nth(1)?.parse().ok())
-        .unwrap_or(40)
+        .unwrap_or_default();
+    let mut n = out.split_whitespace().map(|n| n.parse().ok());
+    (
+        n.next().flatten().unwrap_or(40),
+        n.next().flatten().unwrap_or(40),
+    )
 }
 
 /// Terminal columns `c` takes: two for Hangul and other East Asian wide

@@ -657,6 +657,9 @@ pub struct Session {
     pub title: Option<String>,
     /// When the session last had a message (Unix seconds).
     pub last_activity: Option<u64>,
+    /// Directories the session worked in, first seen first: where it ran,
+    /// edited files, or `cd`'d to.
+    pub dirs: Vec<String>,
 }
 
 /// One thing found in a session file line.
@@ -666,6 +669,8 @@ enum Hit {
     Activity(u64),
     /// Something the user asked, a title for a session Claude has not titled.
     Prompt(String),
+    /// A directory the session worked in.
+    Dir(String),
     /// `custom`: a title the user gave (`/rename`), which outranks generated ones.
     Title {
         custom: bool,
@@ -712,6 +717,9 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
                 if line.contains(r#""type":"user""#) {
                     hits.extend(user_prompt(line).map(Hit::Prompt));
                 }
+                if line.contains(r#""tool_use""#) {
+                    hits.extend(work_dirs(line, home).into_iter().map(Hit::Dir));
+                }
                 return hits;
             }
             let (field, custom) = if line.contains(r#""type":"pr-link""#) {
@@ -735,8 +743,10 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
         // Until Claude titles the session, its first question stands in.
         session.title = session.title.or(found.title).or(found.prompt);
         session.last_activity = session.last_activity.max(found.last);
+        session.dirs.extend(found.dirs);
     }
     session.prs = dedup(session.prs);
+    session.dirs = dedup(session.dirs);
     session
 }
 
@@ -746,6 +756,7 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
     let suffix = format!("{session_id}.jsonl");
     let mut urls = Vec::new();
     let mut last = None;
+    let mut dirs = Vec::new();
     for year in subdirs(&home.join(".codex/sessions")) {
         for month in subdirs(&year) {
             for day in subdirs(&month) {
@@ -755,13 +766,30 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
                         if line.contains(r#""type":"response_item""#) {
                             hits.extend(message_time(line).map(Hit::Activity));
                         }
-                        if !line.contains(r#""CommandExecution""#) || !line.contains("/pull/") {
+                        let command = line.contains(r#""CommandExecution""#);
+                        if !command && !line.contains(r#""FileChange""#) {
                             return hits;
                         }
                         let Some(v) = parse(line) else {
                             return Vec::new();
                         };
                         let item = &v["payload"]["item"];
+                        // Where commands ran and which files patches touched.
+                        if let Some(cwd) = item["cwd"].as_str() {
+                            hits.push(Hit::Dir(
+                                cwd.strip_prefix("file://").unwrap_or(cwd).to_string(),
+                            ));
+                        }
+                        for file in object(&item["changes"]).map(|(file, _)| file) {
+                            hits.extend(
+                                Path::new(file)
+                                    .parent()
+                                    .map(|d| Hit::Dir(d.display().to_string())),
+                            );
+                        }
+                        if !command || !line.contains("/pull/") {
+                            return hits;
+                        }
                         if !is_gh_pr_command(&item["command"].to_string()) {
                             return Vec::new();
                         }
@@ -771,6 +799,7 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
                     });
                     urls.extend(found.urls);
                     last = last.max(found.last);
+                    dirs.extend(found.dirs);
                 }
             }
         }
@@ -790,6 +819,7 @@ pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessio
         prs: dedup(urls),
         title,
         last_activity: last,
+        dirs: dedup(dirs),
     }
 }
 
@@ -813,6 +843,47 @@ fn user_prompt(line: &str) -> Option<String> {
         return None;
     }
     Some(text.chars().take(60).collect())
+}
+
+/// Directories an assistant message's tool calls worked in: the session's
+/// `cwd`, the folder of each file it edited, and each absolute path a shell
+/// command `cd`'d or `git -C`'d to.
+fn work_dirs(line: &str, home: &Path) -> Vec<String> {
+    let Some(v) = parse(line) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<String> = v["cwd"].as_str().map(String::from).into_iter().collect();
+    let expand = |p: &str| -> Option<String> {
+        let p = p.trim_matches(|c| c == '"' || c == '\'' || c == ';' || c == ')');
+        let p = match p.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                format!("{}{rest}", home.display())
+            }
+            _ => p.to_string(),
+        };
+        p.starts_with('/').then_some(p)
+    };
+    for call in v["message"]["content"].as_array().into_iter().flatten() {
+        if call["type"] != "tool_use" {
+            continue;
+        }
+        let input = &call["input"];
+        if let Some(file) = input["file_path"]
+            .as_str()
+            .or(input["notebook_path"].as_str())
+        {
+            dirs.extend(Path::new(file).parent().map(|d| d.display().to_string()));
+        }
+        if let Some(command) = input["command"].as_str() {
+            let words: Vec<&str> = command.split_whitespace().collect();
+            for pair in words.windows(2) {
+                if matches!(pair[0], "cd" | "-C") {
+                    dirs.extend(expand(pair[1]));
+                }
+            }
+        }
+    }
+    dirs
 }
 
 /// The `"timestamp"` of a log line as Unix seconds, read without parsing the
@@ -918,6 +989,8 @@ struct Scanned {
     last: Option<u64>,
     /// The first thing the user asked.
     prompt: Option<String>,
+    /// Directories worked in, deduplicated.
+    dirs: Vec<String>,
 }
 
 /// What [`Cache::scan`] has found in a file so far.
@@ -926,6 +999,7 @@ struct Found {
     title: Option<String>,
     last: Option<u64>,
     prompt: Option<String>,
+    dirs: Vec<String>,
 }
 
 impl Cache {
@@ -957,14 +1031,17 @@ impl Cache {
                 // Entries from before message times were tracked lack "last";
                 // dropping them rereads those files once from the start.
                 v.get("last")?;
-                // Likewise for "prompt", the untitled-session fallback.
+                // Likewise for "prompt", the untitled-session fallback, and
+                // "dirs", where the session worked.
                 v.get("prompt")?;
+                let dirs = v.get("dirs")?.as_array()?.iter();
                 let scanned = Scanned {
                     offset: v["offset"].as_u64()?,
                     urls: urls.map(String::from).collect(),
                     title,
                     last: v["last"].as_u64(),
                     prompt: v["prompt"].as_str().map(String::from),
+                    dirs: dirs.filter_map(|d| d.as_str().map(String::from)).collect(),
                 };
                 Some((path.clone(), scanned))
             })
@@ -1028,7 +1105,7 @@ impl Cache {
             .map(|(path, s)| {
                 let (custom, title) = s.title.clone().unzip();
                 let entry =
-                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom, "last": s.last, "prompt": s.prompt });
+                    json!({ "offset": s.offset, "urls": s.urls, "title": title, "custom": custom, "last": s.last, "prompt": s.prompt, "dirs": s.dirs });
                 (path.clone(), entry)
             })
             .collect();
@@ -1167,6 +1244,7 @@ impl Cache {
                 title: None,
                 last: None,
                 prompt: None,
+                dirs: Vec::new(),
             };
         };
         let key = path.to_string_lossy().into_owned();
@@ -1189,6 +1267,11 @@ impl Cache {
                         Hit::Prompt(p) => {
                             scanned.prompt.get_or_insert(p);
                         }
+                        Hit::Dir(d) => {
+                            if !scanned.dirs.contains(&d) {
+                                scanned.dirs.push(d);
+                            }
+                        }
                         // A generated title never replaces one the user chose.
                         Hit::Title { custom, text } => {
                             if custom || !scanned.title.as_ref().is_some_and(|(c, _)| *c) {
@@ -1205,6 +1288,7 @@ impl Cache {
             title: scanned.title.as_ref().map(|(_, t)| t.clone()),
             last: scanned.last,
             prompt: scanned.prompt.clone(),
+            dirs: scanned.dirs.clone(),
         }
     }
 }
@@ -1748,6 +1832,25 @@ mod tests {
         );
         assert_eq!(state_heading_token("unknown", None), "heading_unknown");
         assert!(STATE_HEADING_TOKENS.contains(&state_heading_token("idle", Some(60))));
+    }
+
+    #[test]
+    fn work_dirs_reads_cwd_edits_and_cd() {
+        let line = json!({
+            "type": "assistant",
+            "cwd": "/w/wiki",
+            "message": { "content": [
+                { "type": "tool_use", "name": "Edit", "input": { "file_path": "/w/sim/src/lib.rs" } },
+                { "type": "tool_use", "name": "Bash", "input": {
+                    "command": "cd ~/dotfiles && git -C \"/w/other\" diff; cd relative; cd $X" } },
+                { "type": "text", "text": "cd /not/a/tool" },
+            ] },
+        })
+        .to_string();
+        assert_eq!(
+            work_dirs(&line, Path::new("/home/u")),
+            ["/w/wiki", "/w/sim/src", "/home/u/dotfiles", "/w/other"]
+        );
     }
 
     #[test]
