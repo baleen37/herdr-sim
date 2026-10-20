@@ -75,7 +75,8 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
     let mut open = Command::new(herdr);
     open.args(["plugin", "pane", "open", "--plugin", PLUGIN])
         .args(["--entrypoint", ENTRYPOINT])
-        .args(["--placement", "split", "--direction", "right", "--no-focus"]);
+        // Focused, so its keys work at once.
+        .args(["--placement", "split", "--direction", "right", "--focus"]);
     // Start on the pane the key was pressed in; after that, follow focus.
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
@@ -200,6 +201,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut view = View {
         scroll: 0,
         rows: size().0,
+        cols: size().1,
         step: 0,
         hover: None,
         selected: None,
@@ -307,10 +309,15 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         };
         // Redraw only on change: no flicker, no work for the terminal. The
         // pane's size is read once a tick, not per draw.
-        let rows = size().0;
-        if frame != last_frame || rows != view.rows {
+        let (rows, cols) = size();
+        if frame != last_frame || rows != view.rows || cols != view.cols {
             view.rows = rows;
+            view.cols = cols;
             view.scroll = view.scroll.min(max_scroll(&frame, rows));
+            // The first row starts selected, so the keys have somewhere to go.
+            if selected.is_none() {
+                selected = items.first().map(|i| i.key.clone());
+            }
             view.selected = selected
                 .as_ref()
                 .and_then(|key| items.iter().find(|i| &i.key == key))
@@ -623,6 +630,8 @@ const DIM: &str = "\x1b[2m";
 /// shows even where underline is not drawn.
 const HL_ON: &str = "\x1b[4;48;2;69;71;90m";
 const HL_OFF: &str = "\x1b[24;49m";
+/// The row the keys selected: a bar across the pane.
+const SELECTED: &str = "\x1b[48;2;49;50;68m";
 const RESET: &str = "\x1b[0m";
 
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
@@ -863,9 +872,7 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
         }
         let line = lines.get(row).copied().unwrap_or("");
         let line = match (view.selected, view.hover) {
-            (Some((first, last)), _) if (first..=last).contains(&i) => {
-                highlight(line, 1, usize::MAX)
-            }
+            (Some((first, last)), _) if (first..=last).contains(&i) => bar(line, view.cols),
             (_, Some((at, start, end))) if at == i => highlight(line, start, end),
             _ => line.to_string(),
         };
@@ -882,8 +889,9 @@ fn draw(frame: &str, view: View, only: Option<&[usize]>) {
 struct View {
     /// Lines scrolled off the top.
     scroll: usize,
-    /// The pane's height.
+    /// The pane's height and width.
     rows: usize,
+    cols: usize,
     /// Pulse step of running checks' dots.
     step: usize,
     /// The link under the pointer: its line in the frame, and columns.
@@ -932,6 +940,33 @@ fn highlight(line: &str, start: usize, end: usize) -> String {
         out += HL_OFF;
     }
     out
+}
+
+/// `line` on the selected row's background, across the pane's whole width.
+fn bar(line: &str, width: usize) -> String {
+    let mut out = SELECTED.to_string();
+    let mut cols = 0;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // A reset inside the line would end the background; restore it.
+            out.push(c);
+            for e in chars.by_ref() {
+                out.push(e);
+                if e.is_ascii_alphabetic() || e == '\\' {
+                    if e == 'm' {
+                        out += SELECTED;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+        cols += if c == PULSE { 1 } else { char_cols(c) };
+    }
+    out += &" ".repeat(width.saturating_sub(cols));
+    out + "\x1b[49m"
 }
 
 /// What wakes the Changes loop besides its tick.
