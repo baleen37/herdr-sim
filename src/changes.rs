@@ -193,10 +193,15 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     if let (Some(ws), Ok(pane)) = (workspace_id(), std::env::var("HERDR_PANE_ID")) {
         let _ = std::fs::write(marker(state_dir, &ws), pane);
     }
-    // GitHub is asked off the drawing thread; one request at a time.
-    let (done, fetched) = mpsc::channel::<(Vec<String>, HashMap<String, Pr>)>();
+    // GitHub is asked off the drawing thread; one request at a time. Clicks
+    // arrive on the same channel.
+    let (done, events) = mpsc::channel::<Event>();
+    listen_for_clicks(done.clone());
     let mut fetching = false;
     let mut last_frame = String::new();
+    // What each drawn line does when clicked, and the PR whose menu is open.
+    let mut targets: Vec<Target> = Vec::new();
+    let mut menu: Option<String> = None;
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     loop {
@@ -234,7 +239,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     let done = done.clone();
                     std::thread::spawn(move || {
                         let got = fetch_all(&stale);
-                        let _ = done.send((stale, got));
+                        let _ = done.send(Event::Fetched(stale, got));
                     });
                 }
                 // Every checkout the session worked in, where it runs first.
@@ -260,9 +265,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     .as_str()
                     .and_then(|cwd| checkouts.get(cwd).cloned().flatten());
                 let env = environment(&tops, own.as_deref(), home, &mut names);
+                let (changes, clicks) = render(&list, &prs, &local, menu.as_deref());
+                // Environment rows do nothing when clicked.
+                targets = vec![Target::None; env.lines().count()];
+                targets.extend(clicks);
                 // Only what fits: a longer frame scrolls the top rows off.
                 let rows = size().0;
-                (env + &render(&list, &prs, &local))
+                (env + &changes)
                     .lines()
                     .take(rows)
                     .collect::<Vec<_>>()
@@ -278,8 +287,26 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             let _ = out.flush();
             last_frame = frame;
         }
-        // Wake early when GitHub answers, so its details show at once.
-        if let Ok((asked, mut got)) = fetched.recv_timeout(TICK) {
+        // Wake early when GitHub answers or a click comes, so either shows at
+        // once.
+        let event = events.recv_timeout(TICK);
+        if let Ok(Event::Click { x, y }) = event {
+            let width = size().1.saturating_sub(1).max(20);
+            let target = y.checked_sub(1).and_then(|row| targets.get(row)).cloned();
+            // Any click closes an open menu; the ⋮ of another PR opens its own.
+            let was = menu.take();
+            match target {
+                Some(Target::Title(url)) if x + 3 >= width => {
+                    if was.as_deref() != Some(url.as_str()) {
+                        menu = Some(url);
+                    }
+                }
+                Some(Target::Title(url) | Target::Open(url)) => open_url(&url),
+                Some(Target::Copy(text)) => copy(&text),
+                Some(Target::None) | None => {}
+            }
+        }
+        if let Ok(Event::Fetched(asked, mut got)) = event {
             fetching = false;
             let now = Some(Instant::now());
             for url in asked {
@@ -479,9 +506,15 @@ const RESET: &str = "\x1b[0m";
 /// Laid out like Claude Code's Changes panel: per PR, its state icon and
 /// title, then repo and number with lines changed, and comments and a checks
 /// dot on the right.
-fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
+fn render(
+    urls: &[String],
+    prs: &Prs,
+    local: &[Local],
+    menu: Option<&str>,
+) -> (String, Vec<Target>) {
     let width = size().1.saturating_sub(1).max(20);
-    let mut s = String::new();
+    let mut out: Vec<(String, Target)> = Vec::new();
+    let blank = |out: &mut Vec<(String, Target)>| out.push((String::new(), Target::None));
     // What the session's checkouts have not committed yet, above its PRs.
     for local in local {
         let lines: Vec<String> = local
@@ -495,10 +528,6 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
         // "Create PR" opens GitHub's compare page for the branch.
         let button = "\u{f407} Create PR";
         let button_cols = cols(button);
-        let button = match &local.compare {
-            Some(url) => format!("\x1b]8;;{url}\x1b\\{button}\x1b]8;;\x1b\\"),
-            None => button.to_string(),
-        };
         let repo = cut(
             &local.repo,
             width
@@ -508,16 +537,19 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
         let gap = width
             .saturating_sub(3 + cols(&repo) + cols(&local.diff) + button_cols)
             .max(1);
-        s += &format!(
-            "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}\n",
-            lines.join(" "),
-            " ".repeat(gap)
-        );
+        out.push((
+            format!(
+                "{DIM}±{RESET} {DIM}{repo}{RESET} {}{}{DIM}{button}{RESET}",
+                lines.join(" "),
+                " ".repeat(gap)
+            ),
+            local.compare.clone().map_or(Target::None, Target::Open),
+        ));
     }
     if !local.is_empty() {
-        s += "\n";
+        blank(&mut out);
     } else if urls.is_empty() {
-        s += &format!("{DIM}No changes.{RESET}\n");
+        out.push((format!("{DIM}No changes.{RESET}"), Target::None));
     }
     for url in urls {
         let Some((_, Some(pr))) = prs.get(url) else {
@@ -527,7 +559,12 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
                 (Some(repo), Some(n)) => format!("{repo} #{n}"),
                 _ => url.clone(),
             };
-            s += &format!("{DIM}\u{f407} {}{RESET}\n\n\n", cut(&name, width - 2));
+            out.push((
+                format!("{DIM}\u{f407} {}{RESET}", cut(&name, width - 2)),
+                Target::Open(url.clone()),
+            ));
+            blank(&mut out);
+            blank(&mut out);
             continue;
         };
         let (icon, colour) = match (pr.state.as_str(), pr.draft) {
@@ -536,15 +573,21 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
             (_, true) => ("\u{f4dd}", DIM),
             _ => ("\u{f407}", GREEN),
         };
-        // OSC 8 makes the title a link to the PR.
         // Title, then the row's menu mark at the right edge.
         let title = cut(&pr.title, width - 4);
         let gap = (width - 3).saturating_sub(cols(&title)).max(1);
-        s += &format!(
-            "{colour}{icon}{RESET} \x1b]8;;{}\x1b\\{title}\x1b]8;;\x1b\\{}{DIM}\u{f142}{RESET}\n",
-            pr.url,
-            " ".repeat(gap)
-        );
+        let open = menu == Some(pr.url.as_str());
+        let mark = if open { "" } else { DIM };
+        out.push((
+            format!(
+                "{colour}{icon}{RESET} {title}{}{mark}\u{f142}{RESET}",
+                " ".repeat(gap)
+            ),
+            Target::Title(pr.url.clone()),
+        ));
+        if open {
+            out.extend(pr_menu(&pr.url, width));
+        }
         let mut left = format!("{DIM}{} #{}{RESET}", pr.repo, pr.number);
         let mut left_cols = cols(&pr.repo) + 2 + pr.number.len();
         if pr.additions + pr.deletions > 0 {
@@ -575,9 +618,126 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> String {
             right_cols += 3;
         }
         let gap = (width - 2).saturating_sub(left_cols + right_cols).max(1);
-        s += &format!("  {left}{}{right}\n\n", " ".repeat(gap));
+        out.push((
+            format!("  {left}{}{right}", " ".repeat(gap)),
+            Target::Open(pr.url.clone()),
+        ));
+        blank(&mut out);
     }
-    s
+    let (lines, targets): (Vec<String>, Vec<Target>) = out.into_iter().unzip();
+    (lines.join("\n"), targets)
+}
+
+/// The menu a PR's ⋮ opens, boxed under its title at the right edge.
+fn pr_menu(url: &str, width: usize) -> Vec<(String, Target)> {
+    let items = [
+        ("Open in browser", Target::Open(url.to_string())),
+        ("Files changed", Target::Open(format!("{url}/files"))),
+        ("Checks", Target::Open(format!("{url}/checks"))),
+        ("Copy link", Target::Copy(url.to_string())),
+    ];
+    let inner = items
+        .iter()
+        .map(|(label, _)| cols(label))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let indent = " ".repeat(width.saturating_sub(inner + 2));
+    let edge = |l: &str, r: &str| format!("{indent}{DIM}{l}{}{r}{RESET}", "─".repeat(inner));
+    let mut rows = vec![(edge("┌", "┐"), Target::None)];
+    for (label, target) in items {
+        let pad = " ".repeat(inner - 1 - cols(label));
+        rows.push((
+            format!("{indent}{DIM}│{RESET} {label}{pad}{DIM}│{RESET}"),
+            target,
+        ));
+    }
+    rows.push((edge("└", "┘"), Target::None));
+    rows
+}
+
+/// What a click on a drawn line does.
+#[derive(Clone)]
+enum Target {
+    None,
+    /// A PR's title row: its ⋮ at the right edge opens the menu, the rest
+    /// opens the PR.
+    Title(String),
+    Open(String),
+    Copy(String),
+}
+
+/// What wakes the Changes loop besides its tick.
+enum Event {
+    Fetched(Vec<String>, HashMap<String, Pr>),
+    Click { x: usize, y: usize },
+}
+
+/// Turns on mouse reporting in the pane and sends each left click, as
+/// 1-based column and row, to `events`.
+fn listen_for_clicks(events: mpsc::Sender<Event>) {
+    // Unbuffered input without echo; output keeps its newlines.
+    let _ = Command::new("stty")
+        .args(["-icanon", "-echo"])
+        .stdin(Stdio::inherit())
+        .status();
+    // Button events, in SGR encoding.
+    print!("\x1b[?1000h\x1b[?1006h");
+    let _ = io::stdout().flush();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while io::stdin().read(&mut byte).is_ok_and(|n| n == 1) {
+            // ESC [ < button ; x ; y M  — a press; `m` is a release.
+            if byte[0] == 0x1b {
+                buf.clear();
+            }
+            buf.push(byte[0]);
+            if !matches!(byte[0], b'M' | b'm') || !buf.starts_with(b"\x1b[<") {
+                continue;
+            }
+            let seq = String::from_utf8_lossy(&buf[3..buf.len() - 1]).to_string();
+            let press = byte[0] == b'M';
+            buf.clear();
+            let n: Vec<usize> = seq.split(';').filter_map(|n| n.parse().ok()).collect();
+            if press
+                && let [0, x, y] = n[..]
+                && events.send(Event::Click { x, y }).is_err()
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Opens `url` in the default browser.
+fn open_url(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = Command::new(opener)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Puts `text` on the clipboard.
+fn copy(text: &str) {
+    let tool = if cfg!(target_os = "macos") {
+        "pbcopy"
+    } else {
+        "wl-copy"
+    };
+    if let Ok(mut child) = Command::new(tool).stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 /// Uncommitted changes in a checkout: its repo, `+a -d`, and GitHub's page
@@ -677,7 +837,8 @@ fn environment(
 ) -> String {
     let width = size().1.saturating_sub(1).max(20);
     let mut s = format!("{BOLD}Environment{RESET} {DIM}\u{f47c}{RESET}\n");
-    s += "\u{f0322} This computer\n";
+    // Herdr's name for the machine the panes run on.
+    s += "\u{f0322} local\n";
     let mut shown: Vec<String> = Vec::new();
     for top in tops {
         let name = names
