@@ -250,6 +250,8 @@ pub struct Place {
     /// What the checkout header shows: its branch, or its directory name on a
     /// detached HEAD.
     pub label: String,
+    /// A linked worktree rather than the repository's main checkout.
+    pub worktree: bool,
 }
 
 /// Sidebar token with a one-line checkout header, referenced as
@@ -316,10 +318,11 @@ pub fn tree_headers(places: &[Option<Place>]) -> Vec<(Option<String>, Option<Str
         .collect()
 }
 
-/// Sidebar tokens for a project › branch › session tree after herdr-radar,
+/// Sidebar tokens for a project › worktree › session tree after herdr-radar,
 /// referenced as `$tree_group_project`, `$tree_group` and `$tree_gap`: the
-/// project over its first agent, `├─`/`└─ <branch>` over each checkout's
-/// first agent, and a blank row after the project. A header whose sessions
+/// project over its first agent, `├─`/`└─ <branch>` over each worktree's
+/// first agent (the main checkout's sessions sit right under the project),
+/// and a blank row after the project. A header whose sessions
 /// have all gone stale moves to its `_stale` token instead.
 pub const TREE_GROUP_PROJECT_TOKEN: &str = "tree_group_project";
 pub const TREE_GROUP_PROJECT_STALE_TOKEN: &str = "tree_group_project_stale";
@@ -347,16 +350,17 @@ pub struct GroupRow {
     pub project: Option<String>,
     /// Whether every session of that project has gone stale.
     pub project_stale: bool,
-    /// The branch header, if this agent heads a checkout.
+    /// The branch header, if this agent heads a worktree.
     pub group: Option<String>,
-    /// Whether every session of that checkout has gone stale.
+    /// Whether every session of that worktree has gone stale.
     pub stale: bool,
     /// The blank row after a project's last agent.
     pub gap: Option<String>,
     /// How far the agent's own row sits in, on top of Herdr's. Herdr indents
-    /// an entry's continuation rows one level itself, so a session under a
-    /// header needs one more level of ours to sit under the branch, and a
-    /// session that is its entry's first row needs two.
+    /// an entry's continuation rows one level itself, so a worktree's session
+    /// under its header needs one more level of ours to sit under the branch,
+    /// and one that is its entry's first row needs two; a main checkout's
+    /// session one level less.
     pub depth: usize,
 }
 
@@ -384,13 +388,14 @@ pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
             let first_of_project = seen_projects.insert(place.project.clone());
             let first_of_checkout = seen_checkouts.insert(place.checkout.clone());
             let project = first_of_project.then(|| place.project.clone());
-            // The checkout's header is a continuation row under the project
+            // The worktree's header is a continuation row under the project
             // header on the project's first agent, which Herdr indents itself.
-            let group = first_of_checkout.then(|| {
-                let last = !later
-                    .iter()
-                    .flatten()
-                    .any(|next| next.project == place.project && next.checkout != place.checkout);
+            let group = (first_of_checkout && place.worktree).then(|| {
+                let last = !later.iter().flatten().any(|next| {
+                    next.worktree
+                        && next.project == place.project
+                        && next.checkout != place.checkout
+                });
                 let corner = if last { "└─" } else { "├─" };
                 let indent = if first_of_project {
                     String::new()
@@ -407,7 +412,11 @@ pub fn group_rows(places: &[Option<Place>], stale: &[bool]) -> Vec<GroupRow> {
                 project_stale: project.is_some() && all_stale(&|o| o.project == place.project),
                 project,
                 stale: group.is_some() && all_stale(&|o| o.checkout == place.checkout),
-                depth: if group.is_some() { 1 } else { 2 },
+                depth: match (place.worktree, group.is_some(), first_of_project) {
+                    (true, true, _) | (false, _, false) => 1,
+                    (true, false, _) => 2,
+                    (false, _, true) => 0,
+                },
                 group,
                 gap: last_of_project.then(|| ZWSP.to_string()),
             }
@@ -452,8 +461,8 @@ pub struct Activity {
 }
 
 /// Indices of the agents in activity order: projects by their most recent
-/// agent, then checkouts (main checkout and worktrees alike) and tabs within
-/// them the same way; names break ties, then list order. A tab whose sessions
+/// agent, then the main checkout, then worktrees and tabs within them the
+/// same way; names break ties, then list order. A tab whose sessions
 /// have all gone stale sinks to the bottom of its checkout, as in herdr-radar.
 /// Agents without a place come last, in list order.
 pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
@@ -479,7 +488,18 @@ pub fn activity_order(agents: &[Activity]) -> Vec<usize> {
         .filter_map(|(i, agent)| {
             let [project, checkout, tab] = groups(agent)?;
             let sunk = !fresh_tabs.contains(tab);
-            Some((i, (key(0, project), key(1, checkout), sunk, key(2, tab))))
+            // The main checkout leads its project: its worktrees hang off it.
+            let worktree = agent.place.as_ref().is_some_and(|p| p.worktree);
+            Some((
+                i,
+                (
+                    key(0, project),
+                    worktree,
+                    key(1, checkout),
+                    sunk,
+                    key(2, tab),
+                ),
+            ))
         })
         .collect();
     placed.sort_by(|a, b| a.1.cmp(&b.1));
@@ -1114,6 +1134,8 @@ impl Cache {
                     project: v["project"].as_str()?.to_string(),
                     checkout: v["checkout"].as_str()?.to_string(),
                     label: v["label"].as_str()?.to_string(),
+                    // Entries from before this field are dropped and looked up again.
+                    worktree: v["worktree"].as_bool()?,
                 };
                 Some((cwd.clone(), place))
             })
@@ -1174,7 +1196,7 @@ impl Cache {
             .map(|(cwd, p)| {
                 (
                     cwd.clone(),
-                    json!({ "project": p.project, "checkout": p.checkout, "label": p.label }),
+                    json!({ "project": p.project, "checkout": p.checkout, "label": p.label, "worktree": p.worktree }),
                 )
             })
             .collect();
@@ -1676,6 +1698,7 @@ mod tests {
                 project: project.into(),
                 checkout: checkout.into(),
                 label: label.into(),
+                worktree: checkout.contains("/wt"),
             })
         };
         let headers = tree_headers(&[
@@ -1745,12 +1768,13 @@ mod tests {
     }
 
     #[test]
-    fn group_rows_draw_project_branch_session_and_fade_stale_groups() {
+    fn group_rows_draw_project_worktree_session_and_fade_stale_groups() {
         let at = |project: &str, checkout: &str, label: &str| {
             Some(Place {
                 project: project.into(),
                 checkout: checkout.into(),
                 label: label.into(),
+                worktree: checkout.contains("/wt"),
             })
         };
         let rows = group_rows(
@@ -1761,22 +1785,23 @@ mod tests {
                 at("search", "/s/wt", "fix-x"),
                 None,
                 at("dotfiles", "/d", "main"),
+                at("infra", "/i/wt", "feat"),
             ],
-            &[false, true, true, true, false, true],
+            &[false, true, true, true, false, true, false],
         );
         let s = |v: &str| Some(v.to_string());
         let gap = s("\u{200b}");
         assert_eq!(
             rows,
             [
+                // The main checkout's sessions sit right under the project.
                 GroupRow {
                     project: s("search"),
-                    group: s("├─ \u{f418} main"),
-                    depth: 1,
+                    depth: 0,
                     ..Default::default()
                 },
                 GroupRow {
-                    depth: 2,
+                    depth: 1,
                     ..Default::default()
                 },
                 GroupRow {
@@ -1794,10 +1819,18 @@ mod tests {
                 GroupRow {
                     project: s("dotfiles"),
                     project_stale: true,
-                    group: s("└─ \u{f418} main"),
-                    stale: true,
+                    gap: gap.clone(),
+                    depth: 0,
+                    ..Default::default()
+                },
+                // A worktree whose main checkout runs nothing still hangs
+                // under its project.
+                GroupRow {
+                    project: s("infra"),
+                    group: s("└─ \u{f418} feat"),
                     gap,
                     depth: 1,
+                    ..Default::default()
                 },
             ]
         );
@@ -1818,6 +1851,7 @@ mod tests {
                 project: project.into(),
                 checkout: checkout.into(),
                 label: label.into(),
+                worktree: checkout.contains("/wt"),
             })
         };
         let headers = checkout_headers(&[
@@ -1844,6 +1878,7 @@ mod tests {
                 project: project.into(),
                 checkout: checkout.into(),
                 label: "main".into(),
+                worktree: checkout.matches('/').count() > 1,
             }),
             tab: tab.into(),
             seq,
@@ -1867,10 +1902,11 @@ mod tests {
             at("api", "/a", "t8", 0),
             at("infra", "/i", "t9", 0),
         ];
-        // search (latest 9): status (9: tab t2 then t6), batch (3), the main
-        // checkout (1); dotfiles (5); the two idle projects and their tabs by
-        // name; last the agent without a place.
-        assert_eq!(activity_order(&agents), [1, 6, 5, 4, 0, 2, 8, 7, 9, 3]);
+        // search (latest 9): the main checkout first, as the root its
+        // worktrees hang off, then status (9: tab t2 then t6), batch (3);
+        // dotfiles (5); the two idle projects and their tabs by name; last the
+        // agent without a place.
+        assert_eq!(activity_order(&agents), [0, 1, 6, 5, 4, 2, 8, 7, 9, 3]);
     }
 
     #[test]
@@ -1880,6 +1916,7 @@ mod tests {
                 project: "search".into(),
                 checkout: "/s".into(),
                 label: "main".into(),
+                worktree: false,
             }),
             tab: tab.into(),
             seq,

@@ -245,9 +245,9 @@ impl Run {
             };
             let (group_project, group_project_stale) = fade(row.project_stale, row.project);
             let (group, group_stale) = fade(row.stale, row.group);
-            // The branch PR rides on the checkout's card, from the same cache
-            // the Space pass fills, so it costs no extra gh call.
-            let card_pr = match (&worktree, &places[pos]) {
+            // The branch PR rides on the worktree's header, from the same
+            // cache the Space pass fills, so it costs no extra gh call.
+            let card_pr = match (group.as_ref().or(group_stale.as_ref()), &places[pos]) {
                 (Some(_), Some(place)) => {
                     let (repo, branch) = (place.checkout.clone(), place.label.clone());
                     let key = format!("{repo}#{branch}");
@@ -568,6 +568,7 @@ impl Run {
                 project: dir_name(cwd, &self.home),
                 checkout: cwd.to_string(),
                 label: dir_name(cwd, &self.home),
+                worktree: false,
             },
         };
         self.cache.set_place(cwd, place.clone());
@@ -631,6 +632,8 @@ struct Repo {
     project: String,
     /// `None` on a detached HEAD.
     branch: Option<String>,
+    /// A linked worktree rather than the main checkout.
+    worktree: bool,
 }
 
 impl Repo {
@@ -650,6 +653,7 @@ impl Repo {
                 .clone()
                 .or_else(dir)
                 .unwrap_or_else(|| self.top.clone()),
+            worktree: self.worktree,
         }
     }
 }
@@ -676,6 +680,8 @@ fn git_repo(cwd: &str) -> Option<Repo> {
         top: top.to_string(),
         project: project_name(top, common),
         branch: (branch != "HEAD").then(|| branch.to_string()),
+        // The main checkout keeps the repository in its own `.git`.
+        worktree: Path::new(common) != Path::new(top).join(".git"),
     })
 }
 
