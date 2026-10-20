@@ -373,7 +373,8 @@ fn parse(diff: &str) -> Vec<File> {
             }
             continue;
         }
-        let text = line.get(1..).unwrap_or("").replace('\t', "    ");
+        // Tabs stay: TSV columns are split on them; drawing expands them.
+        let text = line.get(1..).unwrap_or("").to_string();
         let row = |kind, old, new, text| Row {
             kind,
             old,
@@ -546,6 +547,9 @@ fn diff_lines(file: &File, colour: bool) -> Vec<Shown> {
     out
 }
 
+/// Columns a tab takes when drawn.
+const TAB_COLS: usize = 4;
+
 /// Colours for CSV columns, in turn.
 const COLUMN_COLOURS: [&str; 6] = [
     "\x1b[38;2;137;180;250m",
@@ -589,16 +593,20 @@ fn paint(spans: &[(String, String)], width: usize, bg: &str) -> (String, usize) 
     for (colour, text) in spans {
         out += &format!("{colour}{bg}");
         for c in text.chars() {
-            let w = if c.is_ascii() {
-                1
-            } else {
-                cols(&c.to_string())
+            let (c, w) = match c {
+                '\t' => (' ', TAB_COLS),
+                c if c.is_ascii() => (c, 1),
+                c => (c, cols(&c.to_string())),
             };
             if used + w > width {
                 out += "…";
                 return (out + RESET, width);
             }
-            out.push(c);
+            if c == ' ' && w > 1 {
+                out += &" ".repeat(w);
+            } else {
+                out.push(c);
+            }
             used += w;
         }
     }
@@ -801,6 +809,16 @@ fn tree_row(file: &File, selected: bool, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tsv_keeps_its_tabs_to_split_columns() {
+        let diff =
+            "diff --git a/t.tsv b/t.tsv\n--- a/t.tsv\n+++ b/t.tsv\n@@ -1 +1 @@\n-a\tb\n+a\tc\n";
+        let lines = diff_lines(&parse(diff)[0], true);
+        let texts: Vec<&str> = lines[1].spans.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(texts, ["a", "\t", "c"]);
+        assert_eq!(paint(&lines[1].spans, 20, "").1, 2 + TAB_COLS);
+    }
 
     #[test]
     fn columns_colour_each_field_and_keep_quoted_commas() {
