@@ -34,6 +34,8 @@ struct Pr {
     title: String,
     state: String,
     draft: bool,
+    /// Reviewers approved it.
+    approved: bool,
     additions: u64,
     deletions: u64,
     comments: usize,
@@ -160,8 +162,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
     // Each directory's checkout, found once: sessions revisit the same few.
     let mut checkouts: HashMap<String, Option<String>> = HashMap::new();
-    // Each checkout's repo name, from its remote; asked once.
-    let mut names: HashMap<String, Option<String>> = HashMap::new();
+    // Each checkout's repo name and GitHub owner/repo, from its remote; asked once.
+    let mut names: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     // The last details seen, so a reopened panel draws its PRs before GitHub
     // answers.
     let saved = state_dir.join("changes-prs.json");
@@ -279,10 +281,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     .iter()
                     .zip(diffs)
                     .filter_map(|(top, diff)| {
-                        let repo = names.entry(top.clone()).or_insert_with(|| repo_name(top));
+                        let (repo, slug) = names
+                            .entry(top.clone())
+                            .or_insert_with(|| (repo_name(top), github_slug(top)));
                         Some(Local {
                             repo: repo.clone()?,
                             diff: diff?,
+                            url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
                         })
                     })
                     .collect();
@@ -444,6 +449,7 @@ fn load_prs(path: &Path) -> Prs {
                 title: p["title"].as_str().unwrap_or("").to_string(),
                 state: p["state"].as_str().unwrap_or("").to_string(),
                 draft: p["draft"].as_bool().unwrap_or(false),
+                approved: p["approved"].as_bool().unwrap_or(false),
                 additions: p["additions"].as_u64().unwrap_or(0),
                 deletions: p["deletions"].as_u64().unwrap_or(0),
                 comments: p["comments"].as_u64().unwrap_or(0) as usize,
@@ -468,7 +474,7 @@ fn save_prs(path: &Path, prs: &Prs) {
                 url.clone(),
                 json!({
                     "repo": p.repo, "number": p.number, "title": p.title,
-                    "state": p.state, "draft": p.draft, "additions": p.additions,
+                    "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
                     "deletions": p.deletions, "comments": p.comments,
                     "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
                 }),
@@ -503,7 +509,7 @@ fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> 
 }
 
 /// What the panel asks GitHub for each PR.
-const PR_FIELDS: &str = "title number state isDraft additions deletions \
+const PR_FIELDS: &str = "title number state isDraft reviewDecision additions deletions \
     comments { totalCount } \
     commits(last: 1) { nodes { commit { statusCheckRollup { contexts { \
     checkRunCountsByState { state count } statusContextCountsByState { state count } \
@@ -587,6 +593,7 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
                 title,
                 state: pr["state"].as_str().unwrap_or("").to_string(),
                 draft: pr["isDraft"].as_bool().unwrap_or(false),
+                approved: pr["reviewDecision"] == "APPROVED",
                 additions: pr["additions"].as_u64().unwrap_or(0),
                 deletions: pr["deletions"].as_u64().unwrap_or(0),
                 comments: pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize,
@@ -627,7 +634,8 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
         );
         out.push((
             format!("{DIM}±{RESET} {DIM}{repo}{RESET} {}", lines.join(" ")),
-            Target::default(),
+            // The row opens the repo, and so is a stop for hjkl too.
+            Target::all(local.url.clone()),
         ));
     }
     if !local.is_empty() {
@@ -655,6 +663,8 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
             ("MERGED", _) => ("\u{f419}", PURPLE),
             ("CLOSED", _) => ("\u{f4dc}", RED),
             (_, true) => ("\u{f4dd}", DIM),
+            // Approved and still open: a green check, as in Claude Code.
+            _ if pr.approved => ("\u{f49e}", GREEN),
             _ => ("\u{f407}", GREEN),
         };
         let title = cut(&pr.title, width - 2);
@@ -911,7 +921,9 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
         .stdin(Stdio::inherit())
         .status();
     // Button and motion events, in SGR encoding.
-    print!("\x1b[?1003h\x1b[?1006h");
+    // The alternate screen has no scrollback, so herdr shows no scrollbar
+    // flashing at each redraw; the cursor is hidden.
+    print!("\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h");
     let _ = io::stdout().flush();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -968,10 +980,12 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-/// Uncommitted changes in a checkout: its repo and `+a -d`.
+/// Uncommitted changes in a checkout: its repo, `+a -d`, and its page.
 struct Local {
     repo: String,
     diff: String,
+    /// The repo on GitHub, if it is there.
+    url: Option<String>,
 }
 
 /// The top of the git checkout holding `dir`, if any.
@@ -1090,6 +1104,7 @@ mod tests {
             title: "Title".into(),
             state: "OPEN".into(),
             draft: false,
+            approved: false,
             additions: 3,
             deletions: 1,
             comments: 2,
