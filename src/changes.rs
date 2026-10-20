@@ -281,13 +281,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             last_frame = frame;
         }
         // Wake early when GitHub answers or a click comes, so either shows at
-        // once. Meanwhile, running checks spin.
+        // once. Meanwhile, running checks pulse.
         let deadline = Instant::now() + TICK;
         let mut step = 0;
         let event = loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let spinning = last_frame.contains(SPIN);
-            let wait = if spinning { left.min(SPIN_STEP) } else { left };
+            let spinning = last_frame.contains(PULSE);
+            let wait = if spinning { left.min(PULSE_STEP) } else { left };
             match events.recv_timeout(wait) {
                 // The wheel moves the drawn frame; nothing needs reading again.
                 Ok(Event::Scroll(by)) => {
@@ -505,7 +505,6 @@ fn fetch_all(urls: &[String]) -> HashMap<String, Pr> {
 const GREEN: &str = "\x1b[38;2;166;227;161m";
 const PURPLE: &str = "\x1b[38;2;203;166;247m";
 const RED: &str = "\x1b[38;2;243;139;168m";
-const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
@@ -605,16 +604,19 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>) 
             let n = pr.comments.to_string();
             right.push((format!("\u{f41f} {n}"), 2 + n.len(), DIM, pr.url.clone()));
         }
-        // Checks matter only while the PR is open; running ones spin.
+        // Checks matter only while the PR is open. Running ones show a
+        // pulsing grey dot and how many have passed, as in Claude Code.
         if let Some((ok, failed, total)) = pr.checks.filter(|_| pr.state == "OPEN") {
-            let (mark, c) = if failed > 0 {
-                ('\u{25cf}', RED)
+            let checks = format!("{}/checks", pr.url);
+            if failed > 0 {
+                right.push(("\u{25cf}".into(), 1, RED, checks));
             } else if ok == total {
-                ('\u{25cf}', GREEN)
+                right.push(("\u{25cf}".into(), 1, GREEN, checks));
             } else {
-                (SPIN, YELLOW)
-            };
-            right.push((mark.to_string(), 1, c, format!("{}/checks", pr.url)));
+                let count = format!("{ok}/{total}");
+                let n = 2 + count.len();
+                right.push((format!("{PULSE}{RESET} {DIM}{count}"), n, "", checks));
+            }
         }
         let right_cols: usize =
             right.iter().map(|(_, n, ..)| n).sum::<usize>() + 2 * right.len().saturating_sub(1);
@@ -670,10 +672,11 @@ impl Target {
     }
 }
 
-/// Stands in a frame for a running check's spinner, drawn at each step.
-const SPIN: char = '\u{1}';
-const SPIN_STEP: Duration = Duration::from_millis(120);
-const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Stands in a frame for a running check's dot, drawn at each step.
+const PULSE: char = '\u{1}';
+const PULSE_STEP: Duration = Duration::from_millis(120);
+/// The dot's grey at each step: fading in and out.
+const PULSE_GREYS: [u8; 10] = [90, 110, 130, 150, 170, 185, 170, 150, 130, 110];
 
 /// Lines one wheel notch scrolls.
 const SCROLL_LINES: isize = 3;
@@ -683,11 +686,12 @@ fn max_scroll(frame: &str) -> usize {
     frame.lines().count().saturating_sub(size().0)
 }
 
-/// Draws what of `frame` fits the pane from line `scroll`, spinners at
+/// Draws what of `frame` fits the pane from line `scroll`, pulsing dots at
 /// `step`: line by line over the last frame, each cleared to its end, so
 /// nothing flickers.
 fn draw(frame: &str, scroll: usize, step: usize) {
-    let spin = SPINNER[step % SPINNER.len()].to_string();
+    let grey = PULSE_GREYS[step % PULSE_GREYS.len()];
+    let dot = format!("\x1b[38;2;{grey};{grey};{grey}m\u{25cf}");
     let mut out = io::stdout();
     let _ = write!(out, "\x1b[H");
     let rows = size().0;
@@ -695,7 +699,7 @@ fn draw(frame: &str, scroll: usize, step: usize) {
         if i > 0 {
             let _ = write!(out, "\r\n");
         }
-        let _ = write!(out, "{}\x1b[K", line.replace(SPIN, &spin));
+        let _ = write!(out, "{}\x1b[K", line.replace(PULSE, &dot));
     }
     let _ = write!(out, "\x1b[J");
     let _ = out.flush();
@@ -712,8 +716,8 @@ enum Event {
     Scroll(isize),
 }
 
-/// Turns on mouse reporting in the pane and sends each left click, as
-/// 1-based column and row, to `events`.
+/// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
+/// 1-based column and row, and each wheel notch to `events`.
 fn listen_for_clicks(events: mpsc::Sender<Event>) {
     // Unbuffered input without echo; output keeps its newlines.
     let _ = Command::new("stty")
@@ -741,7 +745,9 @@ fn listen_for_clicks(events: mpsc::Sender<Event>) {
             buf.clear();
             let n: Vec<usize> = seq.split(';').filter_map(|n| n.parse().ok()).collect();
             let event = match n[..] {
-                [0, x, y] if press => Event::Click { x, y },
+                // Ctrl adds 16 to the button: links open on Ctrl+click only,
+                // so a plain click just focuses the pane.
+                [16, x, y] if press => Event::Click { x, y },
                 [64, ..] => Event::Scroll(-SCROLL_LINES),
                 [65, ..] => Event::Scroll(SCROLL_LINES),
                 _ => continue,
@@ -1043,9 +1049,9 @@ mod tests {
         assert_eq!(target.at(col("#7")), Some(pr));
         assert_eq!(target.at(col("+3")), Some(&*format!("{pr}/files")));
         assert_eq!(target.at(col("2")), Some(pr));
-        // Checks still running spin, and link to the checks page.
+        // Checks still running pulse, and link to the checks page.
         assert_eq!(
-            target.at(col(&SPIN.to_string())),
+            target.at(col(&PULSE.to_string())),
             Some(&*format!("{pr}/checks"))
         );
     }
