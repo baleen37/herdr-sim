@@ -188,12 +188,10 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                     edit(herdr, dir, &file.path, line);
                 }
             }
-            // z hides the file tree, or shows it again.
+            // z hides the file tree, or shows it again with the focus in it.
             Ok(Event::Key(b'z')) => {
                 tree_shown = !tree_shown;
-                if !tree_shown {
-                    focus = Focus::Diff;
-                }
+                focus = if tree_shown { Focus::Files } else { Focus::Diff };
             }
             Ok(Event::Key(b'\t')) if tree_shown => {
                 focus = if focus == Focus::Files {
