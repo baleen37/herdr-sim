@@ -221,6 +221,22 @@ herdr-radar's order is on.
 - A PR a session only inspected can still show up: in testing, Claude Code linked
   a PR whose URL appeared in the output of read-only commands.
 
+## Development
+
+`dev/session.sh` builds this checkout and opens a named Herdr session,
+`sim-dev`, whose plugin hooks run that build (`HERDR_SIM_BIN`, which every
+manifest command honours) and whose config is `~/.config/herdr/dev.toml` (a
+copy of the live one, made on first run). The default session keeps the
+installed version and its own config. The server reads both paths when it
+starts, so `herdr session stop sim-dev` before a run that changes them; a
+rebuilt binary is picked up at the next event.
+
+Each named session keeps its plugin state under `sessions/<name>` of the
+plugin's state directory, since pane ids repeat across sessions.
+
+`dev/sidebar.py [--color] [--session sim-dev]` prints the sidebar as the
+running server draws it, to check a change without looking at the screen.
+
 ## License
 
 MIT or Apache-2.0, at your option.
