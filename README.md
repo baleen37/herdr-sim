@@ -117,7 +117,7 @@ Claude Code's "Changes" panel as a right-hand split.
   barred and tinted, highlighted for the file's language, CSV columns in
   colour) beside a tree of the changed files. Vim keys move (`j`/`k`,
   `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
-  switches box, `z` hides the tree, `e` opens the file in `$EDITOR` at the
+  switches box, `z` hides the tree (and shows it again, focused), `e` opens the file in `$EDITOR` at the
   line, `q` brings the panel back.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
