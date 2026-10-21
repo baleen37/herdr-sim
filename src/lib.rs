@@ -573,6 +573,12 @@ pub fn space_lead(statuses: &[&str]) -> Option<usize> {
     statuses.iter().position(|s| *s == status)
 }
 
+/// The PRs a workspace's sessions touched, as one icon (`$pr`'s summary),
+/// at the right end of its header: `$space_pr` on the Space,
+/// `$group_pr` on the Agents list's header agent.
+pub const SPACE_PR_TOKEN: &str = "space_pr";
+pub const GROUP_PR_TOKEN: &str = "group_pr";
+
 /// `$space_title` on a working Space instead, behind the spinner (the
 /// working mark until the animator turns it), so the loading shows on the
 /// session's line as in the Agents list rather than on the Space's name.

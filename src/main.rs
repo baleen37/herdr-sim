@@ -12,7 +12,7 @@ mod changes;
 mod diff;
 mod watch;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
@@ -26,13 +26,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
-    DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, SPACE_AGE_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, STALE_HEADING_TOKEN,
-    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
-    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
-    animation, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
-    header_value, heading_title, heading_value, held_status, icon_token, indent,
+    DIFF_TOKEN, GROUP_PR_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place,
+    PrState, SORT_RANK_TOKEN, SPACE_AGE_TOKEN, SPACE_HEADER_TOKENS, SPACE_PR_TOKEN, SPIN_MS,
+    STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN,
+    TREE_GROUP_PARENT_TOKEN, TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN,
+    TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon,
+    agent_logo_value, animation, checkout_headers, claude_session, claude_session_name,
+    codex_session, diff_value, header_value, heading_title, heading_value, held_status, icon_token,
+    indent,
     layout::{self, Pane, Space},
     project_name, resolve_claude_session, scope, space_header_value, space_lead, space_status,
     space_title_animation, space_title_tokens, state_heading_token, state_heading_value,
@@ -57,6 +58,8 @@ struct Run {
     home: PathBuf,
     /// Whether the Agents list is in activity order.
     ordered: bool,
+    /// Herdr's `ui.sidebar_width`, to set a header's PR at its right end.
+    sidebar_width: Option<usize>,
     now: u64,
     cache: Cache,
 }
@@ -132,6 +135,7 @@ fn main() -> Result<()> {
         herdr: env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into()),
         home: PathBuf::from(env::var("HOME").context("HOME is not set")?),
         ordered: false,
+        sidebar_width: sidebar_width(),
         now: 0,
         cache: Cache::load(&cache_path),
     };
@@ -244,6 +248,7 @@ impl Run {
             .into_iter()
             .zip(checkout_headers(&places))
             .zip(rows);
+        let prs = self.space_prs(&agents);
         for (pos, (((project, worktree), header), row)) in headers.enumerate() {
             let agent = &agents[order[pos]];
             let Some(pane) = agent["pane_id"].as_str() else {
@@ -251,10 +256,25 @@ impl Run {
             };
             // The indent rides on the session row's first cell, the logo.
             self.cache.set_depth(pane, row.depth);
+            // The workspace's PRs at the right end of its header, as on its
+            // Space; Herdr draws the header from the second column, and the
+            // last stays free for the scrollbar.
+            let workspace = agent["workspace_id"].as_str().unwrap_or_default();
+            let group_pr = row
+                .group
+                .as_ref()
+                .and_then(|_| prs.get(workspace))
+                .and_then(summary_value);
+            let group = match (&group_pr, self.sidebar_width) {
+                (Some(pr), Some(width)) => row
+                    .group
+                    .map(|g| pad_before_pr(&g, width.saturating_sub(5), pr)),
+                _ => row.group,
+            };
             let (group, group_stale) = if row.group_stale {
-                (None, row.group)
+                (None, group)
             } else {
-                (row.group, None)
+                (group, None)
             };
             let tokens = [
                 (TREE_PROJECT_TOKEN.to_string(), project),
@@ -263,6 +283,7 @@ impl Run {
                 (TREE_GROUP_PARENT_TOKEN.to_string(), row.group_parent),
                 (TREE_GROUP_TOKEN.to_string(), group),
                 (TREE_GROUP_STALE_TOKEN.to_string(), group_stale),
+                (GROUP_PR_TOKEN.to_string(), group_pr),
                 (
                     TREE_GAP_TOKEN.to_string(),
                     row.gap.then(|| ZWSP.to_string()),
@@ -374,6 +395,7 @@ impl Run {
         states: &[(String, &'static str)],
         workspaces: &Value,
     ) {
+        let prs = self.space_prs(agents);
         for space in workspaces["result"]["workspaces"]
             .as_array()
             .into_iter()
@@ -395,7 +417,28 @@ impl Run {
                     .map(|(_, (status, _))| status.as_str()),
             );
             let token = format!("header_{status}");
-            let value = space_header_value(header, status);
+            // The PRs its sessions touched, at the right end of the name's row.
+            let pr = prs.get(id).and_then(summary_value);
+            let mut value = space_header_value(header, status);
+            if let (Some(pr), Some(width)) = (&pr, self.sidebar_width) {
+                // Herdr draws a Space's name from its fourth column, a
+                // worktree's under its checkout five further in, and keeps
+                // the last two columns for a collapse arrow and the scrollbar.
+                let family = |w: &Value| {
+                    w["worktree"]["is_linked_worktree"] == false
+                        && !w["worktree"]["repo_key"].is_null()
+                        && w["worktree"]["repo_key"] == space["worktree"]["repo_key"]
+                };
+                let nested = space["worktree"]["is_linked_worktree"] == true
+                    && workspaces["result"]["workspaces"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(family);
+                let inset = if nested { 13 } else { 8 };
+                let room = width.saturating_sub(inset);
+                value = pad_before_pr(&value, room, pr);
+            }
             let mut tokens: Vec<(String, Option<String>)> = SPACE_HEADER_TOKENS
                 .iter()
                 .map(|t| (t.to_string(), (*t == token).then(|| value.clone())))
@@ -415,8 +458,37 @@ impl Run {
             let age = lead.and_then(|a| self.age_secs(a)).map(age_value);
             tokens.extend(space_title_tokens(title.as_deref(), status));
             tokens.push((SPACE_AGE_TOKEN.to_string(), age));
+            tokens.push((SPACE_PR_TOKEN.to_string(), pr));
             self.report("workspace", id, "space-state", None, &tokens);
         }
+    }
+
+    /// Each workspace's PRs by state: those its sessions touched, as the
+    /// Changes panel lists them, each once. Read from the cache only; the
+    /// agent pass keeps it fresh.
+    fn space_prs(&mut self, agents: &[Value]) -> HashMap<String, HashMap<PrState, usize>> {
+        let mut urls: HashMap<String, HashSet<String>> = HashMap::new();
+        for agent in agents {
+            let (Some(workspace), Some(session)) =
+                (agent["workspace_id"].as_str(), self.session_of(agent))
+            else {
+                continue;
+            };
+            urls.entry(workspace.to_string())
+                .or_default()
+                .extend(session.prs);
+        }
+        urls.into_iter()
+            .map(|(workspace, urls)| {
+                let mut counts: HashMap<PrState, usize> = HashMap::new();
+                for url in urls {
+                    if let Some(state) = self.cache.state(&url, self.now, |_| None) {
+                        *counts.entry(state).or_default() += 1;
+                    }
+                }
+                (workspace, counts)
+            })
+            .collect()
     }
 
     fn agent(&mut self, agent: &Value) {
@@ -666,6 +738,35 @@ fn set_agent_view(on: bool) {
     }
 }
 
+/// `header` padded out to `room` columns less the PR cell Herdr puts after
+/// it (` · ` and `pr`), so that cell lands at the row's right end; cut with
+/// an ellipsis when it does not fit. Braille blanks, since Herdr trims
+/// spaces off a value's end; a leading zero-width indent is not counted.
+fn pad_before_pr(header: &str, room: usize, pr: &str) -> String {
+    let width = room.saturating_sub(3 + changes::cols(pr));
+    let body = header.trim_start_matches(ZWSP);
+    let lead = &header[..header.len() - body.len()];
+    let used = changes::cols(body);
+    if used > width {
+        return format!("{lead}{}", changes::cut(body, width));
+    }
+    format!("{header}{}", "\u{2800}".repeat(width - used))
+}
+
+/// `ui.sidebar_width` from Herdr's config file, if set.
+fn sidebar_width() -> Option<usize> {
+    let path = env::var("HERDR_CONFIG_PATH")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            env::var("HOME").map(|home| PathBuf::from(home).join(".config/herdr/config.toml"))
+        });
+    let text = fs::read_to_string(path.ok()?).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "sidebar_width").then(|| value.trim().parse().ok())?
+    })
+}
+
 /// Starts `--animate` in its own process group, so it outlives this run.
 fn spawn_animator() {
     let Ok(exe) = env::current_exe() else {
@@ -723,6 +824,11 @@ fn animate(state_dir: &Path) -> Result<()> {
             // A working Space spins on its title's line, as an agent does;
             // its name keeps the still mark. A question pulses on the name.
             let header_moves = tokens["header_working"].is_null();
+            // The name as the run padded it, behind the mark it pulses.
+            let header = tokens["header_blocked"]
+                .as_str()
+                .and_then(|v| v.split_once(' '))
+                .map_or(header, |(_, name)| name);
             let moves = [
                 header_moves
                     .then(|| animation(tokens, "header", header, frame))
@@ -954,4 +1060,22 @@ fn run(program: &str, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) ->
         );
     }
     Ok(out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_before_pr_sets_the_pr_at_the_right_end() {
+        // 20 columns: name, blanks, then Herdr's ` · ` and the PR's 3.
+        let padded = pad_before_pr("◐ search", 20, "\u{f407} 2");
+        assert_eq!(changes::cols(&padded), 14);
+        assert!(padded.starts_with("◐ search\u{2800}"));
+        // An indent of a zero-width space is not counted.
+        let nested = pad_before_pr("\u{200b}  └─ wt", 12, "\u{f407}");
+        assert_eq!(nested, "\u{200b}  └─ wt\u{2800}");
+        // Too long: cut, so the PR still shows.
+        assert_eq!(pad_before_pr("한국어 이름", 10, "\u{f407}"), "한국…");
+    }
 }
