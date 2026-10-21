@@ -503,7 +503,8 @@ pub fn state_heading_value(heading: &str, status: &str, depth: usize) -> String 
 /// agent it is in its vendor's colour, and the title beside it, in a
 /// `$label_*` token, says what it is doing. Referenced as `$icon_claude` and
 /// `$icon_codex`, or `$icon_stale` for a session idle over two hours, so the
-/// whole row can dim. The value leads with the row's tree indent.
+/// whole row can dim. The row's tree indent leads `$label_*`, so a row can
+/// leave the logo out.
 pub const ICON_TOKENS: [&str; 3] = ["icon_claude", "icon_codex", "icon_stale"];
 
 /// Which of [`ICON_TOKENS`] holds an agent's logo.
@@ -556,6 +557,21 @@ pub fn space_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static
         .into_iter()
         .find(|s| statuses.contains(s))
         .unwrap_or("unknown")
+}
+
+/// Workspace token with a session's title under the Space's name,
+/// referenced as `$space_title`, so the Spaces list reads like the Agents
+/// list.
+pub const SPACE_TITLE_TOKEN: &str = "space_title";
+
+/// The `$space_title` value, given each session's shown status and title:
+/// the title of the first session in the state the Space shows.
+pub fn space_title<'a>(sessions: &[(&str, &'a str)]) -> Option<&'a str> {
+    let status = space_status(sessions.iter().map(|(status, _)| *status));
+    sessions
+        .iter()
+        .find(|(s, _)| *s == status)
+        .map(|(_, heading)| *heading)
 }
 
 /// A `$header_*` value: the state's mark, then the header.
@@ -613,10 +629,13 @@ pub fn animation(
     .into_iter()
     .filter(|s| *s != state)
     .any(|s| !tokens[key(s)].is_null());
+    // The row's tree indent, which leads the value, stays where it is.
+    let current = tokens[key(state)].as_str().unwrap_or_default();
+    let lead = &current[..current.len() - current.trim_start_matches([' ', '\u{200b}']).len()];
     let value = match (others, text) {
         (true, _) => None,
-        (false, "") => Some(mark.to_string()),
-        (false, text) => Some(format!("{mark} {text}")),
+        (false, "") => Some(format!("{lead}{mark}")),
+        (false, text) => Some(format!("{lead}{mark} {text}")),
     };
     Some((key(state), value))
 }
@@ -1667,6 +1686,17 @@ mod tests {
     }
 
     #[test]
+    fn space_title_is_the_title_of_the_session_that_sets_its_state() {
+        let sessions = [
+            ("idle", "idle one"),
+            ("blocked", "asks"),
+            ("blocked", "asks too"),
+        ];
+        assert_eq!(space_title(&sessions), Some("asks"));
+        assert_eq!(space_title(&[]), None);
+    }
+
+    #[test]
     fn animation_spins_work_pulses_questions_and_lets_go_after_a_race() {
         let working = json!({ "label_working": "◐ Fix" });
         assert_eq!(
@@ -1690,6 +1720,11 @@ mod tests {
         assert_eq!(
             animation(&json!({ "label_idle": "○ Fix" }), "label", "Fix", 0),
             None
+        );
+        let indented = json!({ "label_working": "\u{200b}    ◐ Fix" });
+        assert_eq!(
+            animation(&indented, "label", "Fix", 9),
+            Some(("label_working".into(), Some("\u{200b}    ⣯ Fix".into())))
         );
         assert_eq!(heading_title("\u{ec82} Fix login"), "Fix login");
         assert_eq!(heading_title("\u{ec82}"), "");

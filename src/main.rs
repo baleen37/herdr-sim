@@ -27,14 +27,14 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
     DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, STALE_HEADING_TOKEN, STATE_HEADING_TOKENS,
-    Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN, TREE_GROUP_STALE_TOKEN,
-    TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN,
-    TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value, animation,
-    checkout_headers, claude_session, claude_session_name, codex_session, diff_value, header_value,
-    heading_title, heading_value, held_status, icon_token, indent,
+    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPACE_TITLE_TOKEN, SPIN_MS, STALE_HEADING_TOKEN,
+    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
+    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
+    animation, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
+    header_value, heading_title, heading_value, held_status, icon_token, indent,
     layout::{self, Pane, Space},
-    project_name, resolve_claude_session, scope, space_header_value, space_status,
+    project_name, resolve_claude_session, scope, space_header_value, space_status, space_title,
     state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
@@ -387,10 +387,27 @@ impl Run {
             );
             let token = format!("header_{status}");
             let value = space_header_value(header, status);
-            let tokens: Vec<(String, Option<String>)> = SPACE_HEADER_TOKENS
+            let mut tokens: Vec<(String, Option<String>)> = SPACE_HEADER_TOKENS
                 .iter()
                 .map(|t| (t.to_string(), (*t == token).then(|| value.clone())))
                 .collect();
+            // Under the name, the title of the session behind its state.
+            let sessions: Vec<(&str, String)> = agents
+                .iter()
+                .zip(states)
+                .filter(|(a, _)| a["workspace_id"] == id)
+                .filter_map(|(a, (status, _))| {
+                    let heading = self.cache.heading(a["pane_id"].as_str()?)?;
+                    let (_, title) = heading.split_once(' ')?;
+                    Some((status.as_str(), title.to_string()))
+                })
+                .collect();
+            let sessions: Vec<(&str, &str)> =
+                sessions.iter().map(|(s, h)| (*s, h.as_str())).collect();
+            tokens.push((
+                SPACE_TITLE_TOKEN.to_string(),
+                space_title(&sessions).map(String::from),
+            ));
             self.report("workspace", id, "space-state", None, &tokens);
         }
     }
@@ -539,7 +556,9 @@ impl Run {
             // The same heading split in two, logo apart, for the radar rows.
             // A report takes at most 16 tokens, so these go in a call of their own.
             let title = heading.strip_prefix(icon).and_then(|t| t.strip_prefix(' '));
-            let label = state_label_value(title, status);
+            // The indent leads the title: the row needs no logo ahead of it.
+            let label = state_label_value(title, status)
+                .map(|label| format!("{}{label}", indent(self.cache.depth(pane))));
             let mut radar: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
                 .map(|t| {
@@ -550,7 +569,7 @@ impl Run {
                 })
                 .collect();
             let logo = icon_token(kind, *state == STALE_HEADING_TOKEN);
-            let logo_value = format!("{}{icon}", indent(self.cache.depth(pane)));
+            let logo_value = icon.to_string();
             radar.extend(
                 ICON_TOKENS
                     .iter()
