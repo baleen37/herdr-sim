@@ -183,7 +183,7 @@ rows = [
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Until Claude Code titles the session, its first real question (not a slash command or command output, cut to 60 characters) stands in; unset before that. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$header_working`, `$header_blocked`, `$header_done`, `$header_idle`, `$header_unknown`, `$header_none` | On workspaces: the workspace's name behind the state's mark, in the one token for the state of the Space's agents — whichever most needs you: a question, then work, a finished turn (held until seen, as on agent rows), idle — or `$header_none` (`◦`) without an agent. So the Spaces list colours like the Agents list; leave Herdr's `state_icon` out of that row. A working Space's mark turns with the spinner. |
-| `$space_title` | On workspaces: the title of the session behind the Space's state (the one whose state its `$header_*` shows), so a Space's second row reads like an Agents row. |
+| `$space_title`, `$space_age` | On workspaces: the title of the session behind the Space's state (the one whose state its `$header_*` shows), and how long ago it last had a message, as `$age`. So a Space's second row reads like an Agents row. |
 | `$tree_header_idle` | `$tree_header` on a Space with no agent in it, in its own token so it can be dimmed. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 
@@ -193,13 +193,15 @@ A token with no PRs is cleared, so its separator disappears too.
 
 Off by default: the Agents list keeps Herdr's own sort (`agent_panel_sort`,
 for example `priority`, which puts sessions waiting for you first). Turned
-on, the plugin orders the Agents list by activity, the way
-[herdr-radar](https://github.com/hhdebb/herdr-radar) does, by when each
-session last had a message: a worktree family (a checkout and its linked
-worktrees) by its latest session, the checkout first; within it each
-workspace by its own latest; then each tab as one unit, the pane it was split
-from first; then each pane. Sessions that never worked come last. The tree
-headers follow that order.
+on, the plugin orders the Agents list in herdr-radar's tree
+([herdr-radar](https://github.com/hhdebb/herdr-radar)), what needs you first:
+a question, then a finished turn not yet seen, then work, then idle; within
+each, by when the session last had a message. A worktree family (a checkout
+and its linked worktrees) ranks by its most urgent session, the checkout
+first; within it each workspace the same way; then each tab as one unit, the
+pane it was split from first; then each pane. Sessions that never worked come
+last. The tree headers follow that order. Rows move when a turn ends or asks
+for input, not when one starts.
 
 Herdr turns off its own order toggle while a plugin's order is on. Switch back
 and forth with the `toggle-order` action, for example on a key:

@@ -27,14 +27,15 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
     DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, SPACE_HEADER_TOKENS, SPACE_TITLE_TOKEN, SPIN_MS, STALE_HEADING_TOKEN,
-    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
-    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
-    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
-    animation, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
-    header_value, heading_title, heading_value, held_status, icon_token, indent,
+    SORT_RANK_TOKEN, SPACE_AGE_TOKEN, SPACE_HEADER_TOKENS, SPACE_TITLE_TOKEN, SPIN_MS,
+    STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN,
+    TREE_GROUP_PARENT_TOKEN, TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN,
+    TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon,
+    agent_logo_value, animation, checkout_headers, claude_session, claude_session_name,
+    codex_session, diff_value, header_value, heading_title, heading_value, held_status, icon_token,
+    indent,
     layout::{self, Pane, Space},
-    project_name, resolve_claude_session, scope, space_header_value, space_status, space_title,
+    project_name, resolve_claude_session, scope, space_header_value, space_lead, space_status,
     state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
     token_value, tree_headers, workspace_agent_token,
 };
@@ -220,7 +221,7 @@ impl Run {
         let panes: Vec<Pane> = agents
             .iter()
             .zip(&states)
-            .map(|(agent, (_, state))| Pane {
+            .map(|(agent, (status, state))| Pane {
                 workspace: agent["workspace_id"]
                     .as_str()
                     .unwrap_or_default()
@@ -231,6 +232,7 @@ impl Run {
                     .and_then(|session| session.last_activity)
                     .map(|at| at / 60),
                 stale: *state == STALE_HEADING_TOKEN,
+                urgency: layout::urgency(status),
             })
             .collect();
         let (order, rows) = layout::layout(&panes, &spaces, self.ordered);
@@ -398,23 +400,21 @@ impl Run {
                 .iter()
                 .map(|t| (t.to_string(), (*t == token).then(|| value.clone())))
                 .collect();
-            // Under the name, the title of the session behind its state.
-            let sessions: Vec<(&str, String)> = agents
+            // Under the name, the session behind its state: its title and age.
+            let sessions: Vec<(&Value, &str)> = agents
                 .iter()
                 .zip(states)
                 .filter(|(a, _)| a["workspace_id"] == id)
-                .filter_map(|(a, (status, _))| {
-                    let heading = self.cache.heading(a["pane_id"].as_str()?)?;
-                    let (_, title) = heading.split_once(' ')?;
-                    Some((status.as_str(), title.to_string()))
-                })
+                .map(|(a, (status, _))| (a, status.as_str()))
                 .collect();
-            let sessions: Vec<(&str, &str)> =
-                sessions.iter().map(|(s, h)| (*s, h.as_str())).collect();
-            tokens.push((
-                SPACE_TITLE_TOKEN.to_string(),
-                space_title(&sessions).map(String::from),
-            ));
+            let statuses: Vec<&str> = sessions.iter().map(|(_, s)| *s).collect();
+            let lead = space_lead(&statuses).map(|i| sessions[i].0);
+            let title = lead
+                .and_then(|a| self.cache.heading(a["pane_id"].as_str()?))
+                .and_then(|heading| Some(heading.split_once(' ')?.1.to_string()));
+            let age = lead.and_then(|a| self.age_secs(a)).map(age_value);
+            tokens.push((SPACE_TITLE_TOKEN.to_string(), title));
+            tokens.push((SPACE_AGE_TOKEN.to_string(), age));
             self.report("workspace", id, "space-state", None, &tokens);
         }
     }
