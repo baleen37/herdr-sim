@@ -27,17 +27,17 @@ use anyhow::{Context, Result, bail};
 use herdr_sim::{
     AGE_TOKEN, AGENT_ICON_TOKEN, AGENT_KINDS, BRANCH_TOKEN, BranchPr, CI_TOKEN, Cache, Ci,
     DIFF_TOKEN, HEADING_TOKEN, ICON_TOKENS, PR_SUMMARY_TOKEN, PROJECT_TOKEN, Place, PrState,
-    SORT_RANK_TOKEN, SPACE_AGE_TOKEN, SPACE_HEADER_TOKENS, SPACE_TITLE_TOKEN, SPIN_MS,
-    STALE_HEADING_TOKEN, STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN,
-    TREE_GROUP_PARENT_TOKEN, TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN,
-    TREE_HEADER_TOKEN, TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon,
-    agent_logo_value, animation, checkout_headers, claude_session, claude_session_name,
-    codex_session, diff_value, header_value, heading_title, heading_value, held_status, icon_token,
-    indent,
+    SORT_RANK_TOKEN, SPACE_AGE_TOKEN, SPACE_HEADER_TOKENS, SPIN_MS, STALE_HEADING_TOKEN,
+    STATE_HEADING_TOKENS, Scope, Session, TITLE_TOKEN, TREE_GAP_TOKEN, TREE_GROUP_PARENT_TOKEN,
+    TREE_GROUP_STALE_TOKEN, TREE_GROUP_TOKEN, TREE_HEADER_IDLE_TOKEN, TREE_HEADER_TOKEN,
+    TREE_PROJECT_TOKEN, TREE_WORKTREE_TOKEN, ZWSP, age_value, agent_icon, agent_logo_value,
+    animation, checkout_headers, claude_session, claude_session_name, codex_session, diff_value,
+    header_value, heading_title, heading_value, held_status, icon_token, indent,
     layout::{self, Pane, Space},
     project_name, resolve_claude_session, scope, space_header_value, space_lead, space_status,
-    state_heading_token, state_heading_value, state_label_token, state_label_value, summary_value,
-    token_value, tree_headers, workspace_agent_token,
+    space_title_animation, space_title_tokens, state_heading_token, state_heading_value,
+    state_label_token, state_label_value, summary_value, token_value, tree_headers,
+    workspace_agent_token,
 };
 use serde_json::{Value, json};
 
@@ -413,7 +413,7 @@ impl Run {
                 .and_then(|a| self.cache.heading(a["pane_id"].as_str()?))
                 .and_then(|heading| Some(heading.split_once(' ')?.1.to_string()));
             let age = lead.and_then(|a| self.age_secs(a)).map(age_value);
-            tokens.push((SPACE_TITLE_TOKEN.to_string(), title));
+            tokens.extend(space_title_tokens(title.as_deref(), status));
             tokens.push((SPACE_AGE_TOKEN.to_string(), age));
             self.report("workspace", id, "space-state", None, &tokens);
         }
@@ -720,7 +720,16 @@ fn animate(state_dir: &Path) -> Result<()> {
             else {
                 continue;
             };
-            if let Some((key, value)) = animation(tokens, "header", header, frame) {
+            // A working Space spins on its title's line, as an agent does;
+            // its name keeps the still mark. A question pulses on the name.
+            let header_moves = tokens["header_working"].is_null();
+            let moves = [
+                header_moves
+                    .then(|| animation(tokens, "header", header, frame))
+                    .flatten(),
+                space_title_animation(tokens, frame),
+            ];
+            for (key, value) in moves.into_iter().flatten() {
                 moving |= value.is_some();
                 if written.insert((id.into(), key.clone()), value.clone()) != Some(value.clone()) {
                     report_tokens("workspace", id, json!({ key: value }));

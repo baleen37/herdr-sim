@@ -17,6 +17,10 @@ session="${HERDR_SIM_SESSION:-sim-dev}"
 cargo build --release --quiet --manifest-path "$root/Cargo.toml"
 # A copy of the live config to start from; edit it freely.
 [ -e "$config/dev.toml" ] || cp -L "$config/config.toml" "$config/dev.toml"
+# Started from inside an agent's pane, the server would hand that agent's
+# markers to every pane it opens (Claude Code then keeps no transcript, so
+# sessions have no titles).
+for var in $(env | sed -n 's/^\(CLAUDE[A-Z_]*\)=.*/\1/p'); do unset "$var"; done
 export HERDR_CONFIG_PATH="$config/dev.toml"
 export HERDR_SIM_BIN="$root/target/release/herdr-sim"
 exec herdr --session "$session" "$@"
