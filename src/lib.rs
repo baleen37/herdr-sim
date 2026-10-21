@@ -573,6 +573,49 @@ pub fn space_lead(statuses: &[&str]) -> Option<usize> {
     statuses.iter().position(|s| *s == status)
 }
 
+/// `$space_title` on a working Space instead, behind the spinner (the
+/// working mark until the animator turns it), so the loading shows on the
+/// session's line as in the Agents list rather than on the Space's name.
+pub const SPACE_TITLE_WORKING_TOKEN: &str = "space_title_working";
+/// The bare title, which the animator turns its spinner in front of; not
+/// meant for display.
+pub const SPACE_TITLE_TEXT_TOKEN: &str = "space_title_text";
+
+/// The three title tokens of a Space, given its title and state: the title
+/// in `$space_title`, or behind `◐` in `$space_title_working` while it works.
+pub fn space_title_tokens(title: Option<&str>, status: &str) -> [(String, Option<String>); 3] {
+    let working = status == "working";
+    [
+        (
+            SPACE_TITLE_TOKEN.into(),
+            title.filter(|_| !working).map(String::from),
+        ),
+        (
+            SPACE_TITLE_WORKING_TOKEN.into(),
+            title.filter(|_| working).map(|t| format!("◐ {t}")),
+        ),
+        (SPACE_TITLE_TEXT_TOKEN.into(), title.map(String::from)),
+    ]
+}
+
+/// What the animator writes on step `frame` into a Space's title tokens:
+/// the spinner in `$space_title_working`, or a clear when a write raced the
+/// end of the work and left it beside `$space_title`. `None` when the Space
+/// does not work.
+pub fn space_title_animation(tokens: &Value, frame: usize) -> Option<(String, Option<String>)> {
+    if tokens[SPACE_TITLE_WORKING_TOKEN].is_null() {
+        return None;
+    }
+    let value = match (
+        &tokens[SPACE_TITLE_TOKEN],
+        tokens[SPACE_TITLE_TEXT_TOKEN].as_str(),
+    ) {
+        (Value::Null, Some(title)) => Some(format!("{} {title}", SPINNER[frame % SPINNER.len()])),
+        _ => None,
+    };
+    Some((SPACE_TITLE_WORKING_TOKEN.into(), value))
+}
+
 /// A `$header_*` value: the state's mark, then the header.
 pub fn space_header_value(header: &str, status: &str) -> String {
     let mark = state_mark(status).unwrap_or("◦");
@@ -1688,6 +1731,30 @@ mod tests {
     fn space_lead_is_the_first_session_in_the_spaces_state() {
         assert_eq!(space_lead(&["idle", "blocked", "blocked"]), Some(1));
         assert_eq!(space_lead(&[]), None);
+    }
+
+    #[test]
+    fn a_working_space_spins_on_its_title_line() {
+        let [plain, working, text] = space_title_tokens(Some("Fix"), "working");
+        assert_eq!(plain.1, None);
+        assert_eq!(working.1.as_deref(), Some("◐ Fix"));
+        assert_eq!(text.1.as_deref(), Some("Fix"));
+        let [plain, working, _] = space_title_tokens(Some("Fix"), "idle");
+        assert_eq!((plain.1.as_deref(), working.1), (Some("Fix"), None));
+        let spinning = json!({ "space_title_working": "◐ Fix", "space_title_text": "Fix" });
+        assert_eq!(
+            space_title_animation(&spinning, 9),
+            Some(("space_title_working".into(), Some("⣯ Fix".into())))
+        );
+        let raced = json!({ "space_title_working": "⣷ Fix", "space_title": "Fix" });
+        assert_eq!(
+            space_title_animation(&raced, 0),
+            Some(("space_title_working".into(), None))
+        );
+        assert_eq!(
+            space_title_animation(&json!({ "space_title": "Fix" }), 0),
+            None
+        );
     }
 
     #[test]
