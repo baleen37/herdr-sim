@@ -157,7 +157,7 @@ rows = [
 row_gap = 0
 rows = [
   [{ token = "$header_working", fg = "#fab387", bold = true }, { token = "$header_blocked", fg = "#f38ba8", bold = true }, { token = "$header_done", fg = "#a6e3a1", bold = true }, { token = "$header_idle", fg = "#cdd6f4", bold = true }, { token = "$header_unknown", fg = "#cba6f7", bold = true }, { token = "$header_none", fg = "#6c7086" }],
-  [{ token = "$agent_claude", fg = "#d97757" }, { token = "$agent_codex", fg = "#cdd6f4" }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", hide = true }] }],
+  [{ token = "$space_title", fg = "#a8abbd" }, { token = "$pr", rules = [{ starts_with = "\uF407", fg = "#a6e3a1" }, { starts_with = "\uF419", fg = "#cba6f7" }, { starts_with = "\uF4DC", hide = true }] }],
 ]
 ```
 
@@ -183,6 +183,7 @@ rows = [
 | `$ci` | On workspaces: the checks of the branch's open PR as one icon: `` passed, `` failed, `` still running. Fetched with the PR state in the same `gh` call. |
 | `$title` | The session's title on agent panes: for Claude Code the latest `/rename` (`custom-title`), else the latest generated `ai-title`; for Codex the latest `thread_name` in `~/.codex/session_index.jsonl`. Until Claude Code titles the session, its first real question (not a slash command or command output, cut to 60 characters) stands in; unset before that. Unlike the terminal title, it is right for resumed sessions and for Codex, which sets none. |
 | `$header_working`, `$header_blocked`, `$header_done`, `$header_idle`, `$header_unknown`, `$header_none` | On workspaces: the workspace's name behind the state's mark, in the one token for the state of the Space's agents — whichever most needs you: a question, then work, a finished turn (held until seen, as on agent rows), idle — or `$header_none` (`◦`) without an agent. So the Spaces list colours like the Agents list; leave Herdr's `state_icon` out of that row. A working Space's mark turns with the spinner. |
+| `$space_title` | On workspaces: the logo and title of the session behind the Space's state (the one whose state its `$header_*` shows), so a Space's second row reads like an Agents row. |
 | `$tree_header_idle` | `$tree_header` on a Space with no agent in it, in its own token so it can be dimmed. |
 | `$agent_icon` | `` (cod-claude) for Claude Code, `` (cod-openai) for Codex. Agents only; needs a Nerd Font with Codicons 0.0.36+. |
 

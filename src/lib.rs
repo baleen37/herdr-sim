@@ -558,6 +558,21 @@ pub fn space_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static
         .unwrap_or("unknown")
 }
 
+/// Workspace token with a session's logo and title under the Space's name,
+/// referenced as `$space_title`, so the Spaces list reads like the Agents
+/// list.
+pub const SPACE_TITLE_TOKEN: &str = "space_title";
+
+/// The `$space_title` value, given each session's shown status and heading:
+/// the heading of the first session in the state the Space shows.
+pub fn space_title<'a>(sessions: &[(&str, &'a str)]) -> Option<&'a str> {
+    let status = space_status(sessions.iter().map(|(status, _)| *status));
+    sessions
+        .iter()
+        .find(|(s, _)| *s == status)
+        .map(|(_, heading)| *heading)
+}
+
 /// A `$header_*` value: the state's mark, then the header.
 pub fn space_header_value(header: &str, status: &str) -> String {
     let mark = state_mark(status).unwrap_or("◦");
@@ -1664,6 +1679,17 @@ mod tests {
         assert_eq!(space_status([]), "none");
         assert_eq!(space_header_value("search", "done"), "✓ search");
         assert_eq!(space_header_value("search", "none"), "◦ search");
+    }
+
+    #[test]
+    fn space_title_is_the_heading_of_the_session_that_sets_its_state() {
+        let sessions = [
+            ("idle", "L idle one"),
+            ("blocked", "L asks"),
+            ("blocked", "L asks too"),
+        ];
+        assert_eq!(space_title(&sessions), Some("L asks"));
+        assert_eq!(space_title(&[]), None);
     }
 
     #[test]
