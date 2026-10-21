@@ -70,11 +70,18 @@ fn main() -> Result<()> {
         event.as_deref(),
         env::var("HERDR_PLUGIN_EVENT_JSON").ok().as_deref(),
     );
-    let state_dir = env::var("HERDR_PLUGIN_STATE_DIR")
+    let plugin_dir = env::var("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| env::temp_dir().join("herdr-sim"));
+    // A named session has panes of its own, and pane ids repeat across
+    // sessions: keep its cache, locks and order apart. GitHub's budget is
+    // one, so the pause stays shared.
+    let state_dir = match env::var("HERDR_SESSION") {
+        Ok(session) if !session.is_empty() => plugin_dir.join("sessions").join(session),
+        _ => plugin_dir.clone(),
+    };
     fs::create_dir_all(&state_dir)?;
-    let _ = GH_PAUSE.set(state_dir.join("gh-pause"));
+    let _ = GH_PAUSE.set(plugin_dir.join("gh-pause"));
     // Present while the activity order is on (it is off by default, leaving
     // Herdr's own sort); the toggle action flips it.
     let order_on = state_dir.join("order-on");

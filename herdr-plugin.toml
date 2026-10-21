@@ -14,7 +14,7 @@ description = "Show the PRs each Claude Code / Codex pane touched as sidebar ico
 command = ["sh", "herdr/install.sh"]
 
 [[startup]]
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # Herdr disables its own Agents order toggle while a plugin's order is on, so
 # the plugin owns the way back. Bind it with a `plugin_action` key command.
@@ -22,36 +22,36 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 id = "toggle-order"
 title = "Agents: activity order on/off"
 description = "Switch the Agents list between activity order and Herdr's own."
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --toggle-order"]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --toggle-order"]
 
 # A finished turn is when a session may have created or pushed to a PR.
 [[events]]
 on = "pane.agent_status_changed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # A new worktree workspace is a new branch row; show its PR right away.
 [[events]]
 on = "worktree.created"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 [[events]]
 on = "worktree.opened"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # An agent pane going away changes its Space's agent count.
 [[events]]
 on = "pane.closed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # Looking at a pane releases the tick its finished turn held.
 [[events]]
 on = "pane.focused"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # A new Space needs its $project before its name can show.
 [[events]]
 on = "workspace.created"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\""]
 
 # Claude Code's "Changes" panel in a right-hand split: the PRs the focused
 # agent's session touched. Bind the action to a key, e.g. cmd+p.
@@ -59,14 +59,14 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\""]
 id = "changes"
 title = "Changes"
 placement = "split"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --changes-pane"]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --changes-pane"]
 
 # The diff the Changes panel opens full screen with `d`.
 [[panes]]
 id = "diff"
 title = "Diff"
 placement = "zoomed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --diff-pane"]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --diff-pane"]
 
 # `e` in the diff pane: the file in the user's editor, at the line, zoomed
 # over the diff.
@@ -74,10 +74,10 @@ command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --diff-pane"]
 id = "edit"
 title = "Edit"
 placement = "zoomed"
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --edit-pane"]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --edit-pane"]
 
 [[actions]]
 id = "toggle-changes"
 title = "Changes: open/close the right panel"
 description = "Open or close the panel of PRs the focused agent's session touched."
-command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-sim\" --toggle-changes"]
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --toggle-changes"]

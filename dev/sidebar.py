@@ -13,6 +13,7 @@ server and its panes are untouched.
 
     dev/sidebar.py            # the sidebar's text
     dev/sidebar.py --color    # each run of text with its colour, e.g. [#d97757]
+    dev/sidebar.py --session sim-dev   # the dev session (dev/session.sh)
 """
 
 import argparse
@@ -48,11 +49,11 @@ class Screen(pyte.Screen):
             self.write_process_input("\x1b[?62;22c")
 
 
-def capture(cols: int, rows: int, seconds: float) -> pyte.Screen:
+def capture(cols: int, rows: int, seconds: float, session: str | None) -> pyte.Screen:
     pid, fd = pty.fork()
     if pid == 0:
         os.environ.update(TERM="xterm-256color", COLORTERM="truecolor")
-        os.execvp("herdr", ["herdr"])
+        os.execvp("herdr", ["herdr", *(["--session", session] if session else [])])
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     screen = Screen(cols, rows, fd)
     stream = pyte.ByteStream(screen)
@@ -90,8 +91,9 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=50)
     parser.add_argument("--seconds", type=float, default=2.5)
     parser.add_argument("--color", action="store_true")
+    parser.add_argument("--session", help="a named session instead of the default one")
     args = parser.parse_args()
-    screen = capture(args.cols, args.rows, args.seconds)
+    screen = capture(args.cols, args.rows, args.seconds, args.session)
     for y in range(args.rows):
         line = screen.buffer[y]
         cells = [line[x] for x in range(args.width)]
