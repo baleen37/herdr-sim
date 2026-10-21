@@ -398,7 +398,8 @@ impl Run {
                 .filter(|(a, _)| a["workspace_id"] == id)
                 .filter_map(|(a, (status, _))| {
                     let heading = self.cache.heading(a["pane_id"].as_str()?)?;
-                    Some((status.as_str(), heading))
+                    let (_, title) = heading.split_once(' ')?;
+                    Some((status.as_str(), title.to_string()))
                 })
                 .collect();
             let sessions: Vec<(&str, &str)> =
@@ -555,7 +556,9 @@ impl Run {
             // The same heading split in two, logo apart, for the radar rows.
             // A report takes at most 16 tokens, so these go in a call of their own.
             let title = heading.strip_prefix(icon).and_then(|t| t.strip_prefix(' '));
-            let label = state_label_value(title, status);
+            // The indent leads the title: the row needs no logo ahead of it.
+            let label = state_label_value(title, status)
+                .map(|label| format!("{}{label}", indent(self.cache.depth(pane))));
             let mut radar: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
                 .map(|t| {
@@ -566,7 +569,7 @@ impl Run {
                 })
                 .collect();
             let logo = icon_token(kind, *state == STALE_HEADING_TOKEN);
-            let logo_value = format!("{}{icon}", indent(self.cache.depth(pane)));
+            let logo_value = icon.to_string();
             radar.extend(
                 ICON_TOKENS
                     .iter()
