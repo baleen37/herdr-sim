@@ -31,6 +31,19 @@ pub struct Pane {
     pub last_minute: Option<u64>,
     /// Idle over two hours.
     pub stale: bool,
+    /// How much the session needs you: 3 a question, 2 a finished turn not
+    /// yet seen, 1 at work, 0 idle.
+    pub urgency: u8,
+}
+
+/// [`Pane::urgency`] for a session's shown status.
+pub fn urgency(status: &str) -> u8 {
+    match status {
+        "blocked" => 3,
+        "done" => 2,
+        "working" => 1,
+        _ => 0,
+    }
 }
 
 /// One Herdr workspace.
@@ -196,45 +209,48 @@ fn family_of<'a>(parent_of: &HashMap<&str, &'a str>, ws: &'a str) -> &'a str {
     parent_of.get(ws).copied().unwrap_or(ws)
 }
 
-/// Indices of `panes` in herdr-radar's activity order: a worktree family by
-/// its latest session, its main checkout first; then each workspace by its
-/// own latest; then each tab as one unit, the pane it was split from first;
-/// then each pane. Never-worked panes sort last at every level; ties keep
+/// Indices of `panes` in herdr-radar's activity order, what needs you first:
+/// a worktree family by its most urgent session, then its newest, its main
+/// checkout first; then each workspace the same way; then each tab as one
+/// unit, the pane it was split from first; then each pane. Never-worked panes sort last at every level; ties keep
 /// Herdr's order.
 fn activity_order(panes: &[Pane], parent_of: &HashMap<&str, &str>) -> Vec<usize> {
-    // Each family, workspace and tab: its newest minute, and where it first
-    // shows in Herdr's list, which keeps it together and breaks ties.
-    let mut family_latest: HashMap<&str, (Option<u64>, usize)> = HashMap::new();
-    let mut ws_latest: HashMap<&str, (Option<u64>, usize)> = HashMap::new();
-    let mut tab_latest: HashMap<&str, (Option<u64>, usize)> = HashMap::new();
+    // Each family, workspace and tab: its most urgent session's urgency and
+    // newest minute, and where it first shows in Herdr's list, which keeps it
+    // together and breaks ties.
+    type Rank = (u8, Option<u64>);
+    let mut family_rank: HashMap<&str, (Rank, usize)> = HashMap::new();
+    let mut ws_rank: HashMap<&str, (Rank, usize)> = HashMap::new();
+    let mut tab_rank: HashMap<&str, (Rank, usize)> = HashMap::new();
     for (i, p) in panes.iter().enumerate() {
         for (map, name) in [
-            (&mut family_latest, family_of(parent_of, &p.workspace)),
-            (&mut ws_latest, p.workspace.as_str()),
-            (&mut tab_latest, p.tab.as_str()),
+            (&mut family_rank, family_of(parent_of, &p.workspace)),
+            (&mut ws_rank, p.workspace.as_str()),
+            (&mut tab_rank, p.tab.as_str()),
         ] {
-            let (latest, _) = map.entry(name).or_insert((None, i));
-            *latest = (*latest).max(p.last_minute);
+            let (rank, _) = map.entry(name).or_insert(((0, None), i));
+            *rank = (*rank).max((p.urgency, p.last_minute));
         }
     }
     let mut order: Vec<usize> = (0..panes.len()).collect();
-    // `Reverse` puts the newest first and `None`, the lowest, last.
+    // `Reverse` puts the most urgent, then the newest, first and `None`, the
+    // lowest, last.
     order.sort_by_key(|&i| {
         let p = &panes[i];
         let family = family_of(parent_of, &p.workspace);
-        let (family_minute, family_seen) = family_latest[family];
-        let (ws_minute, ws_seen) = ws_latest[p.workspace.as_str()];
-        let (tab_minute, tab_seen) = tab_latest[p.tab.as_str()];
+        let (family_rank, family_seen) = family_rank[family];
+        let (ws_rank, ws_seen) = ws_rank[p.workspace.as_str()];
+        let (tab_rank, tab_seen) = tab_rank[p.tab.as_str()];
         (
-            Reverse(family_minute),
+            Reverse(family_rank),
             family_seen,
             family != p.workspace,
-            Reverse(ws_minute),
+            Reverse(ws_rank),
             ws_seen,
-            Reverse(tab_minute),
+            Reverse(tab_rank),
             tab_seen,
             tab_seen != i,
-            Reverse(p.last_minute),
+            Reverse((p.urgency, p.last_minute)),
         )
     });
     order
@@ -250,6 +266,7 @@ mod tests {
             tab: tab.into(),
             last_minute: last,
             stale: false,
+            urgency: 0,
         }
     }
 
@@ -416,6 +433,31 @@ mod tests {
         ];
         let (_, rows) = layout(&panes, &spaces, false);
         assert_eq!(rows[3].group.as_deref(), Some("\u{f418} fix-b"));
+    }
+
+    #[test]
+    fn urgency_ranks_a_question_over_a_finished_turn_over_work() {
+        let ranks = ["blocked", "done", "working", "idle", "unknown"].map(urgency);
+        assert_eq!(ranks, [3, 2, 1, 0, 0]);
+    }
+
+    #[test]
+    fn what_needs_you_comes_first_then_the_newest() {
+        let at = |ws: &str, tab: &str, last: u64, urgency: u8| Pane {
+            urgency,
+            ..pane(ws, tab, Some(last))
+        };
+        let panes = [
+            at("idle", "t1", 9, 0),
+            at("asks", "t2", 1, 3),
+            at("done", "t3", 5, 2),
+            at("works", "t4", 7, 1),
+            at("asks", "t5", 8, 0),
+        ];
+        let spaces = ["idle", "asks", "done", "works"].map(|w| space(w, w));
+        let (order, _) = layout(&panes, &spaces, true);
+        // Groups by their most urgent session; within one, the same.
+        assert_eq!(order, [1, 4, 2, 3, 0]);
     }
 
     #[test]

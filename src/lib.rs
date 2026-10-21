@@ -559,19 +559,18 @@ pub fn space_status<'a>(statuses: impl IntoIterator<Item = &'a str>) -> &'static
         .unwrap_or("unknown")
 }
 
-/// Workspace token with a session's title under the Space's name,
-/// referenced as `$space_title`, so the Spaces list reads like the Agents
-/// list.
+/// Workspace tokens about the session behind a Space's state, under its
+/// name: `$space_title` its title, `$space_age` how long ago it last had a
+/// message (as `$age`), so the Spaces list's second row reads like an Agents
+/// row.
 pub const SPACE_TITLE_TOKEN: &str = "space_title";
+pub const SPACE_AGE_TOKEN: &str = "space_age";
 
-/// The `$space_title` value, given each session's shown status and title:
-/// the title of the first session in the state the Space shows.
-pub fn space_title<'a>(sessions: &[(&str, &'a str)]) -> Option<&'a str> {
-    let status = space_status(sessions.iter().map(|(status, _)| *status));
-    sessions
-        .iter()
-        .find(|(s, _)| *s == status)
-        .map(|(_, heading)| *heading)
+/// Which of a Space's sessions, given their shown statuses, is behind the
+/// state it shows: the first in that state.
+pub fn space_lead(statuses: &[&str]) -> Option<usize> {
+    let status = space_status(statuses.iter().copied());
+    statuses.iter().position(|s| *s == status)
 }
 
 /// A `$header_*` value: the state's mark, then the header.
@@ -1686,14 +1685,9 @@ mod tests {
     }
 
     #[test]
-    fn space_title_is_the_title_of_the_session_that_sets_its_state() {
-        let sessions = [
-            ("idle", "idle one"),
-            ("blocked", "asks"),
-            ("blocked", "asks too"),
-        ];
-        assert_eq!(space_title(&sessions), Some("asks"));
-        assert_eq!(space_title(&[]), None);
+    fn space_lead_is_the_first_session_in_the_spaces_state() {
+        assert_eq!(space_lead(&["idle", "blocked", "blocked"]), Some(1));
+        assert_eq!(space_lead(&[]), None);
     }
 
     #[test]
