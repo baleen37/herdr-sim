@@ -277,6 +277,13 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         let opener = start
             .as_deref()
             .and_then(|pane| agents.iter().find(|a| a["pane_id"].as_str() == Some(pane)));
+        // The pane it shows closed: the panel goes with it, even when focus
+        // landed on another agent.
+        if followed_gone(last_agent.as_ref(), &agents, |pane| {
+            pane_exists(herdr, pane)
+        }) {
+            return close(herdr);
+        }
         // Focus wins once it is on an agent; until then, the opener's pane.
         if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
             last_agent = Some(agent.clone());
@@ -501,7 +508,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     }
                 }
                 // j/k move between rows; Enter opens the row, p its PR, d its
-                // diff, c its latest comment.
+                // diff, c its latest comment; q closes the panel.
                 Ok(Event::Key(key)) => {
                     let at = selected
                         .as_ref()
@@ -511,6 +518,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     // Ctrl-d/u move half a screen of rows.
                     let half = (view.rows / 4).max(1);
                     let to = match (key, at) {
+                        (b'q', _) => return close(herdr),
                         (b'g', _) if !after_g => {
                             pending_g = true;
                             None
@@ -666,6 +674,39 @@ fn agents(herdr: &str) -> Vec<Value> {
         .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
         .and_then(|v| v["result"]["agents"].as_array().cloned())
         .unwrap_or_default()
+}
+
+/// Whether the pane the panel follows has closed: not among `agents`, and
+/// Herdr, asked only then, no longer has it. A pane whose agent quit is still
+/// there; focus on a pane that is no agent never changes what is followed.
+fn followed_gone(
+    followed: Option<&Value>,
+    agents: &[Value],
+    exists: impl FnOnce(&str) -> bool,
+) -> bool {
+    let Some(pane) = followed.and_then(|a| a["pane_id"].as_str()) else {
+        return false;
+    };
+    !agents.iter().any(|a| a["pane_id"].as_str() == Some(pane)) && !exists(pane)
+}
+
+/// Whether Herdr still has `pane`; yes when it cannot be asked, so a failed
+/// call never closes the panel.
+fn pane_exists(herdr: &str, pane: &str) -> bool {
+    Command::new(herdr)
+        .args(["pane", "get", pane])
+        .output()
+        .map_or(true, |o| o.status.success())
+}
+
+/// Closes the panel's own pane, which ends this process too.
+fn close(herdr: &str) -> anyhow::Result<()> {
+    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+        Command::new(herdr)
+            .args(["pane", "close", &pane])
+            .output()?;
+    }
+    Ok(())
 }
 
 fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> {
@@ -1590,5 +1631,25 @@ mod tests {
             target.at(col(&PULSE.to_string())),
             Some(&*format!("{pr}/checks"))
         );
+    }
+
+    #[test]
+    fn closes_only_when_the_followed_pane_is_gone() {
+        let agent = |pane: &str| json!({ "pane_id": pane });
+        let followed = agent("p1");
+        let never = |_: &str| panic!("asked Herdr about a pane it listed");
+        // Still an agent: stays, without asking Herdr.
+        assert!(!followed_gone(
+            Some(&followed),
+            &[agent("p1"), agent("p2")],
+            never
+        ));
+        // Its agent is gone but the pane is still there: stays.
+        assert!(!followed_gone(Some(&followed), &[agent("p2")], |_| true));
+        // The pane is gone: closes, even with focus on another agent.
+        assert!(followed_gone(Some(&followed), &[agent("p2")], |p| p != "p1"));
+        assert!(followed_gone(Some(&followed), &[], |_| false));
+        // Following nothing yet: nothing to lose.
+        assert!(!followed_gone(None, &[], |_| false));
     }
 }
