@@ -264,6 +264,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     let workspace = workspace_id();
+    // The panel's own tab, whose agents it falls back on.
+    let tab = std::env::var("HERDR_PANE_ID")
+        .ok()
+        .and_then(|pane| tab_of(herdr, &pane));
     loop {
         let agents = agents(herdr);
         // Only this workspace's agents: a panel in each workspace follows its
@@ -277,13 +281,15 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         let opener = start
             .as_deref()
             .and_then(|pane| agents.iter().find(|a| a["pane_id"].as_str() == Some(pane)));
-        // The pane it shows closed: the panel goes with it, even when focus
-        // landed on another agent.
-        if followed_gone(last_agent.as_ref(), &agents, |pane| {
+        // The pane it shows closed: another agent in the panel's tab takes
+        // its place, even when focus landed elsewhere; with none left, the
+        // panel goes with it.
+        match next(last_agent.as_ref(), &agents, tab.as_deref(), |pane| {
             pane_exists(herdr, pane)
-        }) && close(herdr)
-        {
-            return Ok(());
+        }) {
+            Next::Follow(agent) => last_agent = Some(agent.clone()),
+            Next::Close if close(herdr) => return Ok(()),
+            _ => {}
         }
         // Focus wins once it is on an agent; until then, the opener's pane.
         if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
@@ -677,18 +683,50 @@ fn agents(herdr: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Whether the pane the panel follows has closed: not among `agents`, and
-/// Herdr, asked only then, no longer has it. A pane whose agent quit is still
-/// there; focus on a pane that is no agent never changes what is followed.
-fn followed_gone(
+/// What the panel does about the pane it follows.
+enum Next<'a> {
+    Stay,
+    /// It closed; show this agent in the panel's tab instead.
+    Follow(&'a Value),
+    /// It closed, and no agent is left in the panel's tab.
+    Close,
+}
+
+/// Whether the pane the panel follows has closed, and what then. Closed means
+/// not among `agents`, and Herdr, asked only then, no longer has it: a pane
+/// whose agent quit is still there, and focus on a pane that is no agent never
+/// changes what is followed. Another agent in `tab` (the panel's, else the
+/// closed pane's), the focused one first, takes its place.
+fn next<'a>(
     followed: Option<&Value>,
-    agents: &[Value],
+    agents: &'a [Value],
+    tab: Option<&str>,
     exists: impl FnOnce(&str) -> bool,
-) -> bool {
+) -> Next<'a> {
     let Some(pane) = followed.and_then(|a| a["pane_id"].as_str()) else {
-        return false;
+        return Next::Stay;
     };
-    !agents.iter().any(|a| a["pane_id"].as_str() == Some(pane)) && !exists(pane)
+    if agents.iter().any(|a| a["pane_id"].as_str() == Some(pane)) || exists(pane) {
+        return Next::Stay;
+    }
+    let tab = tab.or(followed.and_then(|a| a["tab_id"].as_str()));
+    let mut left = agents
+        .iter()
+        .filter(|a| tab.is_some() && a["tab_id"].as_str() == tab);
+    match left.clone().find(|a| a["focused"].as_bool() == Some(true)) {
+        Some(agent) => Next::Follow(agent),
+        None => left.next().map_or(Next::Close, Next::Follow),
+    }
+}
+
+/// The tab `pane` is in.
+fn tab_of(herdr: &str, pane: &str) -> Option<String> {
+    let out = Command::new(herdr)
+        .args(["pane", "get", pane])
+        .output()
+        .ok()?;
+    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["result"]["pane"]["tab_id"].as_str().map(String::from)
 }
 
 /// Whether Herdr still has `pane`: no only when it answers that the pane is
@@ -1641,22 +1679,55 @@ mod tests {
     }
 
     #[test]
-    fn closes_only_when_the_followed_pane_is_gone() {
-        let agent = |pane: &str| json!({ "pane_id": pane });
-        let followed = agent("p1");
+    fn follows_another_agent_in_its_tab_before_closing() {
+        let agent = |pane: &str, tab: &str| json!({ "pane_id": pane, "tab_id": tab });
+        let followed = agent("p1", "t1");
         let never = |_: &str| panic!("asked Herdr about a pane it listed");
-        // Still an agent: stays, without asking Herdr.
-        assert!(!followed_gone(
-            Some(&followed),
-            &[agent("p1"), agent("p2")],
-            never
+        let pane = |a: &Value| a["pane_id"].as_str().map(String::from);
+        // The pane it shows is still an agent: stays, without asking Herdr.
+        // Focus on a pane that is no agent leaves it listed, so this holds.
+        let agents = [agent("p1", "t1"), agent("p2", "t1")];
+        assert!(matches!(
+            next(Some(&followed), &agents, Some("t1"), never),
+            Next::Stay
         ));
-        // Its agent is gone but the pane is still there: stays.
-        assert!(!followed_gone(Some(&followed), &[agent("p2")], |_| true));
-        // The pane is gone: closes, even with focus on another agent.
-        assert!(followed_gone(Some(&followed), &[agent("p2")], |p| p != "p1"));
-        assert!(followed_gone(Some(&followed), &[], |_| false));
+        // Its agent quit but the pane is still there: stays.
+        let agents = [agent("p2", "t1")];
+        assert!(matches!(
+            next(Some(&followed), &agents, Some("t1"), |_| true),
+            Next::Stay
+        ));
+        // Closed, with another agent stacked in its tab: shows that one.
+        match next(Some(&followed), &agents, Some("t1"), |_| false) {
+            Next::Follow(a) => assert_eq!(pane(a).as_deref(), Some("p2")),
+            _ => panic!("expected to follow p2"),
+        }
+        // Of several, the focused one.
+        let agents = [
+            agent("p2", "t1"),
+            json!({ "pane_id": "p4", "tab_id": "t1", "focused": true }),
+        ];
+        match next(Some(&followed), &agents, Some("t1"), |_| false) {
+            Next::Follow(a) => assert_eq!(pane(a).as_deref(), Some("p4")),
+            _ => panic!("expected to follow p4"),
+        }
+        // Closed, with agents only in other tabs: closes.
+        let agents = [agent("p3", "t2")];
+        assert!(matches!(
+            next(Some(&followed), &agents, Some("t1"), |_| false),
+            Next::Close
+        ));
+        assert!(matches!(
+            next(Some(&followed), &[], Some("t1"), |_| false),
+            Next::Close
+        ));
+        // The panel's tab unknown: the closed pane's tab stands in.
+        let agents = [agent("p2", "t1")];
+        assert!(matches!(
+            next(Some(&followed), &agents, None, |_| false),
+            Next::Follow(_)
+        ));
         // Following nothing yet: nothing to lose.
-        assert!(!followed_gone(None, &[], |_| false));
+        assert!(matches!(next(None, &[], Some("t1"), |_| false), Next::Stay));
     }
 }
