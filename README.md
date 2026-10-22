@@ -107,7 +107,8 @@ Claude Code's "Changes" panel as a right-hand split.
   dot and `8/11`.
 - **Focus.** It starts on the pane the key was pressed in, then follows the
   focused agent in its own workspace. When the agent pane it shows closes,
-  the panel closes too.
+  it shows another agent in its tab (one stacked above or below), or closes
+  when none is left.
 - **Keys.** `j`/`k` move between rows, `gg`/`G` to the ends. `Enter` opens
   the row, `p` its PR, `c` its latest comment, `d` its diff, `q` closes the
   panel.
