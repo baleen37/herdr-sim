@@ -281,8 +281,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         // landed on another agent.
         if followed_gone(last_agent.as_ref(), &agents, |pane| {
             pane_exists(herdr, pane)
-        }) {
-            return close(herdr);
+        }) && close(herdr)
+        {
+            return Ok(());
         }
         // Focus wins once it is on an agent; until then, the opener's pane.
         if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
@@ -518,7 +519,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     // Ctrl-d/u move half a screen of rows.
                     let half = (view.rows / 4).max(1);
                     let to = match (key, at) {
-                        (b'q', _) => return close(herdr),
+                        (b'q', _) if close(herdr) => return Ok(()),
                         (b'g', _) if !after_g => {
                             pending_g = true;
                             None
@@ -690,23 +691,29 @@ fn followed_gone(
     !agents.iter().any(|a| a["pane_id"].as_str() == Some(pane)) && !exists(pane)
 }
 
-/// Whether Herdr still has `pane`; yes when it cannot be asked, so a failed
-/// call never closes the panel.
+/// Whether Herdr still has `pane`: no only when it answers that the pane is
+/// not found, so a call that fails otherwise never closes the panel.
 fn pane_exists(herdr: &str, pane: &str) -> bool {
-    Command::new(herdr)
+    !Command::new(herdr)
         .args(["pane", "get", pane])
         .output()
-        .map_or(true, |o| o.status.success())
+        .is_ok_and(|o| {
+            !o.status.success()
+                && [&o.stderr, &o.stdout]
+                    .iter()
+                    .any(|out| String::from_utf8_lossy(out).contains("pane_not_found"))
+        })
 }
 
-/// Closes the panel's own pane, which ends this process too.
-fn close(herdr: &str) -> anyhow::Result<()> {
-    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+/// Closes the panel's own pane, which ends this process too; false when
+/// Herdr did not close it, and the panel stays.
+fn close(herdr: &str) -> bool {
+    std::env::var("HERDR_PANE_ID").is_ok_and(|pane| {
         Command::new(herdr)
             .args(["pane", "close", &pane])
-            .output()?;
-    }
-    Ok(())
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
 }
 
 fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> {
