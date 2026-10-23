@@ -1,4 +1,4 @@
-{ gh, lib, makeWrapper, rustPlatform, systems }:
+{ gh, git, lib, makeWrapper, rustPlatform, systems }:
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile ../Cargo.toml);
@@ -9,6 +9,8 @@ rustPlatform.buildRustPackage {
   src = ../.;
   cargoLock.lockFile = ../Cargo.lock;
   nativeBuildInputs = [ makeWrapper ];
+  # The Changes panel's tests make throwaway repos and worktrees.
+  nativeCheckInputs = [ git ];
 
   # $out doubles as the plugin root: the manifest runs bin/herdr-sim beside it.
   postInstall = ''
