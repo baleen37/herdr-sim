@@ -1,6 +1,6 @@
 id = "baleen37.herdr-sim"
 name = "herdr-sim"
-version = "0.33.0"
+version = "0.34.0"
 # `agent list` must report `agent_session`, which the Claude and Codex
 # integrations fill in from 0.9.0.
 min_herdr_version = "0.9.0"
@@ -61,15 +61,17 @@ title = "Changes"
 placement = "split"
 command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --changes-pane"]
 
-# The diff the Changes panel opens full screen with `d`.
+# The diff the Changes panel opens with `d`, as a popup over the tab.
 [[panes]]
 id = "diff"
 title = "Diff"
-placement = "zoomed"
+placement = "popup"
+width = "90%"
+height = "90%"
 command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --diff-pane"]
 
-# `e` in the diff pane: the file in the user's editor, at the line, zoomed
-# over the diff.
+# `e` in the diff: the file in the user's editor, at the line, zoomed over
+# the agent's pane; quitting it brings the diff back.
 [[panes]]
 id = "edit"
 title = "Edit"
@@ -81,3 +83,16 @@ id = "toggle-changes"
 title = "Changes: open/close the right panel"
 description = "Open or close the panel of PRs the focused agent's session touched."
 command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --toggle-changes"]
+
+# Ctrl+click on a GitHub PR link in any pane: its diff, as `d` shows it.
+[[actions]]
+id = "pr-diff"
+title = "Changes: the clicked PR's diff"
+description = "Open the diff of a GitHub pull request link in a popup."
+command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --pr-diff"]
+
+[[link_handlers]]
+id = "github-pr"
+title = "Show the PR's diff"
+pattern = "^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+"
+action = "pr-diff"

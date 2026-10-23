@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{LazyLock, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use herdr_sim::{
@@ -54,16 +55,16 @@ pub(crate) struct Pr {
 /// Opens the Changes pane at the right edge of the tab, or closes it if it
 /// is already open in this tab. The panel is found by its process, so panes
 /// closed by hand or opened before an upgrade are handled too.
-pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
+pub fn toggle(state_dir: &Path) -> anyhow::Result<()> {
     let focused = context_id("HERDR_PANE_ID", "focused_pane_id");
     // Without a tab in the context, the focused pane's: never the whole
     // workspace, whose other tabs have panels of their own.
-    let tab = tab_id().or_else(|| focused.as_deref().and_then(|p| tab_of(herdr, p)));
+    let tab = tab_id().or_else(|| focused.as_deref().and_then(tab_of));
     let Ours {
         live: mut open_now,
         dead,
         ..
-    } = our_panes(herdr, workspace_id().as_deref(), tab.as_deref());
+    } = our_panes(workspace_id().as_deref(), tab.as_deref());
     // The panel's own note of its pane id, in case its process list was busy
     // with a gh child when we looked. Only a pane titled and placed as the
     // panel is taken at its word.
@@ -72,13 +73,8 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
         if let Ok(pane) = std::fs::read_to_string(&path) {
             let _ = std::fs::remove_file(&path);
             let pane = pane.trim();
-            let panel = Command::new(herdr)
-                .args(["pane", "get", pane])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
-                .is_some_and(|v| ours(&v["result"]["pane"]));
+            let panel =
+                call("pane.get", json!({ "pane_id": pane })).is_some_and(|v| ours(&v["pane"]));
             if panel && !open_now.iter().chain(&dead).any(|p| p == pane) {
                 open_now.push(pane.to_string());
             }
@@ -86,44 +82,44 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
     }
     if !open_now.is_empty() {
         for pane in open_now {
-            let _ = Command::new(herdr).args(["pane", "close", &pane]).output();
+            call("pane.close", json!({ "pane_id": pane }));
         }
         return Ok(());
     }
     // What a restart left of a panel: the panel opens again in its place.
     if !dead.is_empty() {
         for pane in &dead {
-            replace(herdr, pane, true);
+            replace(pane, true);
         }
         return Ok(());
     }
-    let mut open = Command::new(herdr);
-    open.args(["plugin", "pane", "open", "--plugin", PLUGIN])
-        .args(["--entrypoint", ENTRYPOINT])
-        // Focused, so its keys work at once.
-        .args(["--placement", "split", "--direction", "right", "--focus"]);
+    // Focused, so its keys work at once.
+    let mut open = json!({
+        "plugin_id": PLUGIN, "entrypoint": ENTRYPOINT,
+        "placement": "split", "direction": "right", "focus": true,
+    });
     // Start on the pane the key was pressed in; after that, follow focus.
     if let Some(pane) = focused {
-        open.args(["--env", &format!("{FOR_PANE}={pane}")]);
-        if let Some(edge) = right_edge(herdr, &pane) {
-            open.args(["--target-pane", &edge]);
-        }
+        open["env"] = json!({ FOR_PANE: pane });
+        open["target_pane_id"] = right_edge(&pane).map_or(Value::Null, Value::from);
     }
-    let opened = open.output()?;
     // Narrow it at once, from the id the open returns: the panel would size
     // itself too, but only once its process is up, and the half-screen pane
     // would show until then.
-    let pane = serde_json::from_slice::<Value>(&opened.stdout)
-        .ok()
-        .and_then(|v| {
-            v["result"]["plugin_pane"]["pane"]["pane_id"]
-                .as_str()
-                .map(String::from)
-        });
-    if let Some(pane) = pane {
-        fit_width(herdr, &pane, Some(PANEL_COLS));
+    let opened = call("plugin.pane.open", open);
+    if let Some(pane) = opened
+        .as_ref()
+        .and_then(|v| v["plugin_pane"]["pane"]["pane_id"].as_str())
+    {
+        fit_width(pane, PANEL_COLS);
     }
     Ok(())
+}
+
+/// The result of a request to the Herdr server over its socket; `None` when
+/// it fails.
+pub(crate) fn call(method: &str, params: Value) -> Option<Value> {
+    crate::socket_request(method, params).ok()
 }
 
 /// The workspace this run belongs to. Plugin panes and actions get it only
@@ -137,7 +133,7 @@ fn tab_id() -> Option<String> {
     context_id("HERDR_TAB_ID", "tab_id")
 }
 
-fn context_id(var: &str, key: &str) -> Option<String> {
+pub(crate) fn context_id(var: &str, key: &str) -> Option<String> {
     std::env::var(var).ok().or_else(|| {
         let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
         let ctx: Value = serde_json::from_str(&ctx).ok()?;
@@ -155,28 +151,19 @@ fn marker(state_dir: &Path, tab: &str) -> std::path::PathBuf {
 struct Ours {
     /// Running the Changes panel.
     live: Vec<String>,
-    /// What a restart left of a panel or its diff (see `bare_shell`).
+    /// What a restart left of a panel (see `bare_shell`).
     dead: Vec<String>,
     /// Titled as ours but not at their prompt yet.
     waiting: usize,
 }
 
 /// The plugin's panes in `tab` of `workspace`, or everywhere.
-fn our_panes(herdr: &str, workspace: Option<&str>, tab: Option<&str>) -> Ours {
-    let mut list = Command::new(herdr);
-    list.args(["pane", "list"]);
-    if let Some(ws) = workspace {
-        list.args(["--workspace", ws]);
-    }
-    let Some(v) = list
-        .output()
-        .ok()
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
-    else {
+fn our_panes(workspace: Option<&str>, tab: Option<&str>) -> Ours {
+    let Some(v) = call("pane.list", json!({ "workspace_id": workspace })) else {
         return Ours::default();
     };
     let mut found = Ours::default();
-    for p in v["result"]["panes"].as_array().into_iter().flatten() {
+    for p in v["panes"].as_array().into_iter().flatten() {
         let Some(pane) = p["pane_id"].as_str() else {
             continue;
         };
@@ -188,13 +175,8 @@ fn our_panes(herdr: &str, workspace: Option<&str>, tab: Option<&str>) -> Ours {
         if tab.is_none() && !titled {
             continue;
         }
-        let info = Command::new(herdr)
-            .args(["pane", "process-info", "--pane", pane])
-            .output()
-            .ok()
-            .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
-        let info = info.as_ref().map(|i| &i["result"]["process_info"]);
-        match info {
+        let info = call("pane.process_info", json!({ "pane_id": pane }));
+        match info.as_ref().map(|i| &i["process_info"]) {
             Some(info) if info.to_string().contains("--changes-pane") => {
                 found.live.push(pane.to_string())
             }
@@ -209,10 +191,10 @@ fn our_panes(herdr: &str, workspace: Option<&str>, tab: Option<&str>) -> Ours {
 }
 
 /// Whether `pane` (from `pane list`) has the title and directory of the
-/// panel or its diff. Herdr brings such a pane back after a restart, by its
-/// title, as a shell in the plugin's directory.
+/// panel. Herdr brings such a pane back after a restart, by its title, as a
+/// shell in the plugin's directory.
 fn ours(pane: &Value) -> bool {
-    matches!(pane["label"].as_str(), Some("Changes" | "Diff"))
+    pane["label"] == "Changes"
         && pane["cwd"].as_str().is_some_and(|cwd| {
             let root = Path::new(cwd);
             root.file_name()
@@ -235,18 +217,18 @@ fn bare_shell(info: &Value) -> bool {
         })
 }
 
-/// Opens a panel in place of each pane a restart left of one (or of its
-/// diff), so the panels come back with the server. Run at startup.
-pub fn revive(herdr: &str) {
+/// Opens a panel in place of each pane a restart left of one, so the panels
+/// come back with the server. Run at startup.
+pub fn revive() {
     // The shells start with the server and run their rc files first; give
     // them a few seconds to reach their prompt.
     let mut done: Vec<String> = Vec::new();
     for _ in 0..20 {
-        let found = our_panes(herdr, None, None);
+        let found = our_panes(None, None);
         // Each once: one whose close failed is not given a second panel.
         for pane in found.dead {
             if !done.contains(&pane) {
-                replace(herdr, &pane, false);
+                replace(&pane, false);
                 done.push(pane);
             }
         }
@@ -258,34 +240,29 @@ pub fn revive(herdr: &str) {
 }
 
 /// Opens a panel in `pane`'s place, then closes `pane`.
-fn replace(herdr: &str, pane: &str, focus: bool) {
-    let opened = Command::new(herdr)
-        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
-        .args(["--entrypoint", ENTRYPOINT, "--placement", "split"])
-        .args(["--direction", "right", "--target-pane", pane])
-        .arg(if focus { "--focus" } else { "--no-focus" })
-        .args(["--env", &format!("{REPLACES}={pane}")])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if opened {
-        let _ = Command::new(herdr).args(["pane", "close", pane]).output();
+fn replace(pane: &str, focus: bool) {
+    let opened = call(
+        "plugin.pane.open",
+        json!({
+            "plugin_id": PLUGIN, "entrypoint": ENTRYPOINT, "placement": "split",
+            "direction": "right", "target_pane_id": pane, "focus": focus,
+            "env": { REPLACES: pane },
+        }),
+    );
+    if opened.is_some() {
+        call("pane.close", json!({ "pane_id": pane }));
     }
 }
 
 /// The pane a new panel opens to the right of, from `pane`'s tab: one at the
 /// tab's right edge, so the panel never lands between two panes.
-fn right_edge(herdr: &str, pane: &str) -> Option<String> {
-    rightmost(layout(herdr, pane)?["panes"].as_array()?, pane)
+fn right_edge(pane: &str) -> Option<String> {
+    rightmost(layout(pane)?["panes"].as_array()?, pane)
 }
 
 /// The layout of `pane`'s tab: its `area` and its `panes` with their `rect`s.
-fn layout(herdr: &str, pane: &str) -> Option<Value> {
-    let out = Command::new(herdr)
-        .args(["pane", "layout", "--pane", pane])
-        .output()
-        .ok()?;
-    let mut v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    Some(v["result"]["layout"].take())
+fn layout(pane: &str) -> Option<Value> {
+    Some(call("pane.layout", json!({ "pane_id": pane }))?["layout"].take())
 }
 
 /// Of `panes` (with their `rect`s), `pane` if it reaches the right edge,
@@ -313,68 +290,98 @@ const PANEL_COLS: f64 = 42.0;
 
 /// Names the pane a newly opened panel takes the place of; it waits for it
 /// to close before sizing itself.
-pub(crate) const REPLACES: &str = "HERDR_SIM_REPLACES";
+const REPLACES: &str = "HERDR_SIM_REPLACES";
 
 /// Waits, a second at most, for the pane in `REPLACES` to close.
-pub(crate) fn wait_gone(herdr: &str) {
+fn wait_gone() {
     let Ok(pane) = std::env::var(REPLACES) else {
         return;
     };
     for _ in 0..20 {
-        let alive = Command::new(herdr)
-            .args(["pane", "get", &pane])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !alive {
+        if !pane_exists(&pane) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Moves `pane`'s left edge so it is about `target` columns wide, or half
-/// the tab when `None`.
-pub(crate) fn fit_width(herdr: &str, pane: &str, target: Option<f64>) {
-    let measure = || {
-        let layout = layout(herdr, pane)?;
-        let width = layout["panes"]
-            .as_array()?
-            .iter()
-            .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
-            .as_f64()?;
-        Some((width, layout["area"]["width"].as_f64()?))
-    };
-    let Some((mut width, area)) = measure() else {
+/// Makes `pane` about `target` columns wide, in one move of the split that
+/// sets its width.
+fn fit_width(pane: &str, target: f64) {
+    let (Some(tree), Some(layout)) = (
+        call("layout.export", json!({ "pane_id": pane })),
+        layout(pane),
+    ) else {
         return;
     };
-    let target = target.unwrap_or(area / 2.0);
-    // A resize's amount is a share of the split the pane is in, which is the
-    // whole tab only when the pane was split off a full-width one. Start from
-    // the tab, then learn the split's width from how far the edge moved.
-    let mut unit = area;
-    for _ in 0..3 {
-        let by = width - target;
-        if by.abs() < 1.0 {
-            return;
-        }
-        // `right` moves the edge right, narrowing the pane; `left` widens it.
-        let direction = if by > 0.0 { "right" } else { "left" };
-        let amount = (by.abs() / unit).min(1.0);
-        let _ = Command::new(herdr)
-            .args(["pane", "resize", "--pane", pane, "--direction", direction])
-            .arg("--amount")
-            .arg(format!("{amount:.3}"))
-            .output();
-        let Some((now, _)) = measure() else {
-            return;
-        };
-        let moved = (now - width).abs();
-        if moved < 1.0 {
-            return;
-        }
-        unit = moved / amount;
-        width = now;
+    let rects = layout["panes"].as_array().map_or(&[][..], Vec::as_slice);
+    if let Some((path, ratio)) = split_ratio(&tree["layout"]["root"], rects, pane, target) {
+        call(
+            "layout.set_split_ratio",
+            json!({ "pane_id": pane, "path": path, "ratio": ratio }),
+        );
     }
+}
+
+/// The split that sets `pane`'s width in `root` (`layout.export`'s tree),
+/// and the ratio that makes it `target` columns wide: the nearest `right`
+/// split above it, as its path (true: the second side) and its first side's
+/// share. Its width is what its panes' `rects` (`pane.layout`) cover. `None`
+/// with no such split, or one too narrow for `target`.
+fn split_ratio(root: &Value, rects: &[Value], pane: &str, target: f64) -> Option<(Vec<bool>, f64)> {
+    // The splits from `node` down to `pane`, each with the side taken.
+    fn trail<'a>(node: &'a Value, pane: &str, out: &mut Vec<(&'a Value, bool)>) -> bool {
+        if node["type"] == "pane" {
+            return node["pane_id"].as_str() == Some(pane);
+        }
+        for (side, second) in [("first", false), ("second", true)] {
+            out.push((node, second));
+            if trail(&node[side], pane, out) {
+                return true;
+            }
+            out.pop();
+        }
+        false
+    }
+    fn panes<'a>(node: &'a Value, out: &mut Vec<&'a str>) {
+        match node["type"].as_str() {
+            Some("pane") => out.extend(node["pane_id"].as_str()),
+            Some("split") => {
+                panes(&node["first"], out);
+                panes(&node["second"], out);
+            }
+            _ => {}
+        }
+    }
+    let mut steps = Vec::new();
+    if !trail(root, pane, &mut steps) {
+        return None;
+    }
+    let at = steps
+        .iter()
+        .rposition(|(split, _)| split["direction"] == "right")?;
+    let (split, second) = steps[at];
+    let mut ids = Vec::new();
+    panes(split, &mut ids);
+    let n = |r: &Value, k: &str| r["rect"][k].as_f64().unwrap_or(0.0);
+    let cover = rects
+        .iter()
+        .filter(|r| r["pane_id"].as_str().is_some_and(|id| ids.contains(&id)));
+    let left = cover.clone().map(|r| n(r, "x")).fold(f64::MAX, f64::min);
+    let right = cover.map(|r| n(r, "x") + n(r, "width")).fold(0.0, f64::max);
+    let width = right - left;
+    if width <= target {
+        return None;
+    }
+    let share = if second {
+        1.0 - target / width
+    } else {
+        target / width
+    };
+    Some((
+        steps[..at].iter().map(|(_, second)| *second).collect(),
+        share,
+    ))
 }
 
 /// PR details by URL, with when they were fetched; `None` for details read
@@ -396,14 +403,14 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut prs = load_prs(&saved);
     let own = std::env::var("HERDR_PANE_ID").ok();
     // The panel's own tab: the agents it shows and falls back on.
-    let tab = own.as_deref().and_then(|pane| tab_of(herdr, pane));
+    let tab = own.as_deref().and_then(tab_of);
     if let Some(pane) = &own {
-        // Opened in place of the diff pane, it takes that pane's space when
-        // it goes, so it sizes itself then. Opened by the toggle, the toggle
-        // has sized it already; sizing again here would race it.
+        // Opened in place of what a restart left of a panel, it takes that
+        // pane's space when it goes, so it sizes itself then. Opened by the
+        // toggle, the toggle has sized it already; sizing again would race it.
         if std::env::var(REPLACES).is_ok() {
-            wait_gone(herdr);
-            fit_width(herdr, pane, Some(PANEL_COLS));
+            wait_gone();
+            fit_width(pane, PANEL_COLS);
         }
         // Tell the toggle which pane is the panel in this tab.
         if let Some(tab) = tab.as_deref() {
@@ -414,6 +421,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // arrive on the same channel.
     let (done, events) = mpsc::channel::<Event>();
     listen_for_clicks(done.clone());
+    // Herdr's own events say at once when focus moves or a pane changes;
+    // the tick still catches what they do not (a new PR in a transcript).
+    let woken = listen_for_herdr(done.clone());
     // File-system events tell which checkouts to ask git about again.
     let mut watch = crate::watch::Watch::new(done.clone());
     // Each checkout's `+a -d` and, for a linked worktree, its branch.
@@ -446,6 +456,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     loop {
         // Shortened when a checkout waits out its LOCAL_GAP.
         let mut tick = TICK;
+        // Events from here on wake the next pass.
+        woken.store(false, Ordering::Relaxed);
         let agents = agents(herdr);
         let focus = agents.iter().find(|a| a["focused"].as_bool() == Some(true));
         // Only this tab's agents: a panel in each tab follows its own, not
@@ -458,10 +470,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
         // its place, even when focus landed elsewhere; with none left, the
         // panel goes with it.
         match next(last_agent.as_ref(), &agents, tab.as_deref(), |pane| {
-            pane_exists(herdr, pane)
+            pane_exists(pane)
         }) {
             Next::Follow(agent) => last_agent = Some(agent.clone()),
-            Next::Close if close(herdr) => return Ok(()),
+            Next::Close if close() => return Ok(()),
             _ => {}
         }
         // The followed agent as it is now: a new session or directory shows
@@ -708,7 +720,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                     // Ctrl-d/u move half a screen of rows.
                     let half = (view.rows / 4).max(1);
                     let to = match (key, at) {
-                        (b'q', _) if close(herdr) => return Ok(()),
+                        (b'q', _) if close() => return Ok(()),
                         (b'g', _) if !after_g => {
                             pending_g = true;
                             None
@@ -736,12 +748,10 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some(url) = url {
                                 open_url(url);
                             }
-                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i))
-                                && let Some(agent) =
-                                    last_agent.as_ref().and_then(|a| a["pane_id"].as_str())
-                            {
+                            if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i)) {
                                 let cwd = cwd.unwrap_or_else(|| home.display().to_string());
-                                view_diff(herdr, &source, &cwd, agent);
+                                let agent = last_agent.as_ref().and_then(|a| a["pane_id"].as_str());
+                                open_diff(&source, &cwd, agent, None);
                             }
                             None
                         }
@@ -866,6 +876,66 @@ fn agents(herdr: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The pane and tab events that can change what the panel shows.
+const WAKING: [&str; 7] = [
+    "pane.focused",
+    "pane.closed",
+    "pane.created",
+    "pane.updated",
+    "pane.moved",
+    "pane.agent_detected",
+    "tab.focused",
+];
+
+/// Wakes the panel through `wake` at Herdr's `WAKING` events, from a
+/// subscription on the server's socket kept on a thread of its own: once
+/// per pass however many arrive (the flag returned is cleared at each pass),
+/// so a burst of title changes costs one. The subscription is made again a
+/// second after it drops or reports `events_lost`, with a wake for what
+/// happened meanwhile.
+fn listen_for_herdr(wake: mpsc::Sender<Event>) -> Arc<AtomicBool> {
+    use std::io::BufRead;
+    let woken = Arc::new(AtomicBool::new(false));
+    let subscribe = || -> Option<io::BufReader<std::os::unix::net::UnixStream>> {
+        let path = std::env::var("HERDR_SOCKET_PATH").ok()?;
+        let mut stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+        let types: Vec<Value> = WAKING.iter().map(|t| json!({ "type": t })).collect();
+        let request = json!({
+            "id": "herdr-sim-changes", "method": "events.subscribe",
+            "params": { "subscriptions": types },
+        });
+        writeln!(stream, "{request}").ok()?;
+        let mut reader = io::BufReader::new(stream);
+        let mut ack = String::new();
+        reader.read_line(&mut ack).ok()?;
+        let ack: Value = serde_json::from_str(&ack).ok()?;
+        ack["error"].is_null().then_some(reader)
+    };
+    let flag = woken.clone();
+    std::thread::spawn(move || {
+        loop {
+            if let Some(mut reader) = subscribe() {
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                    // An error (`events_lost`) ends this subscription.
+                    if line.contains(r#""error""#) {
+                        break;
+                    }
+                    if !flag.swap(true, Ordering::Relaxed) && wake.send(Event::Wake).is_err() {
+                        return;
+                    }
+                    line.clear();
+                }
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            if wake.send(Event::Wake).is_err() {
+                return;
+            }
+        }
+    });
+    woken
+}
+
 /// What the panel does about the pane it follows.
 enum Next<'a> {
     Stay,
@@ -912,38 +982,23 @@ fn here(agent: &Value, tab: Option<&str>, workspace: Option<&str>) -> bool {
 }
 
 /// The tab `pane` is in.
-fn tab_of(herdr: &str, pane: &str) -> Option<String> {
-    let out = Command::new(herdr)
-        .args(["pane", "get", pane])
-        .output()
-        .ok()?;
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    v["result"]["pane"]["tab_id"].as_str().map(String::from)
+fn tab_of(pane: &str) -> Option<String> {
+    let v = call("pane.get", json!({ "pane_id": pane }))?;
+    v["pane"]["tab_id"].as_str().map(String::from)
 }
 
 /// Whether Herdr still has `pane`: no only when it answers that the pane is
 /// not found, so a call that fails otherwise never closes the panel.
-fn pane_exists(herdr: &str, pane: &str) -> bool {
-    !Command::new(herdr)
-        .args(["pane", "get", pane])
-        .output()
-        .is_ok_and(|o| {
-            !o.status.success()
-                && [&o.stderr, &o.stdout]
-                    .iter()
-                    .any(|out| String::from_utf8_lossy(out).contains("pane_not_found"))
-        })
+fn pane_exists(pane: &str) -> bool {
+    crate::socket_request("pane.get", json!({ "pane_id": pane }))
+        .map_or_else(|e| !e.to_string().contains("pane_not_found"), |_| true)
 }
 
 /// Closes the panel's own pane, which ends this process too; false when
 /// Herdr did not close it, and the panel stays.
-fn close(herdr: &str) -> bool {
-    std::env::var("HERDR_PANE_ID").is_ok_and(|pane| {
-        Command::new(herdr)
-            .args(["pane", "close", &pane])
-            .output()
-            .is_ok_and(|o| o.status.success())
-    })
+fn close() -> bool {
+    std::env::var("HERDR_PANE_ID")
+        .is_ok_and(|pane| call("pane.close", json!({ "pane_id": pane })).is_some())
 }
 
 fn session_of(agent: &Value, home: &Path, cache: &mut Cache) -> Option<Session> {
@@ -1289,51 +1344,50 @@ fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
     Some((format!("pr:{}", item.pr.as_deref()?), None))
 }
 
-/// Swaps this panel for the diff pane on `source`: the diff opens on the
-/// right half beside `agent`, and this panel closes. Quitting the diff brings
-/// the panel back.
-fn view_diff(herdr: &str, source: &str, cwd: &str, agent: &str) {
-    let Ok(pane) = std::env::var("HERDR_PANE_ID") else {
-        return;
-    };
-    let opened = Command::new(herdr)
-        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
-        .args([
-            "--entrypoint",
-            "diff",
-            "--placement",
-            "split",
-            "--direction",
-            "right",
-        ])
-        .args(["--focus", "--target-pane", agent, "--cwd", cwd])
-        .args(["--env", &format!("{}={source}", crate::diff::SOURCE)])
-        .args(["--env", &format!("{FOR_PANE}={agent}")])
-        .args(["--env", &format!("{REPLACES}={pane}")])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if opened {
-        // Ends this process too.
-        let _ = Command::new(herdr).args(["pane", "close", &pane]).output();
+/// `--pr-diff`, the action behind Ctrl+click on a GitHub PR link: that PR's
+/// diff, as `d` shows it.
+pub fn pr_diff(home: &Path) -> anyhow::Result<()> {
+    let clicked = std::env::var("HERDR_PLUGIN_CLICKED_URL").unwrap_or_default();
+    if let Some(url) = pr_url(&clicked) {
+        let agent = context_id("HERDR_PANE_ID", "focused_pane_id");
+        open_diff(
+            &format!("pr:{url}"),
+            &home.to_string_lossy(),
+            agent.as_deref(),
+            None,
+        );
     }
+    Ok(())
 }
 
-/// Opens the Changes panel beside `agent` in place of `replaces`.
-pub(crate) fn reopen(herdr: &str, agent: &str, replaces: &str) {
-    let _ = Command::new(herdr)
-        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
-        .args([
-            "--entrypoint",
-            ENTRYPOINT,
-            "--placement",
-            "split",
-            "--direction",
-            "right",
-        ])
-        .args(["--focus", "--target-pane", agent])
-        .args(["--env", &format!("{FOR_PANE}={agent}")])
-        .args(["--env", &format!("{REPLACES}={replaces}")])
-        .output();
+/// The pull request a GitHub link points into (its files, a comment, a
+/// commit), as `https://github.com/<owner>/<repo>/pull/<n>`.
+fn pr_url(link: &str) -> Option<String> {
+    let rest = link.strip_prefix("https://github.com/")?;
+    let mut parts = rest.split(['/', '#', '?']);
+    let (owner, repo, pull, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (pull == "pull" && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("https://github.com/{owner}/{repo}/pull/{number}"))
+}
+
+/// Opens the diff of `source` (see `diff::SOURCE`) as the popup the
+/// manifest declares, run in `cwd`; the panel stays as it is. `agent` is the pane its editor
+/// (`e`) opens over; `at`, the file to start on.
+pub(crate) fn open_diff(source: &str, cwd: &str, agent: Option<&str>, at: Option<&str>) {
+    let mut env = json!({ crate::diff::SOURCE: source });
+    if let Some(agent) = agent {
+        env[FOR_PANE] = agent.into();
+    }
+    if let Some(at) = at {
+        env[crate::diff::AT_FILE] = at.into();
+    }
+    call(
+        "plugin.pane.open",
+        json!({
+            "plugin_id": PLUGIN, "entrypoint": "diff",
+            "cwd": cwd, "env": env, "focus": true,
+        }),
+    );
 }
 
 /// Stands in a frame for a running check's dot, drawn at each step.
@@ -2027,6 +2081,54 @@ mod tests {
     }
 
     #[test]
+    fn sizes_the_panel_by_the_split_above_it() {
+        let pane = |id: &str| json!({ "type": "pane", "pane_id": id });
+        let split = |dir: &str, first: Value, second: Value| json!({ "type": "split", "direction": dir, "ratio": 0.5, "first": first, "second": second });
+        let rect = |id: &str, x: u32, w: u32| json!({ "pane_id": id, "rect": { "x": x, "y": 0, "width": w, "height": 40 } });
+        // Alone beside the agent: the root split, the panel its second side.
+        let root = split("right", pane("a"), pane("c"));
+        let rects = [rect("a", 0, 60), rect("c", 60, 60)];
+        let (path, ratio) = split_ratio(&root, &rects, "c", 42.0).unwrap();
+        assert!(path.is_empty());
+        assert!((ratio - 78.0 / 120.0).abs() < 1e-9);
+        // Right of a shell beside the agent: the inner split, 60 wide.
+        let root = split("right", pane("a"), split("right", pane("s"), pane("c")));
+        let rects = [rect("a", 0, 60), rect("s", 60, 30), rect("c", 90, 30)];
+        let (path, ratio) = split_ratio(&root, &rects, "c", 42.0).unwrap();
+        assert_eq!(path, [true]);
+        assert!((ratio - 18.0 / 60.0).abs() < 1e-9);
+        // A `down` split between them is passed over; on the first side the
+        // ratio is its own share.
+        let root = split("right", split("down", pane("c"), pane("x")), pane("a"));
+        let rects = [rect("c", 0, 60), rect("x", 0, 60), rect("a", 60, 60)];
+        let (path, ratio) = split_ratio(&root, &rects, "c", 42.0).unwrap();
+        assert!(path.is_empty());
+        assert!((ratio - 42.0 / 120.0).abs() < 1e-9);
+        // No split to the side, or too narrow for the panel: nothing to set.
+        assert!(split_ratio(&pane("c"), &rects, "c", 42.0).is_none());
+        let rects = [rect("a", 0, 20), rect("c", 20, 20)];
+        let root = split("right", pane("a"), pane("c"));
+        assert!(split_ratio(&root, &rects, "c", 42.0).is_none());
+    }
+
+    #[test]
+    fn a_clicked_link_names_its_pr() {
+        let pr = "https://github.com/o/r/pull/7";
+        assert_eq!(pr_url(pr).as_deref(), Some(pr));
+        for tail in [
+            "/files",
+            "/files#diff-1",
+            "#issuecomment-2",
+            "?w=1",
+            "/commits/abc",
+        ] {
+            assert_eq!(pr_url(&format!("{pr}{tail}")).as_deref(), Some(pr));
+        }
+        assert_eq!(pr_url("https://github.com/o/r/issues/7"), None);
+        assert_eq!(pr_url("https://github.com/o/r/pull/x"), None);
+    }
+
+    #[test]
     fn a_restart_leaves_a_shell_where_the_panel_was() {
         let pane = |label: &str, cwd: &str| json!({ "label": label, "cwd": cwd });
         let store = tempfile::TempDir::new().unwrap();
@@ -2037,7 +2139,8 @@ mod tests {
         let shell = json!({ "shell_pid": 7, "foreground_processes": [
             { "pid": 7, "cmdline": "-zsh" } ] });
         assert!(ours(&pane("Changes", root)) && bare_shell(&shell));
-        assert!(ours(&pane("Diff", root)));
+        // The diff is a popup now; a pane titled so is not the panel's.
+        assert!(!ours(&pane("Diff", root)));
         // A pane of the user's that shares the title, elsewhere, or in a
         // directory merely named like the plugin.
         assert!(!ours(&pane("Changes", "/home/u/src")));

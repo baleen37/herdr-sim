@@ -107,9 +107,10 @@ Claude Code's "Changes" panel as a right-hand split.
   An approved open PR shows a green check. Running checks show a pulsing grey
   dot and `8/11`.
 - **Focus.** Each tab has its own panel. It starts on the pane the key was
-  pressed in, then follows the focused agent in its own tab; agents in other
-  tabs never change it. A new session in its pane shows at once, focused or
-  not. When the agent pane it shows closes,
+  pressed in, then follows the focused agent in its own tab, as soon as
+  Herdr reports the focus moving (it subscribes to Herdr's pane events);
+  agents in other tabs never change it. A new session in its pane shows at
+  once, focused or not. When the agent pane it shows closes,
   it shows another agent in its tab (one stacked above or below), or closes
   when none is left.
 - **Keys.** `j`/`k` move between rows, `gg`/`G` to the ends. `Enter` opens
@@ -118,13 +119,17 @@ Claude Code's "Changes" panel as a right-hand split.
 - **Mouse.** A click opens what it is on: the repo, the PR, its files,
   comments, or checks. The wheel scrolls. A drag across rows copies their
   text.
-- **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
+- **Diff.** `d` opens a diff in a popup over the tab (the panel stays), laid
   out like reviewr: the selected file's diff (line numbers, changed lines
   barred and tinted, highlighted for the file's language, CSV columns in
   colour) beside a tree of the changed files. Vim keys move (`j`/`k`,
   `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
-  switches box, `z` hides the tree (and shows it again, focused), `e` opens the file in `$EDITOR` at the
-  line, `q` brings the panel back.
+  switches box, `z` hides the tree (and shows it again, focused), `e` opens
+  the file in `$EDITOR` at the line over the agent's pane (quitting it
+  brings the diff back), `q` closes it.
+- **PR links.** Ctrl+click on a GitHub PR link in any pane (an agent's
+  `gh pr create` output, say) opens that PR's diff the same way. Herdr routes
+  the click only while `ui.mouse_capture` is on.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
   reopened panel draws at once. Calls back off when GitHub's rate limit is
