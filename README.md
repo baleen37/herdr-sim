@@ -101,12 +101,15 @@ or opened.
 Claude Code's "Changes" panel as a right-hand split.
 
 - **Rows.** Above, a `± repo +12 -3` row for each checkout the session worked
-  in that has uncommitted changes. Below, the PRs the session touched, newest
-  first: state icon, title, repo and number, lines changed, comments, checks.
+  in that has uncommitted changes, new untracked files' lines counted as
+  added; a linked worktree's row names its branch (or commit, detached).
+  Below, the PRs the session touched, newest first: state icon, title, repo and number, lines changed, comments, checks.
   An approved open PR shows a green check. Running checks show a pulsing grey
   dot and `8/11`.
-- **Focus.** It starts on the pane the key was pressed in, then follows the
-  focused agent in its own workspace. When the agent pane it shows closes,
+- **Focus.** Each tab has its own panel. It starts on the pane the key was
+  pressed in, then follows the focused agent in its own tab; agents in other
+  tabs never change it. A new session in its pane shows at once, focused or
+  not. When the agent pane it shows closes,
   it shows another agent in its tab (one stacked above or below), or closes
   when none is left.
 - **Keys.** `j`/`k` move between rows, `gg`/`G` to the ends. `Enter` opens
@@ -127,7 +130,9 @@ Claude Code's "Changes" panel as a right-hand split.
   reopened panel draws at once. Calls back off when GitHub's rate limit is
   near.
 
-The panel opens about 42 columns wide and focused; the same key closes it.
+The panel opens about 42 columns wide and focused, at the tab's right edge
+(right of the rightmost pane, never between two); the same key closes it.
+Panels open when Herdr stopped come back with it.
 
 ```toml
 [[keys.command]]

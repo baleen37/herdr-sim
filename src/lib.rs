@@ -127,6 +127,12 @@ pub const DIFF_TOKEN: &str = "diff";
 /// `+<insertions> -<deletions>` from `git diff --shortstat` output, leaving
 /// out a zero side; `None` when nothing changed.
 pub fn diff_value(shortstat: &str) -> Option<String> {
+    let (added, removed) = shortstat_counts(shortstat);
+    diff_text(added, removed)
+}
+
+/// Insertions and deletions in `git diff --shortstat` output.
+pub fn shortstat_counts(shortstat: &str) -> (u64, u64) {
     let count = |word: &str| {
         shortstat
             .split(',')
@@ -134,7 +140,12 @@ pub fn diff_value(shortstat: &str) -> Option<String> {
             .and_then(|part| part.split_whitespace().next()?.parse::<u64>().ok())
             .unwrap_or(0)
     };
-    match (count("insertion"), count("deletion")) {
+    (count("insertion"), count("deletion"))
+}
+
+/// `+<added> -<removed>`, leaving out a zero side; `None` for neither.
+pub fn diff_text(added: u64, removed: u64) -> Option<String> {
+    match (added, removed) {
         (0, 0) => None,
         (added, 0) => Some(format!("+{added}")),
         (0, removed) => Some(format!("-{removed}")),
