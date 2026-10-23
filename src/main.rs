@@ -98,13 +98,17 @@ fn main() -> Result<()> {
         return diff::edit_pane();
     }
     if env::args().any(|a| a == "--diff-pane") {
-        return diff::run(&herdr_bin);
+        return diff::run();
     }
     if env::args().any(|a| a == "--animate") {
         return animate(&state_dir);
     }
+    if env::args().any(|a| a == "--pr-diff") {
+        let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
+        return changes::pr_diff(&home);
+    }
     if env::args().any(|a| a == "--toggle-changes") {
-        return changes::toggle(&herdr_bin, &state_dir);
+        return changes::toggle(&state_dir);
     }
     if env::args().any(|a| a == "--toggle-order") {
         // Turning it on needs no call here: every pass below sets the view.
@@ -166,7 +170,7 @@ fn main() -> Result<()> {
     // Panels the server had open come back as bare shells; reopen them once
     // the sidebar is drawn, which must not wait on their shells starting.
     if startup {
-        changes::revive(&run.herdr);
+        changes::revive();
     }
     Ok(())
 }

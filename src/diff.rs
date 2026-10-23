@@ -15,13 +15,15 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
 use crate::changes::{
-    DIM, Event, FOR_PANE, GREEN, RED, RESET, SELECTED, cols, cut, fit_width, listen_for_clicks,
-    reopen, size, wait_gone,
+    DIM, Event, FOR_PANE, GREEN, RED, RESET, SELECTED, call, cols, context_id, cut,
+    listen_for_clicks, open_diff, size,
 };
 
 /// The environment variable naming what to show: `checkout:<dir>` or
 /// `pr:<url>`.
 pub const SOURCE: &str = "HERDR_SIM_DIFF_SOURCE";
+/// The file to start on, by path: the one `e` left from.
+pub(crate) const AT_FILE: &str = "HERDR_SIM_DIFF_FILE";
 /// How often a checkout's diff is read again, so an agent's edits show up.
 const WATCH: Duration = Duration::from_secs(2);
 /// Quiet ticks between full re-reads, which also find new untracked files.
@@ -70,14 +72,8 @@ enum Focus {
 }
 
 /// Runs the pane until `q`.
-pub fn run(herdr: &str) -> anyhow::Result<()> {
+pub fn run() -> anyhow::Result<()> {
     let source = std::env::var(SOURCE).unwrap_or_default();
-    let me = std::env::var("HERDR_PANE_ID").ok();
-    // The right half of the tab, once the panel it replaces has gone.
-    if let Some(me) = &me {
-        wait_gone(herdr);
-        fit_width(herdr, me, None);
-    }
     let (events_in, events) = mpsc::channel::<Event>();
     let wake = events_in.clone();
     let mut watch = crate::watch::Watch::new(events_in.clone());
@@ -99,7 +95,11 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
     let title = std::thread::spawn(move || title(&asked));
     let mut files = read(&source);
     let title = title.join().unwrap_or_default();
-    let mut selected = 0usize;
+    // Back from the editor, on the file it opened.
+    let mut selected = std::env::var(AT_FILE)
+        .ok()
+        .and_then(|at| files.iter().position(|f| f.path == at))
+        .unwrap_or(0);
     let mut scroll = 0usize;
     let mut focus = Focus::Files;
     let mut tree_shown = true;
@@ -185,7 +185,11 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
                                 r.row.old.max(1)
                             }
                         });
-                    edit(herdr, dir, &file.path, line);
+                    // The popup takes every key; it closes so the editor
+                    // gets them, and the editor brings it back.
+                    if edit(dir, &file.path, line, &source) {
+                        break;
+                    }
                 }
             }
             // z hides the file tree, or shows it again with the focus in it.
@@ -272,10 +276,6 @@ pub fn run(herdr: &str) -> anyhow::Result<()> {
             }
             Ok(_) | Err(_) => {}
         }
-    }
-    // The Changes panel back in this pane's place.
-    if let (Some(me), Ok(agent)) = (me, std::env::var(FOR_PANE)) {
-        reopen(herdr, &agent, &me);
     }
     Ok(())
 }
@@ -493,19 +493,28 @@ fn start(range: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
-/// Opens `path` in `dir` at `line` in the user's editor, zoomed over this
-/// pane; quitting the editor comes back here, the diff already re-read.
-fn edit(herdr: &str, dir: &str, path: &str, line: usize) {
-    let Ok(me) = std::env::var("HERDR_PANE_ID") else {
-        return;
+/// Opens `path` in `dir` at `line` in the user's editor, zoomed over the
+/// agent's pane (the pane under this popup); quitting the editor opens this
+/// diff of `source` again, on `path`. False when it did not open.
+fn edit(dir: &str, path: &str, line: usize, source: &str) -> bool {
+    let Some(under) = std::env::var(FOR_PANE)
+        .ok()
+        .or_else(|| context_id("HERDR_PANE_ID", "focused_pane_id"))
+    else {
+        return false;
     };
-    let _ = Command::new(herdr)
-        .args(["plugin", "pane", "open", "--plugin", "baleen37.herdr-sim"])
-        .args(["--entrypoint", "edit", "--placement", "zoomed", "--focus"])
-        .args(["--target-pane", &me, "--cwd", dir])
-        .args(["--env", &format!("HERDR_SIM_EDIT_FILE={path}")])
-        .args(["--env", &format!("HERDR_SIM_EDIT_LINE={line}")])
-        .output();
+    call(
+        "plugin.pane.open",
+        serde_json::json!({
+            "plugin_id": "baleen37.herdr-sim", "entrypoint": "edit", "placement": "zoomed",
+            "target_pane_id": under, "cwd": dir, "focus": true,
+            "env": {
+                "HERDR_SIM_EDIT_FILE": path, "HERDR_SIM_EDIT_LINE": line.to_string(),
+                SOURCE: source, FOR_PANE: under,
+            },
+        }),
+    )
+    .is_some()
 }
 
 /// The `edit` pane: the file in the user's editor at the line. The login
@@ -537,7 +546,20 @@ pub fn edit_pane() -> anyhow::Result<()> {
     if let Some(path) = var("PATH") {
         command.env("PATH", path);
     }
-    command.status()?;
+    let ran = command.status();
+    // Back to the diff it came from, on this file, re-read; the diff is
+    // closed already, so even when the editor would not start.
+    if let Ok(source) = std::env::var(SOURCE) {
+        let agent = std::env::var(FOR_PANE).ok();
+        let cwd = std::env::current_dir()?;
+        open_diff(
+            &source,
+            &cwd.to_string_lossy(),
+            agent.as_deref(),
+            Some(&file),
+        );
+    }
+    ran?;
     Ok(())
 }
 
