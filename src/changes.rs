@@ -5,19 +5,22 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use herdr_sim::{
-    Cache, Session, claude_session, codex_session, diff_value, parse_utc, resolve_claude_session,
+    Cache, Session, claude_session, codex_session, diff_text, header_value, parse_utc,
+    resolve_claude_session, shortstat_counts,
 };
 use serde_json::{Value, json};
 
 /// How long a checkout's `+a -d` stands without a file-system event saying
 /// it changed, in case one was missed.
 const LOCAL_TTL: Duration = Duration::from_secs(30);
+/// The least time between two reads of a checkout that keeps changing.
+const LOCAL_GAP: Duration = Duration::from_secs(1);
 /// How often the pane looks at focus and the session again.
 const TICK: Duration = Duration::from_secs(3);
 /// How long fetched PR details are reused: open PRs change (checks,
@@ -48,24 +51,36 @@ pub(crate) struct Pr {
     checks: Option<(usize, usize, usize)>,
 }
 
-/// Opens the Changes pane to the right of the focused pane, or closes it if it
-/// is already open in this workspace. The panel is found by its process, so
-/// panes closed by hand or opened before an upgrade are handled too.
+/// Opens the Changes pane at the right edge of the tab, or closes it if it
+/// is already open in this tab. The panel is found by its process, so panes
+/// closed by hand or opened before an upgrade are handled too.
 pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
-    let workspace = workspace_id();
-    let mut open_now = changes_panes(herdr, workspace.as_deref());
+    let focused = context_id("HERDR_PANE_ID", "focused_pane_id");
+    // Without a tab in the context, the focused pane's: never the whole
+    // workspace, whose other tabs have panels of their own.
+    let tab = tab_id().or_else(|| focused.as_deref().and_then(|p| tab_of(herdr, p)));
+    let Ours {
+        live: mut open_now,
+        dead,
+        ..
+    } = our_panes(herdr, workspace_id().as_deref(), tab.as_deref());
     // The panel's own note of its pane id, in case its process list was busy
-    // with a gh child when we looked.
-    if let Some(ws) = workspace.as_deref() {
-        let path = marker(state_dir, ws);
+    // with a gh child when we looked. Only a pane titled and placed as the
+    // panel is taken at its word.
+    if let Some(tab) = tab.as_deref() {
+        let path = marker(state_dir, tab);
         if let Ok(pane) = std::fs::read_to_string(&path) {
             let _ = std::fs::remove_file(&path);
-            let exists = Command::new(herdr)
-                .args(["pane", "get", pane.trim()])
+            let pane = pane.trim();
+            let panel = Command::new(herdr)
+                .args(["pane", "get", pane])
                 .output()
-                .is_ok_and(|o| o.status.success());
-            if exists && !open_now.iter().any(|p| p == pane.trim()) {
-                open_now.push(pane.trim().to_string());
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+                .is_some_and(|v| ours(&v["result"]["pane"]));
+            if panel && !open_now.iter().chain(&dead).any(|p| p == pane) {
+                open_now.push(pane.to_string());
             }
         }
     }
@@ -75,14 +90,24 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    // What a restart left of a panel: the panel opens again in its place.
+    if !dead.is_empty() {
+        for pane in &dead {
+            replace(herdr, pane, true);
+        }
+        return Ok(());
+    }
     let mut open = Command::new(herdr);
     open.args(["plugin", "pane", "open", "--plugin", PLUGIN])
         .args(["--entrypoint", ENTRYPOINT])
         // Focused, so its keys work at once.
         .args(["--placement", "split", "--direction", "right", "--focus"]);
     // Start on the pane the key was pressed in; after that, follow focus.
-    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+    if let Some(pane) = focused {
         open.args(["--env", &format!("{FOR_PANE}={pane}")]);
+        if let Some(edge) = right_edge(herdr, &pane) {
+            open.args(["--target-pane", &edge]);
+        }
     }
     let opened = open.output()?;
     // Narrow it at once, from the id the open returns: the panel would size
@@ -104,23 +129,40 @@ pub fn toggle(herdr: &str, state_dir: &Path) -> anyhow::Result<()> {
 /// The workspace this run belongs to. Plugin panes and actions get it only
 /// inside `HERDR_PLUGIN_CONTEXT_JSON`; ordinary panes have `HERDR_WORKSPACE_ID`.
 fn workspace_id() -> Option<String> {
-    std::env::var("HERDR_WORKSPACE_ID").ok().or_else(|| {
+    context_id("HERDR_WORKSPACE_ID", "workspace_id")
+}
+
+/// The tab this run belongs to, found the same way.
+fn tab_id() -> Option<String> {
+    context_id("HERDR_TAB_ID", "tab_id")
+}
+
+fn context_id(var: &str, key: &str) -> Option<String> {
+    std::env::var(var).ok().or_else(|| {
         let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
         let ctx: Value = serde_json::from_str(&ctx).ok()?;
-        ctx["workspace_id"].as_str().map(String::from)
+        ctx[key].as_str().map(String::from)
     })
 }
 
-/// Where the panel open in `workspace` notes its pane id.
-fn marker(state_dir: &Path, workspace: &str) -> std::path::PathBuf {
-    state_dir.join(format!(
-        "changes-pane-{}",
-        workspace.replace(['/', ':'], "_")
-    ))
+/// Where the panel open in `tab` notes its pane id.
+fn marker(state_dir: &Path, tab: &str) -> std::path::PathBuf {
+    state_dir.join(format!("changes-pane-{}", tab.replace(['/', ':'], "_")))
 }
 
-/// Panes in `workspace` (or everywhere) running the Changes panel.
-fn changes_panes(herdr: &str, workspace: Option<&str>) -> Vec<String> {
+/// The plugin's panes `our_panes` found.
+#[derive(Default)]
+struct Ours {
+    /// Running the Changes panel.
+    live: Vec<String>,
+    /// What a restart left of a panel or its diff (see `bare_shell`).
+    dead: Vec<String>,
+    /// Titled as ours but not at their prompt yet.
+    waiting: usize,
+}
+
+/// The plugin's panes in `tab` of `workspace`, or everywhere.
+fn our_panes(herdr: &str, workspace: Option<&str>, tab: Option<&str>) -> Ours {
     let mut list = Command::new(herdr);
     list.args(["pane", "list"]);
     if let Some(ws) = workspace {
@@ -131,21 +173,139 @@ fn changes_panes(herdr: &str, workspace: Option<&str>) -> Vec<String> {
         .ok()
         .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
     else {
-        return Vec::new();
+        return Ours::default();
     };
-    v["result"]["panes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p["pane_id"].as_str())
-        .filter(|pane| {
-            Command::new(herdr)
-                .args(["pane", "process-info", "--pane", pane])
-                .output()
-                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--changes-pane"))
+    let mut found = Ours::default();
+    for p in v["result"]["panes"].as_array().into_iter().flatten() {
+        let Some(pane) = p["pane_id"].as_str() else {
+            continue;
+        };
+        if tab.is_some_and(|tab| p["tab_id"].as_str() != Some(tab)) {
+            continue;
+        }
+        let titled = ours(p);
+        // Everywhere, only panes titled as ours are asked about.
+        if tab.is_none() && !titled {
+            continue;
+        }
+        let info = Command::new(herdr)
+            .args(["pane", "process-info", "--pane", pane])
+            .output()
+            .ok()
+            .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+        let info = info.as_ref().map(|i| &i["result"]["process_info"]);
+        match info {
+            Some(info) if info.to_string().contains("--changes-pane") => {
+                found.live.push(pane.to_string())
+            }
+            Some(info) if titled && bare_shell(info) => found.dead.push(pane.to_string()),
+            // Its shell not started, or still in its rc files.
+            Some(info) if titled && !info.to_string().contains("herdr-sim") => found.waiting += 1,
+            None if titled => found.waiting += 1,
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Whether `pane` (from `pane list`) has the title and directory of the
+/// panel or its diff. Herdr brings such a pane back after a restart, by its
+/// title, as a shell in the plugin's directory.
+fn ours(pane: &Value) -> bool {
+    matches!(pane["label"].as_str(), Some("Changes" | "Diff"))
+        && pane["cwd"].as_str().is_some_and(|cwd| {
+            let root = Path::new(cwd);
+            root.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("herdr-sim"))
+                && root.join("herdr-plugin.toml").exists()
         })
-        .map(String::from)
-        .collect()
+}
+
+/// Whether only the pane's shell runs in it (from `pane process-info`), so a
+/// live pane busy with a git or gh child never counts.
+fn bare_shell(info: &Value) -> bool {
+    info["foreground_processes"]
+        .as_array()
+        .is_some_and(|procs| {
+            !procs.is_empty()
+                && procs.iter().all(|p| {
+                    p["pid"] == info["shell_pid"]
+                        && !p["cmdline"].as_str().unwrap_or("").contains("herdr-sim")
+                })
+        })
+}
+
+/// Opens a panel in place of each pane a restart left of one (or of its
+/// diff), so the panels come back with the server. Run at startup.
+pub fn revive(herdr: &str) {
+    // The shells start with the server and run their rc files first; give
+    // them a few seconds to reach their prompt.
+    let mut done: Vec<String> = Vec::new();
+    for _ in 0..20 {
+        let found = our_panes(herdr, None, None);
+        // Each once: one whose close failed is not given a second panel.
+        for pane in found.dead {
+            if !done.contains(&pane) {
+                replace(herdr, &pane, false);
+                done.push(pane);
+            }
+        }
+        if found.waiting == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Opens a panel in `pane`'s place, then closes `pane`.
+fn replace(herdr: &str, pane: &str, focus: bool) {
+    let opened = Command::new(herdr)
+        .args(["plugin", "pane", "open", "--plugin", PLUGIN])
+        .args(["--entrypoint", ENTRYPOINT, "--placement", "split"])
+        .args(["--direction", "right", "--target-pane", pane])
+        .arg(if focus { "--focus" } else { "--no-focus" })
+        .args(["--env", &format!("{REPLACES}={pane}")])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if opened {
+        let _ = Command::new(herdr).args(["pane", "close", pane]).output();
+    }
+}
+
+/// The pane a new panel opens to the right of, from `pane`'s tab: one at the
+/// tab's right edge, so the panel never lands between two panes.
+fn right_edge(herdr: &str, pane: &str) -> Option<String> {
+    rightmost(layout(herdr, pane)?["panes"].as_array()?, pane)
+}
+
+/// The layout of `pane`'s tab: its `area` and its `panes` with their `rect`s.
+fn layout(herdr: &str, pane: &str) -> Option<Value> {
+    let out = Command::new(herdr)
+        .args(["pane", "layout", "--pane", pane])
+        .output()
+        .ok()?;
+    let mut v: Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(v["result"]["layout"].take())
+}
+
+/// Of `panes` (with their `rect`s), `pane` if it reaches the right edge,
+/// else the tallest that does, the top one of equals.
+fn rightmost(panes: &[Value], pane: &str) -> Option<String> {
+    let n = |p: &Value, k: &str| p["rect"][k].as_f64().unwrap_or(0.0);
+    let right = |p: &Value| n(p, "x") + n(p, "width");
+    let edge = panes.iter().map(right).fold(0.0, f64::max);
+    let at_edge: Vec<&Value> = panes.iter().filter(|p| right(p) >= edge - 0.5).collect();
+    if at_edge.iter().any(|p| p["pane_id"].as_str() == Some(pane)) {
+        return Some(pane.to_string());
+    }
+    at_edge
+        .into_iter()
+        .max_by(|a, b| {
+            n(a, "height")
+                .total_cmp(&n(b, "height"))
+                .then(n(b, "y").total_cmp(&n(a, "y")))
+        })
+        .and_then(|p| p["pane_id"].as_str().map(String::from))
 }
 
 /// Width the panel aims for, in columns.
@@ -175,33 +335,46 @@ pub(crate) fn wait_gone(herdr: &str) {
 /// Moves `pane`'s left edge so it is about `target` columns wide, or half
 /// the tab when `None`.
 pub(crate) fn fit_width(herdr: &str, pane: &str, target: Option<f64>) {
-    let Some((width, area)) = (|| {
-        let out = Command::new(herdr)
-            .args(["pane", "layout", "--pane", pane])
-            .output()
-            .ok()?;
-        let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-        let layout = &v["result"]["layout"];
+    let measure = || {
+        let layout = layout(herdr, pane)?;
         let width = layout["panes"]
             .as_array()?
             .iter()
             .find(|p| p["pane_id"].as_str() == Some(pane))?["rect"]["width"]
             .as_f64()?;
         Some((width, layout["area"]["width"].as_f64()?))
-    })() else {
+    };
+    let Some((mut width, area)) = measure() else {
         return;
     };
-    let by = width - target.unwrap_or(area / 2.0);
-    if by.abs() < 1.0 {
-        return;
+    let target = target.unwrap_or(area / 2.0);
+    // A resize's amount is a share of the split the pane is in, which is the
+    // whole tab only when the pane was split off a full-width one. Start from
+    // the tab, then learn the split's width from how far the edge moved.
+    let mut unit = area;
+    for _ in 0..3 {
+        let by = width - target;
+        if by.abs() < 1.0 {
+            return;
+        }
+        // `right` moves the edge right, narrowing the pane; `left` widens it.
+        let direction = if by > 0.0 { "right" } else { "left" };
+        let amount = (by.abs() / unit).min(1.0);
+        let _ = Command::new(herdr)
+            .args(["pane", "resize", "--pane", pane, "--direction", direction])
+            .arg("--amount")
+            .arg(format!("{amount:.3}"))
+            .output();
+        let Some((now, _)) = measure() else {
+            return;
+        };
+        let moved = (now - width).abs();
+        if moved < 1.0 {
+            return;
+        }
+        unit = moved / amount;
+        width = now;
     }
-    // `right` moves the edge right, narrowing the pane; `left` widens it.
-    let direction = if by > 0.0 { "right" } else { "left" };
-    let _ = Command::new(herdr)
-        .args(["pane", "resize", "--pane", pane, "--direction", direction])
-        .arg("--amount")
-        .arg(format!("{:.3}", by.abs() / area))
-        .output();
 }
 
 /// PR details by URL, with when they were fetched; `None` for details read
@@ -221,17 +394,20 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     // answers.
     let saved = state_dir.join("changes-prs.json");
     let mut prs = load_prs(&saved);
-    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
+    let own = std::env::var("HERDR_PANE_ID").ok();
+    // The panel's own tab: the agents it shows and falls back on.
+    let tab = own.as_deref().and_then(|pane| tab_of(herdr, pane));
+    if let Some(pane) = &own {
         // Opened in place of the diff pane, it takes that pane's space when
         // it goes, so it sizes itself then. Opened by the toggle, the toggle
         // has sized it already; sizing again here would race it.
         if std::env::var(REPLACES).is_ok() {
             wait_gone(herdr);
-            fit_width(herdr, &pane, Some(PANEL_COLS));
+            fit_width(herdr, pane, Some(PANEL_COLS));
         }
-        // Tell the toggle which pane is the panel in this workspace.
-        if let Some(ws) = workspace_id() {
-            let _ = std::fs::write(marker(state_dir, &ws), pane);
+        // Tell the toggle which pane is the panel in this tab.
+        if let Some(tab) = tab.as_deref() {
+            let _ = std::fs::write(marker(state_dir, tab), pane);
         }
     }
     // GitHub is asked off the drawing thread; one request at a time. Clicks
@@ -240,7 +416,9 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     listen_for_clicks(done.clone());
     // File-system events tell which checkouts to ask git about again.
     let mut watch = crate::watch::Watch::new(done.clone());
-    let mut local_cache: HashMap<String, (Instant, Option<String>)> = HashMap::new();
+    // Each checkout's `+a -d` and, for a linked worktree, its branch.
+    let mut local_cache: HashMap<String, (Instant, Option<String>, Option<String>)> =
+        HashMap::new();
     let mut fetching = false;
     let mut last_frame = String::new();
     // What each drawn line does when clicked.
@@ -264,20 +442,15 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
     let mut last_agent: Option<Value> = None;
     let start = std::env::var(FOR_PANE).ok();
     let workspace = workspace_id();
-    // The panel's own tab, whose agents it falls back on.
-    let tab = std::env::var("HERDR_PANE_ID")
-        .ok()
-        .and_then(|pane| tab_of(herdr, &pane));
+    let is_here = |a: &&Value| here(a, tab.as_deref(), workspace.as_deref());
     loop {
+        // Shortened when a checkout waits out its LOCAL_GAP.
+        let mut tick = TICK;
         let agents = agents(herdr);
-        // Only this workspace's agents: a panel in each workspace follows its
-        // own, not whichever agent has focus elsewhere.
-        let focused = agents.iter().find(|a| {
-            a["focused"].as_bool() == Some(true)
-                && workspace
-                    .as_deref()
-                    .is_none_or(|ws| a["workspace_id"].as_str() == Some(ws))
-        });
+        let focus = agents.iter().find(|a| a["focused"].as_bool() == Some(true));
+        // Only this tab's agents: a panel in each tab follows its own, not
+        // whichever agent has focus elsewhere.
+        let focused = focus.filter(is_here);
         let opener = start
             .as_deref()
             .and_then(|pane| agents.iter().find(|a| a["pane_id"].as_str() == Some(pane)));
@@ -291,19 +464,26 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             Next::Close if close(herdr) => return Ok(()),
             _ => {}
         }
-        // Focus wins once it is on an agent; until then, the opener's pane.
-        if let Some(agent) = focused.or(if last_agent.is_none() { opener } else { None }) {
+        // The followed agent as it is now: a new session or directory shows
+        // without its pane taking focus first.
+        if let Some(now) = last_agent
+            .as_ref()
+            .and_then(|a| agents.iter().find(|b| b["pane_id"] == a["pane_id"]))
+        {
+            last_agent = Some(now.clone());
+        }
+        // Focus wins once it is on an agent; until then, the opener's pane,
+        // else (a panel brought back with the server) the tab's first agent.
+        if let Some(agent) = focused.or_else(|| match last_agent {
+            None => opener.or_else(|| agents.iter().find(is_here)),
+            Some(_) => None,
+        }) {
             last_agent = Some(agent.clone());
         }
-        // A panel in a workspace not on screen keeps its last frame: no git,
-        // no transcripts, no redraw. Only the cheap agent list runs, so it
+        // A panel in a tab not on screen keeps its last frame: no git, no
+        // transcripts, no redraw. Only the cheap agent list runs, so it
         // catches up within a tick of coming back on screen.
-        let hidden = agents.iter().any(|a| {
-            a["focused"].as_bool() == Some(true)
-                && workspace
-                    .as_deref()
-                    .is_some_and(|ws| a["workspace_id"].as_str() != Some(ws))
-        });
+        let hidden = focus.is_some_and(|a| !is_here(&a));
         let frame = if hidden && !last_frame.is_empty() {
             last_frame.clone()
         } else {
@@ -374,41 +554,44 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some(watch) = watch.as_mut() {
                                 watch.add(top);
                             }
+                            let since = local_cache.get(*top).map(|(at, ..)| at.elapsed());
+                            // While files keep changing (a build, an install),
+                            // at most once a LOCAL_GAP; the change stays noted,
+                            // and the tick ends when the gap does.
+                            if let Some(t) = since.filter(|t| *t < LOCAL_GAP) {
+                                let left = LOCAL_GAP - t;
+                                tick = tick.min(left);
+                                return false;
+                            }
                             let changed = watch.as_ref().is_none_or(|w| w.take(top));
-                            changed
-                                || local_cache
-                                    .get(*top)
-                                    .is_none_or(|(at, _)| at.elapsed() >= LOCAL_TTL)
+                            changed || since.is_none_or(|t| t >= LOCAL_TTL)
                         })
                         .collect();
-                    let fresh: Vec<Option<String>> = std::thread::scope(|s| {
+                    let fresh: Vec<(Option<String>, Option<String>)> = std::thread::scope(|s| {
                         let running: Vec<_> = stale
                             .iter()
-                            .map(|top| s.spawn(|| local_diff(top)))
+                            .map(|top| s.spawn(|| (local_diff(top), worktree_branch(top))))
                             .collect();
                         running
                             .into_iter()
-                            .map(|t| t.join().ok().flatten())
+                            .map(|t| t.join().unwrap_or_default())
                             .collect()
                     });
-                    for (top, diff) in stale.into_iter().zip(fresh) {
-                        local_cache.insert(top.clone(), (Instant::now(), diff));
+                    for (top, (diff, branch)) in stale.into_iter().zip(fresh) {
+                        local_cache.insert(top.clone(), (Instant::now(), diff, branch));
                     }
-                    let diffs: Vec<Option<String>> = tops
-                        .iter()
-                        .map(|top| local_cache.get(top).and_then(|(_, d)| d.clone()))
-                        .collect();
                     let local: Vec<Local> = tops
                         .iter()
-                        .zip(diffs)
-                        .filter_map(|(top, diff)| {
+                        .filter_map(|top| {
+                            let (_, diff, branch) = local_cache.get(top)?;
                             let (repo, slug) = names
                                 .entry(top.clone())
                                 .or_insert_with(|| (repo_name(top), github_slug(top)));
                             Some(Local {
                                 top: top.clone(),
                                 repo: repo.clone()?,
-                                diff: diff?,
+                                diff: diff.clone()?,
+                                branch: branch.clone(),
                                 url: slug.as_ref().map(|s| format!("https://github.com/{s}")),
                             })
                         })
@@ -448,7 +631,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
             .collect();
         // Wake early when GitHub answers or a click comes, so either shows at
         // once. Meanwhile, running checks pulse.
-        let deadline = Instant::now() + TICK;
+        let deadline = Instant::now() + tick;
         let event = loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let wait = if pulsing.is_empty() {
@@ -719,6 +902,15 @@ fn next<'a>(
     }
 }
 
+/// Whether `agent` is where the panel is: in its tab, or, with the tab
+/// unknown, in its workspace (anywhere when that is unknown too).
+fn here(agent: &Value, tab: Option<&str>, workspace: Option<&str>) -> bool {
+    match tab {
+        Some(tab) => agent["tab_id"].as_str() == Some(tab),
+        None => workspace.is_none_or(|ws| agent["workspace_id"].as_str() == Some(ws)),
+    }
+}
+
 /// The tab `pane` is in.
 fn tab_of(herdr: &str, pane: &str) -> Option<String> {
     let out = Command::new(herdr)
@@ -894,10 +1086,10 @@ fn render(urls: &[String], prs: &Prs, local: &[Local]) -> (String, Vec<Target>, 
                 format!("{c}{n}{RESET}")
             })
             .collect();
-        let repo = cut(
-            &local.repo,
-            width.saturating_sub(4 + cols(&local.diff)).max(4),
-        );
+        // A linked worktree's branch after the repo, as in the sidebar's
+        // header, so it stands apart from the main checkout.
+        let name = header_value(&local.repo, local.branch.as_deref());
+        let repo = cut(&name, width.saturating_sub(4 + cols(&local.diff)).max(4));
         items.push(Item {
             // By checkout: linked worktrees of one repo share its name.
             key: format!("local:{}", local.top),
@@ -1448,6 +1640,9 @@ struct Local {
     top: String,
     repo: String,
     diff: String,
+    /// The branch, when the checkout is a linked worktree: its repo's name
+    /// alone would not tell it from the main checkout.
+    branch: Option<String>,
     /// The repo on GitHub, if it is there.
     url: Option<String>,
 }
@@ -1462,9 +1657,89 @@ fn checkout_of(dir: &str) -> Option<String> {
     (out.status.success() && !top.is_empty()).then_some(top)
 }
 
-/// `+a -d` the checkout at `top` has not committed; `None` when clean.
+/// The branch the checkout at `top` has out (the commit, detached), if it
+/// is a linked worktree: its git directory is not the repository's own.
+/// (The sidebar's `git_repo` test would also take a submodule for one.)
+fn worktree_branch(top: &str) -> Option<String> {
+    let out = git_in(
+        top,
+        &[
+            "rev-parse",
+            "--git-dir",
+            "--git-common-dir",
+            "--abbrev-ref",
+            "HEAD",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let (dir, common, branch) = (lines.next()?, lines.next()?, lines.next()?);
+    if dir == common {
+        return None;
+    }
+    match branch {
+        "HEAD" => git_in(top, &["rev-parse", "--short", "HEAD"]),
+        _ => Some(branch.to_string()),
+    }
+}
+
+/// `+a -d` the checkout at `top` has not committed, new untracked files'
+/// lines counted as added, as the diff pane shows them; `None` when clean.
 fn local_diff(top: &str) -> Option<String> {
-    diff_value(&git_in(top, &["diff", "--shortstat", "HEAD"])?)
+    let tracked = git_in(top, &["diff", "--shortstat", "HEAD"]).unwrap_or_default();
+    let (added, removed) = shortstat_counts(&tracked);
+    let new: u64 = git_in(top, &["ls-files", "-z", "--others", "--exclude-standard"])
+        .unwrap_or_default()
+        .split('\0')
+        .filter(|f| !f.is_empty())
+        .map(|f| text_lines(&Path::new(top).join(f)))
+        .sum();
+    diff_text(added + new, removed)
+}
+
+/// Lines in the text file at `path`, as git counts them; none for a binary
+/// file (a NUL in its first 8000 bytes, git's test) or one it cannot read.
+/// Each file is read again only when its size or time changed: an agent
+/// writing many new files must not have every one reread at each.
+fn text_lines(path: &Path) -> u64 {
+    type Stamp = (u64, Option<std::time::SystemTime>);
+    static SEEN: LazyLock<Mutex<HashMap<PathBuf, (Stamp, u64)>>> = LazyLock::new(Mutex::default);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    let stamp = (meta.len(), meta.modified().ok());
+    if let Some((at, n)) = SEEN.lock().unwrap().get(path)
+        && *at == stamp
+    {
+        return *n;
+    }
+    let n = count_lines(path).unwrap_or(0);
+    let mut seen = SEEN.lock().unwrap();
+    // Files come and go; forget them all now and then rather than track which.
+    if seen.len() > 100_000 {
+        seen.clear();
+    }
+    seen.insert(path.to_path_buf(), (stamp, n));
+    n
+}
+
+/// `text_lines` without the memo, reading the file a block at a time and
+/// a binary one no further than its start.
+fn count_lines(path: &Path) -> io::Result<u64> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8000];
+    let (mut lines, mut last, mut first) = (0, b'\n', true);
+    loop {
+        let n = io::Read::read(&mut file, &mut buf)?;
+        if n == 0 {
+            return Ok(lines + u64::from(last != b'\n'));
+        }
+        if first && buf[..n].contains(&0) {
+            return Ok(0);
+        }
+        first = false;
+        lines += buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+        last = buf[n - 1];
+    }
 }
 
 /// `owner/repo` of the checkout's GitHub `origin`, if it has one.
@@ -1729,5 +2004,119 @@ mod tests {
         ));
         // Following nothing yet: nothing to lose.
         assert!(matches!(next(None, &[], Some("t1"), |_| false), Next::Stay));
+    }
+
+    #[test]
+    fn opens_at_the_tabs_right_edge() {
+        let pane = |id: &str, x: u32, y: u32, w: u32, h: u32| json!({ "pane_id": id, "rect": { "x": x, "y": y, "width": w, "height": h } });
+        // Agent beside a shell: right of the shell, not between them.
+        let side = [pane("a", 0, 0, 60, 40), pane("s", 60, 0, 60, 40)];
+        assert_eq!(rightmost(&side, "a").as_deref(), Some("s"));
+        assert_eq!(rightmost(&side, "s").as_deref(), Some("s"));
+        // Stacked on the right: the focused one if it is there, else the
+        // tallest, the top one of equals.
+        let stack = [
+            pane("a", 0, 0, 60, 40),
+            pane("t", 60, 0, 60, 10),
+            pane("b", 60, 10, 60, 30),
+        ];
+        assert_eq!(rightmost(&stack, "a").as_deref(), Some("b"));
+        assert_eq!(rightmost(&stack, "t").as_deref(), Some("t"));
+        let halves = [pane("t", 0, 0, 120, 20), pane("b", 0, 20, 120, 20)];
+        assert_eq!(rightmost(&halves, "x").as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn a_restart_leaves_a_shell_where_the_panel_was() {
+        let pane = |label: &str, cwd: &str| json!({ "label": label, "cwd": cwd });
+        let store = tempfile::TempDir::new().unwrap();
+        let root = store.path().join("abc-herdr-sim-0.31.1");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("herdr-plugin.toml"), "").unwrap();
+        let root = root.to_str().unwrap();
+        let shell = json!({ "shell_pid": 7, "foreground_processes": [
+            { "pid": 7, "cmdline": "-zsh" } ] });
+        assert!(ours(&pane("Changes", root)) && bare_shell(&shell));
+        assert!(ours(&pane("Diff", root)));
+        // A pane of the user's that shares the title, elsewhere, or in a
+        // directory merely named like the plugin.
+        assert!(!ours(&pane("Changes", "/home/u/src")));
+        assert!(!ours(&pane("Changes", store.path().to_str().unwrap())));
+        // The live panel, and the live diff busy with a git child.
+        let live = json!({ "shell_pid": 7, "foreground_processes": [
+            { "pid": 7, "cmdline": format!("{root}/bin/herdr-sim --diff-pane") } ] });
+        assert!(!bare_shell(&live));
+        let busy = json!({ "shell_pid": 7, "foreground_processes": [
+            { "pid": 9, "cmdline": "git diff HEAD" } ] });
+        assert!(!bare_shell(&busy));
+    }
+
+    #[test]
+    fn shows_only_its_own_tabs_agents() {
+        let a = json!({ "pane_id": "w1:p3", "tab_id": "w1:t2", "workspace_id": "w1" });
+        // Another tab of the same workspace is not the panel's.
+        assert!(!here(&a, Some("w1:t1"), Some("w1")));
+        assert!(here(&a, Some("w1:t2"), Some("w1")));
+        // The tab unknown: its workspace stands in, then anywhere.
+        assert!(here(&a, None, Some("w1")));
+        assert!(!here(&a, None, Some("w2")));
+        assert!(here(&a, None, None));
+    }
+
+    #[test]
+    fn local_rows_count_new_files_and_name_worktrees() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let top = dir.path().to_str().unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-C", top, "-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.path().join("a.txt"), "a\nb\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        assert_eq!(local_diff(top), None);
+        // Only a new file: its lines, the last one without a newline too.
+        std::fs::write(dir.path().join("new.txt"), "1\n2\n3").unwrap();
+        assert_eq!(local_diff(top).as_deref(), Some("+3"));
+        // With an edit; binary and ignored files add nothing.
+        std::fs::write(dir.path().join("a.txt"), "a\nc\n").unwrap();
+        std::fs::write(dir.path().join("bin"), b"x\0y\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "out\n").unwrap();
+        std::fs::write(dir.path().join("out"), "1\n2\n").unwrap();
+        assert_eq!(local_diff(top).as_deref(), Some("+5 -1"));
+        // A linked worktree names its branch; the main checkout does not.
+        let wt = dir.path().join("wt");
+        git(&["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()]);
+        assert_eq!(worktree_branch(top), None);
+        assert_eq!(
+            worktree_branch(wt.to_str().unwrap()).as_deref(),
+            Some("feat")
+        );
+        // Detached: the short commit, not `HEAD`.
+        let det = dir.path().join("det");
+        git(&["worktree", "add", "-q", "--detach", det.to_str().unwrap()]);
+        let sha = git_in(top, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(worktree_branch(det.to_str().unwrap()), sha);
+        let local = |top: &str, branch: Option<&str>| Local {
+            top: top.into(),
+            repo: "repo".into(),
+            diff: "+1".into(),
+            branch: branch.map(String::from),
+            url: None,
+        };
+        let (frame, ..) = render(
+            &[],
+            &HashMap::new(),
+            &[local("/r", None), local("/r/wt", Some("feat"))],
+        );
+        assert!(frame.contains("repo  \u{f418} feat"));
+        assert_eq!(frame.matches('\u{f418}').count(), 1);
     }
 }

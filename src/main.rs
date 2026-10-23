@@ -158,11 +158,17 @@ fn main() -> Result<()> {
         // Notes left meanwhile do not say which pane they were for. If another
         // run took the lock first, it handles them.
         if !pending.exists() || lock.try_lock().is_err() {
-            return Ok(());
+            break;
         }
         run.cache = Cache::load(&cache_path);
         scope = Scope::All;
     }
+    // Panels the server had open come back as bare shells; reopen them once
+    // the sidebar is drawn, which must not wait on their shells starting.
+    if startup {
+        changes::revive(&run.herdr);
+    }
+    Ok(())
 }
 
 impl Run {
