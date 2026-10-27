@@ -1351,40 +1351,6 @@ fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
     Some((format!("pr:{}", item.pr.as_deref()?), None))
 }
 
-/// `--pr-diff`, the action behind Ctrl+click on a GitHub PR link: that PR's
-/// diff, as `d` shows it.
-pub fn pr_diff(home: &Path) -> anyhow::Result<()> {
-    let clicked = std::env::var("HERDR_PLUGIN_CLICKED_URL").unwrap_or_default();
-    if let Some(url) = pr_url(&clicked) {
-        let agent = context_id("HERDR_PANE_ID", "focused_pane_id");
-        // The tab's panel, if it has one, makes way for the diff as on `d`.
-        let tab = tab_id().or_else(|| agent.as_deref().and_then(tab_of));
-        let panel = tab.as_deref().and_then(|tab| {
-            our_panes(workspace_id().as_deref(), Some(tab))
-                .live
-                .into_iter()
-                .next()
-        });
-        open_diff(
-            &format!("pr:{url}"),
-            &home.to_string_lossy(),
-            agent.as_deref(),
-            panel.as_deref(),
-        );
-    }
-    Ok(())
-}
-
-/// The pull request a GitHub link points into (its files, a comment, a
-/// commit), as `https://github.com/<owner>/<repo>/pull/<n>`.
-fn pr_url(link: &str) -> Option<String> {
-    let rest = link.strip_prefix("https://github.com/")?;
-    let mut parts = rest.split(['/', '#', '?']);
-    let (owner, repo, pull, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-    (pull == "pull" && !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| format!("https://github.com/{owner}/{repo}/pull/{number}"))
-}
-
 /// Opens the diff of `source` (see `diff::SOURCE`), run in `cwd`, on the
 /// right half of the tab: in place of `panel`, which closes and comes back
 /// for `agent` when the diff quits, or with no panel at the tab's right edge
@@ -2143,23 +2109,6 @@ mod tests {
         let rects = [rect("a", 0, 20), rect("c", 20, 20)];
         let root = split("right", pane("a"), pane("c"));
         assert!(split_ratio(&root, &rects, "c", 42.0).is_none());
-    }
-
-    #[test]
-    fn a_clicked_link_names_its_pr() {
-        let pr = "https://github.com/o/r/pull/7";
-        assert_eq!(pr_url(pr).as_deref(), Some(pr));
-        for tail in [
-            "/files",
-            "/files#diff-1",
-            "#issuecomment-2",
-            "?w=1",
-            "/commits/abc",
-        ] {
-            assert_eq!(pr_url(&format!("{pr}{tail}")).as_deref(), Some(pr));
-        }
-        assert_eq!(pr_url("https://github.com/o/r/issues/7"), None);
-        assert_eq!(pr_url("https://github.com/o/r/pull/x"), None);
     }
 
     #[test]
