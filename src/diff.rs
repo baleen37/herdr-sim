@@ -556,13 +556,14 @@ struct Shown {
     spans: Vec<(String, String)>,
 }
 
-/// The syntaxes and colour theme highlighting uses, loaded once.
+/// The syntaxes and colour theme highlighting uses, loaded once: bat's
+/// syntaxes, as syntect's own lack TypeScript, Kotlin, Nix, TOML and more.
 fn highlighting() -> &'static (SyntaxSet, Theme) {
     static LOADED: OnceLock<(SyntaxSet, Theme)> = OnceLock::new();
     LOADED.get_or_init(|| {
         let themes = ThemeSet::load_defaults();
         let theme = themes.themes["base16-ocean.dark"].clone();
-        (SyntaxSet::load_defaults_newlines(), theme)
+        (two_face::syntax::extra_newlines(), theme)
     })
 }
 
@@ -937,6 +938,14 @@ mod tests {
         let texts: Vec<&str> = lines[1].spans.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(texts, ["a", "\t", "c"]);
         assert_eq!(paint(&lines[1].spans, 20, "").1, 2 + TAB_COLS);
+    }
+
+    #[test]
+    fn languages_beyond_syntects_own_are_highlighted() {
+        let (syntaxes, _) = highlighting();
+        for ext in ["ts", "tsx", "kt", "nix", "toml", "swift", "Dockerfile"] {
+            assert!(syntaxes.find_syntax_by_extension(ext).is_some(), "{ext}");
+        }
     }
 
     #[test]
