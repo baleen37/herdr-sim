@@ -127,10 +127,6 @@ Claude Code's "Changes" panel as a right-hand split.
   switches box, `z` hides the tree (and shows it again, focused), `e` opens
   the file in `$EDITOR` at the line (quitting it brings the diff back), `q`
   brings the panel back.
-- **PR links.** Ctrl+click on a GitHub PR link in any pane (an agent's
-  `gh pr create` output, say) opens that PR's diff the same way, beside the
-  tab's panes when it has no panel. Herdr routes
-  the click only while `ui.mouse_capture` is on.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
   reopened panel draws at once. Calls back off when GitHub's rate limit is

@@ -82,16 +82,3 @@ id = "toggle-changes"
 title = "Changes: open/close the right panel"
 description = "Open or close the panel of PRs the focused agent's session touched."
 command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --toggle-changes"]
-
-# Ctrl+click on a GitHub PR link in any pane: its diff, as `d` shows it.
-[[actions]]
-id = "pr-diff"
-title = "Changes: the clicked PR's diff"
-description = "Open the diff of a GitHub pull request link on the right half of the tab."
-command = ["sh", "-c", "exec \"${HERDR_SIM_BIN:-$HERDR_PLUGIN_ROOT/bin/herdr-sim}\" --pr-diff"]
-
-[[link_handlers]]
-id = "github-pr"
-title = "Show the PR's diff"
-pattern = "^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+"
-action = "pr-diff"

@@ -103,10 +103,6 @@ fn main() -> Result<()> {
     if env::args().any(|a| a == "--animate") {
         return animate(&state_dir);
     }
-    if env::args().any(|a| a == "--pr-diff") {
-        let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
-        return changes::pr_diff(&home);
-    }
     if env::args().any(|a| a == "--toggle-changes") {
         return changes::toggle(&state_dir);
     }
