@@ -293,7 +293,7 @@ const PANEL_COLS: f64 = 42.0;
 const REPLACES: &str = "HERDR_SIM_REPLACES";
 
 /// Waits, a second at most, for the pane in `REPLACES` to close.
-fn wait_gone() {
+pub(crate) fn wait_gone() {
     let Ok(pane) = std::env::var(REPLACES) else {
         return;
     };
@@ -320,6 +320,13 @@ fn fit_width(pane: &str, target: f64) {
             "layout.set_split_ratio",
             json!({ "pane_id": pane, "path": path, "ratio": ratio }),
         );
+    }
+}
+
+/// Makes `pane` half its tab wide.
+pub(crate) fn fit_half(pane: &str) {
+    if let Some(area) = layout(pane).and_then(|l| l["area"]["width"].as_f64()) {
+        fit_width(pane, area / 2.0);
     }
 }
 
@@ -751,7 +758,7 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                             if let Some((source, cwd)) = item.and_then(|i| diff_source(key, i)) {
                                 let cwd = cwd.unwrap_or_else(|| home.display().to_string());
                                 let agent = last_agent.as_ref().and_then(|a| a["pane_id"].as_str());
-                                open_diff(&source, &cwd, agent, None);
+                                open_diff(&source, &cwd, agent, own.as_deref());
                             }
                             None
                         }
@@ -1350,11 +1357,19 @@ pub fn pr_diff(home: &Path) -> anyhow::Result<()> {
     let clicked = std::env::var("HERDR_PLUGIN_CLICKED_URL").unwrap_or_default();
     if let Some(url) = pr_url(&clicked) {
         let agent = context_id("HERDR_PANE_ID", "focused_pane_id");
+        // The tab's panel, if it has one, makes way for the diff as on `d`.
+        let tab = tab_id().or_else(|| agent.as_deref().and_then(tab_of));
+        let panel = tab.as_deref().and_then(|tab| {
+            our_panes(workspace_id().as_deref(), Some(tab))
+                .live
+                .into_iter()
+                .next()
+        });
         open_diff(
             &format!("pr:{url}"),
             &home.to_string_lossy(),
             agent.as_deref(),
-            None,
+            panel.as_deref(),
         );
     }
     Ok(())
@@ -1370,22 +1385,41 @@ fn pr_url(link: &str) -> Option<String> {
         .then(|| format!("https://github.com/{owner}/{repo}/pull/{number}"))
 }
 
-/// Opens the diff of `source` (see `diff::SOURCE`) as the popup the
-/// manifest declares, run in `cwd`; the panel stays as it is. `agent` is the pane its editor
-/// (`e`) opens over; `at`, the file to start on.
-pub(crate) fn open_diff(source: &str, cwd: &str, agent: Option<&str>, at: Option<&str>) {
-    let mut env = json!({ crate::diff::SOURCE: source });
-    if let Some(agent) = agent {
-        env[FOR_PANE] = agent.into();
+/// Opens the diff of `source` (see `diff::SOURCE`), run in `cwd`, on the
+/// right half of the tab: in place of `panel`, which closes and comes back
+/// for `agent` when the diff quits, or with no panel at the tab's right edge
+/// beside `agent`.
+pub(crate) fn open_diff(source: &str, cwd: &str, agent: Option<&str>, panel: Option<&str>) {
+    let mut open = json!({
+        "plugin_id": PLUGIN, "entrypoint": "diff", "placement": "split",
+        "direction": "right", "cwd": cwd, "focus": true,
+        "env": { crate::diff::SOURCE: source },
+    });
+    if let Some(panel) = panel {
+        open["target_pane_id"] = panel.into();
+        open["env"][REPLACES] = panel.into();
+        if let Some(agent) = agent {
+            open["env"][FOR_PANE] = agent.into();
+        }
+    } else if let Some(edge) = agent.and_then(right_edge) {
+        open["target_pane_id"] = edge.into();
     }
-    if let Some(at) = at {
-        env[crate::diff::AT_FILE] = at.into();
+    if call("plugin.pane.open", open).is_some()
+        && let Some(panel) = panel
+    {
+        // Ends the panel's process too.
+        call("pane.close", json!({ "pane_id": panel }));
     }
+}
+
+/// Opens the Changes panel for `agent` in place of `replaces`.
+pub(crate) fn reopen(agent: &str, replaces: &str) {
     call(
         "plugin.pane.open",
         json!({
-            "plugin_id": PLUGIN, "entrypoint": "diff",
-            "cwd": cwd, "env": env, "focus": true,
+            "plugin_id": PLUGIN, "entrypoint": ENTRYPOINT, "placement": "split",
+            "direction": "right", "target_pane_id": replaces, "focus": true,
+            "env": { FOR_PANE: agent, REPLACES: replaces },
         }),
     );
 }
@@ -2139,7 +2173,7 @@ mod tests {
         let shell = json!({ "shell_pid": 7, "foreground_processes": [
             { "pid": 7, "cmdline": "-zsh" } ] });
         assert!(ours(&pane("Changes", root)) && bare_shell(&shell));
-        // The diff is a popup now; a pane titled so is not the panel's.
+        // A pane titled as the diff is not the panel's.
         assert!(!ours(&pane("Diff", root)));
         // A pane of the user's that shares the title, elsewhere, or in a
         // directory merely named like the plugin.

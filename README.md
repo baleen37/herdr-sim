@@ -119,16 +119,17 @@ Claude Code's "Changes" panel as a right-hand split.
 - **Mouse.** A click opens what it is on: the repo, the PR, its files,
   comments, or checks. The wheel scrolls. A drag across rows copies their
   text.
-- **Diff.** `d` opens a diff in a popup over the tab (the panel stays), laid
+- **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
   out like reviewr: the selected file's diff (line numbers, changed lines
   barred and tinted, highlighted for the file's language, CSV columns in
   colour) beside a tree of the changed files. Vim keys move (`j`/`k`,
   `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
   switches box, `z` hides the tree (and shows it again, focused), `e` opens
-  the file in `$EDITOR` at the line over the agent's pane (quitting it
-  brings the diff back), `q` closes it.
+  the file in `$EDITOR` at the line (quitting it brings the diff back), `q`
+  brings the panel back.
 - **PR links.** Ctrl+click on a GitHub PR link in any pane (an agent's
-  `gh pr create` output, say) opens that PR's diff the same way. Herdr routes
+  `gh pr create` output, say) opens that PR's diff the same way, beside the
+  tab's panes when it has no panel. Herdr routes
   the click only while `ui.mouse_capture` is on.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
