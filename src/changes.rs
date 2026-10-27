@@ -191,10 +191,10 @@ fn our_panes(workspace: Option<&str>, tab: Option<&str>) -> Ours {
 }
 
 /// Whether `pane` (from `pane list`) has the title and directory of the
-/// panel or its diff. Herdr brings such a pane back after a restart, by its
-/// title, as a shell in the plugin's directory.
+/// panel. Herdr brings such a pane back after a restart, by its title, as a
+/// shell in the plugin's directory.
 fn ours(pane: &Value) -> bool {
-    matches!(pane["label"].as_str(), Some("Changes" | "Diff"))
+    pane["label"] == "Changes"
         && pane["cwd"].as_str().is_some_and(|cwd| {
             let root = Path::new(cwd);
             root.file_name()
@@ -2173,7 +2173,8 @@ mod tests {
         let shell = json!({ "shell_pid": 7, "foreground_processes": [
             { "pid": 7, "cmdline": "-zsh" } ] });
         assert!(ours(&pane("Changes", root)) && bare_shell(&shell));
-        assert!(ours(&pane("Diff", root)));
+        // A pane titled as the diff is not the panel's.
+        assert!(!ours(&pane("Diff", root)));
         // A pane of the user's that shares the title, elsewhere, or in a
         // directory merely named like the plugin.
         assert!(!ours(&pane("Changes", "/home/u/src")));
