@@ -98,7 +98,7 @@ fn main() -> Result<()> {
         return diff::edit_pane();
     }
     if env::args().any(|a| a == "--diff-pane") {
-        return diff::run();
+        return diff::run(&plugin_dir.join("diffs"));
     }
     if env::args().any(|a| a == "--animate") {
         return animate(&state_dir);

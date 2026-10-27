@@ -126,7 +126,8 @@ Claude Code's "Changes" panel as a right-hand split.
   `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
   switches box, `z` hides the tree (and shows it again, focused), `e` opens
   the file in `$EDITOR` at the line (quitting it brings the diff back), `q`
-  brings the panel back.
+  brings the panel back. A PR's diff opened before draws at once from its
+  saved copy, then refreshes from GitHub.
 - **Freshness.** Open PRs are refetched every 30 seconds, merged and closed ones
   every 10 minutes, all in one GraphQL call. The last details are saved, so a
   reopened panel draws at once. Calls back off when GitHub's rate limit is
