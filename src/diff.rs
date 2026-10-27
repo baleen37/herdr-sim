@@ -4,11 +4,11 @@
 //! right half of the tab; `q` swaps the panel back.
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -26,6 +26,8 @@ pub const SOURCE: &str = "HERDR_SIM_DIFF_SOURCE";
 const WATCH: Duration = Duration::from_secs(2);
 /// Quiet ticks between full re-reads, which also find new untracked files.
 const RESCAN_TICKS: u32 = 5;
+/// How long a PR's saved diff is kept unopened.
+const SAVED_FOR: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const CYAN: &str = "\x1b[38;2;137;220;235m";
 const YELLOW: &str = "\x1b[38;2;249;226;175m";
 const BOLD: &str = "\x1b[1m";
@@ -69,8 +71,8 @@ enum Focus {
     Diff,
 }
 
-/// Runs the pane until `q`.
-pub fn run() -> anyhow::Result<()> {
+/// Runs the pane until `q`. A PR's last diff is saved in `saved`.
+pub fn run(saved: &Path) -> anyhow::Result<()> {
     let source = std::env::var(SOURCE).unwrap_or_default();
     let me = std::env::var("HERDR_PANE_ID").ok();
     // The right half of the tab, once the panel it replaces has gone.
@@ -93,12 +95,30 @@ pub fn run() -> anyhow::Result<()> {
     // of the diff they were made from.
     let (coloured_in, coloured) = mpsc::channel::<(usize, u64, Vec<Shown>)>();
     let mut version = 0u64;
-    // The title and the diff come from separate git or gh calls; ask both at
-    // once.
-    let asked = source.clone();
-    let title = std::thread::spawn(move || title(&asked));
-    let mut files = read(&source);
-    let title = title.join().unwrap_or_default();
+    // A PR's diff is a second away on GitHub: the last one saved shows at
+    // once, the fresh one when it arrives.
+    let (fetched_in, fetched) = mpsc::channel::<(String, Option<Vec<File>>)>();
+    let (mut title, mut files) = match source.strip_prefix("pr:") {
+        Some(url) => {
+            let path = saved_path(saved, url);
+            let last = load_saved(&path)
+                .unwrap_or_else(|| (format!("{url} {DIM}· loading…{RESET}"), Vec::new()));
+            let (url, wake) = (url.to_string(), wake.clone());
+            std::thread::spawn(move || {
+                let _ = fetched_in.send(fetch_pr(&url, &path));
+                let _ = wake.send(Event::Wake);
+            });
+            last
+        }
+        // The title and the diff come from separate git calls; ask both at
+        // once.
+        None => {
+            let asked = source.clone();
+            let title = std::thread::spawn(move || title(&asked));
+            let files = read(&source);
+            (title.join().unwrap_or_default(), files)
+        }
+    };
     let mut selected = 0usize;
     let mut scroll = 0usize;
     let mut focus = Focus::Files;
@@ -113,6 +133,15 @@ pub fn run() -> anyhow::Result<()> {
     loop {
         let (rows, width) = size();
         let body = rows.saturating_sub(4);
+        if let Ok((fresh_title, fresh)) = fetched.try_recv() {
+            title = fresh_title;
+            if let Some(fresh) = fresh.filter(|fresh| *fresh != files) {
+                files = fresh;
+                shown = None;
+                version += 1;
+                selected = selected.min(files.len().saturating_sub(1));
+            }
+        }
         while let Ok((at, made_from, lines)) = coloured.try_recv() {
             if at == selected && made_from == version {
                 shown = Some((at, lines));
@@ -323,19 +352,70 @@ fn fingerprint(dir: &str, files: &[File]) -> u64 {
     hash.finish()
 }
 
-/// The unified diff `source` names, split into files.
-/// In path order, as the tree shows them, so keys move through the tree.
+/// The checkout's diff `source` names, split into files.
 fn read(source: &str) -> Vec<File> {
-    let mut files = if let Some(dir) = source.strip_prefix("checkout:") {
-        parse(&checkout_diff(dir))
-    } else if let Some(url) = source.strip_prefix("pr:") {
-        crate::gh(&["pr", "diff", url, "--color", "never"], None)
-            .map_or_else(Vec::new, |o| parse(&String::from_utf8_lossy(&o.stdout)))
-    } else {
-        Vec::new()
-    };
+    source
+        .strip_prefix("checkout:")
+        .map_or_else(Vec::new, |dir| files(&checkout_diff(dir)))
+}
+
+/// `diff`'s files in path order, as the tree shows them, so keys move
+/// through the tree.
+fn files(diff: &str) -> Vec<File> {
+    let mut files = parse(diff);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
+}
+
+/// A PR's title and files from GitHub, saved at `path` for the next time it
+/// opens; no files when GitHub could not be asked. The title is asked
+/// alongside the diff.
+fn fetch_pr(url: &str, path: &Path) -> (String, Option<Vec<File>>) {
+    let source = format!("pr:{url}");
+    let title = std::thread::spawn(move || title(&source));
+    let diff = crate::gh(&["pr", "diff", url, "--color", "never"], None)
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let title = title.join().unwrap_or_default();
+    if let Some(diff) = &diff {
+        save(path, &title, diff);
+    }
+    (title, diff.as_deref().map(files))
+}
+
+/// Where a PR's diff is saved: `o-r-pull-7.json` for
+/// `https://github.com/o/r/pull/7`.
+fn saved_path(dir: &Path, url: &str) -> PathBuf {
+    let name = url
+        .trim_start_matches("https://github.com/")
+        .replace('/', "-");
+    dir.join(format!("{name}.json"))
+}
+
+fn load_saved(path: &Path) -> Option<(String, Vec<File>)> {
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    Some((v["title"].as_str()?.to_string(), files(v["diff"].as_str()?)))
+}
+
+/// Saves a PR's title and diff, dropping others unopened for `SAVED_FOR`.
+fn save(path: &Path, title: &str, diff: &str) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({ "title": title, "diff": diff }).to_string(),
+    );
+    let old = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| SystemTime::now().duration_since(t).unwrap_or_default() > SAVED_FOR)
+    };
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if old(&entry.path()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The checkout's uncommitted changes against `HEAD`, new untracked files
@@ -946,6 +1026,30 @@ mod tests {
         for ext in ["ts", "tsx", "kt", "nix", "toml", "swift", "Dockerfile"] {
             assert!(syntaxes.find_syntax_by_extension(ext).is_some(), "{ext}");
         }
+    }
+
+    #[test]
+    fn a_saved_pr_diff_opens_as_it_was_and_old_ones_go() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let stale = dir.path().join("o-r-pull-1.json");
+        std::fs::write(&stale, "{}").unwrap();
+        let week_ago = SystemTime::now() - SAVED_FOR - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(week_ago)
+            .unwrap();
+        let path = saved_path(dir.path(), "https://github.com/o/r/pull/7");
+        assert!(path.ends_with("o-r-pull-7.json"));
+        let diff = "diff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-x\n+y\n\
+                    diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        save(&path, "main → topic", diff);
+        assert_eq!(
+            load_saved(&path),
+            Some(("main → topic".into(), files(diff)))
+        );
+        assert!(!stale.exists());
     }
 
     #[test]
