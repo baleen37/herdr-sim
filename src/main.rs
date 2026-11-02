@@ -517,14 +517,12 @@ impl Run {
             (PROJECT_TOKEN.to_string(), project),
             (BRANCH_TOKEN.to_string(), branch),
         ];
-        // The logo needs no session; the PRs and title do, so leave those be.
+        // Without a session, keep the logo but clear the previous title.
         if agent["agent_session"]["value"].as_str().is_none() {
-            let heading = self
-                .cache
-                .heading(pane)
-                .unwrap_or_else(|| heading_value(icon, None));
+            let heading = heading_value(icon, None);
             self.cache.set_heading(pane, heading.clone());
             tokens.push((HEADING_TOKEN.to_string(), Some(heading)));
+            tokens.push((TITLE_TOKEN.to_string(), None));
             self.report("pane", pane, "agent", None, &tokens);
             return;
         }
@@ -604,7 +602,17 @@ impl Run {
                 let status = agent["agent_status"].as_str().unwrap_or("unknown");
                 let focused = agent["focused"].as_bool().unwrap_or(false);
                 let pane = agent["pane_id"].as_str().unwrap_or_default();
-                let held = self.cache.held(pane).map(String::from);
+                let activity = matches!(status, "working" | "done")
+                    || self
+                        .session_of(agent)
+                        .is_some_and(|s| s.last_activity.is_some());
+                let worked = self.cache.observe_work(pane, activity);
+                // Startup questions can return to idle without starting a turn.
+                let held = self
+                    .cache
+                    .held(pane)
+                    .filter(|held| *held != "blocked" || status != "idle" || worked)
+                    .map(String::from);
                 let (status, held) = held_status(status, held.as_deref(), focused);
                 let status = status.to_string();
                 self.cache.set_held(pane, held);
@@ -614,8 +622,8 @@ impl Run {
             .collect()
     }
 
-    /// Puts each agent's heading in the token for its state (herdr-radar's
-    /// colour by state), reusing the heading the last full pass computed.
+    /// Puts each agent's current session heading in the token for its state
+    /// (herdr-radar's colour by state), clearing titles without a session.
     fn report_states(&mut self, agents: &[Value], states: &[(String, &'static str)]) {
         for (agent, (status, state)) in agents.iter().zip(states) {
             let kind = agent["agent"].as_str().unwrap_or_default();
@@ -624,19 +632,16 @@ impl Run {
             };
             // Read the title now rather than reuse the last pass's: Claude
             // titles a session during its first turn, before that turn ends.
-            let heading = match self.session_of(agent) {
-                Some(session) => {
-                    let heading = heading_value(icon, session.title.as_deref());
-                    self.cache.set_heading(pane, heading.clone());
-                    heading
-                }
-                None => self.cache.heading(pane).unwrap_or_else(|| icon.to_string()),
-            };
+            let session = self.session_of(agent).unwrap_or_default();
+            let heading = heading_value(icon, session.title.as_deref());
+            self.cache.set_heading(pane, heading.clone());
             let value = state_heading_value(&heading, status, 0);
-            let tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
+            let mut tokens: Vec<(String, Option<String>)> = STATE_HEADING_TOKENS
                 .iter()
                 .map(|t| (t.to_string(), (t == state).then(|| value.clone())))
                 .collect();
+            tokens.push((HEADING_TOKEN.to_string(), Some(heading.clone())));
+            tokens.push((TITLE_TOKEN.to_string(), session.title));
             self.report("pane", pane, "state", None, &tokens);
             // The same heading split in two, logo apart, for the radar rows.
             // A report takes at most 16 tokens, so these go in a call of their own.
@@ -1071,6 +1076,87 @@ fn run(program: &str, args: &[impl AsRef<std::ffi::OsStr> + std::fmt::Debug]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_question_clears_on_idle_but_work_questions_stay_held() {
+        for worked in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut run = Run {
+                herdr: "herdr".into(),
+                home: home.path().into(),
+                ordered: false,
+                sidebar_width: None,
+                now: 0,
+                cache: Cache::default(),
+            };
+            let mut agent = json!({ "agent": "codex", "pane_id": "w1:p1" });
+            if worked {
+                agent["agent_status"] = json!("working");
+                run.states(&[agent.clone()]);
+            }
+            agent["agent_status"] = json!("blocked");
+            assert_eq!(run.states(&[agent.clone()])[0].0, "blocked");
+            let path = home.path().join("cache.json");
+            run.cache.save(&path).unwrap();
+            run.cache = Cache::load(&path);
+            agent["agent_status"] = json!("idle");
+            assert_eq!(
+                run.states(&[agent])[0].0,
+                if worked { "blocked" } else { "idle" }
+            );
+        }
+    }
+
+    #[test]
+    fn questions_from_old_caches_keep_their_unknown_work_history() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("cache.json");
+        fs::write(&path, r#"{"held":{"w1:p1":"blocked"}}"#).unwrap();
+        let mut run = Run {
+            herdr: "herdr".into(),
+            home: home.path().into(),
+            ordered: false,
+            sidebar_width: None,
+            now: 0,
+            cache: Cache::load(&path),
+        };
+        let agent = json!({ "agent": "codex", "pane_id": "w1:p1", "agent_status": "idle" });
+        assert_eq!(run.states(&[agent])[0].0, "blocked");
+    }
+
+    #[test]
+    fn missing_session_clears_the_previous_title_on_full_and_status_passes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for status_only in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let herdr = dir.path().join("herdr");
+            fs::write(&herdr, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.calls\"\n").unwrap();
+            fs::set_permissions(&herdr, fs::Permissions::from_mode(0o755)).unwrap();
+            let mut run = Run {
+                herdr: herdr.display().to_string(),
+                home: dir.path().into(),
+                ordered: false,
+                sidebar_width: None,
+                now: 0,
+                cache: Cache::default(),
+            };
+            run.cache.set_heading("w1:p1", "old session title".into());
+            let agent = json!({ "agent": "codex", "pane_id": "w1:p1" });
+            if !status_only {
+                run.agent(&agent);
+            }
+            run.report_states(&[agent], &[("idle".into(), "heading_idle")]);
+
+            let calls = fs::read_to_string(dir.path().join("herdr.calls")).unwrap();
+            assert!(!calls.contains("old session title"), "{calls}");
+            assert!(calls.contains("--clear-token\ntitle\n"), "{calls}");
+            assert_eq!(
+                run.cache.heading("w1:p1"),
+                Some(agent_icon("codex").unwrap().into())
+            );
+        }
+    }
 
     #[test]
     fn pad_before_pr_sets_the_pr_at_the_right_end() {
