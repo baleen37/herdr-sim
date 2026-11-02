@@ -1037,6 +1037,8 @@ pub struct Cache {
     headings: HashMap<String, String>,
     /// The `done` or `blocked` each pane holds past Herdr's own status.
     held: HashMap<String, String>,
+    /// Whether each pane has worked; false identifies startup questions.
+    worked: HashMap<String, bool>,
     /// How far in each pane's heading sits, from the last tree pass.
     depths: HashMap<String, usize>,
 }
@@ -1137,6 +1139,9 @@ impl Cache {
         let held = object(&v["held"])
             .filter_map(|(pane, v)| Some((pane.clone(), v.as_str()?.to_string())))
             .collect();
+        let worked = object(&v["worked"])
+            .filter_map(|(pane, v)| Some((pane.clone(), v.as_bool()?)))
+            .collect();
         let depths = object(&v["depths"])
             .filter_map(|(pane, v)| Some((pane.clone(), usize::try_from(v.as_u64()?).ok()?)))
             .collect();
@@ -1148,6 +1153,7 @@ impl Cache {
             places,
             headings,
             held,
+            worked,
             depths,
         }
     }
@@ -1194,7 +1200,7 @@ impl Cache {
         let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
         fs::write(
             &tmp,
-            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings, "held": self.held, "depths": self.depths })
+            json!({ "prs": prs, "branches": branches, "files": files, "reported": self.reported, "places": places, "headings": self.headings, "held": self.held, "worked": self.worked, "depths": self.depths })
                 .to_string(),
         )?;
         fs::rename(&tmp, path)
@@ -1263,6 +1269,17 @@ impl Cache {
 
     pub fn held(&self, pane: &str) -> Option<&str> {
         self.held.get(pane).map(String::as_str)
+    }
+
+    pub fn observe_work(&mut self, pane: &str, working: bool) -> bool {
+        // A badge from an older cache has no history: keep it conservatively.
+        let previously_held = self.held.contains_key(pane);
+        let worked = self
+            .worked
+            .entry(pane.to_string())
+            .or_insert(previously_held);
+        *worked |= working;
+        *worked
     }
 
     pub fn set_held(&mut self, pane: &str, held: Option<&str>) {
