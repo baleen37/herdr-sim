@@ -4,6 +4,7 @@
     "name": "main",
     "version": "0.1.13"
   },
+  "preview": "layouts/main-sim.svg",
   "type": "row",
   "titlebar": "none",
   "traffic_lights": [
@@ -107,14 +108,14 @@
               }
             },
             {
-              "id": "prs-button",
+              "id": "sim-prs-button",
               "type": "block",
               "size": {
                 "px": 56
               },
               "window_drag": true,
               "content": {
-                "mod": "prs",
+                "mod": "sim-prs",
                 "props": {
                   "button": true
                 }
@@ -187,10 +188,10 @@
                       }
                     },
                     {
-                      "id": "prs",
+                      "id": "sim-prs",
                       "type": "block",
                       "content": {
-                        "mod": "prs"
+                        "mod": "sim-prs"
                       }
                     }
                   ]

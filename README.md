@@ -112,18 +112,14 @@ check; a click opens the PR. Open PRs are re-checked at most once a minute,
 merged and closed ones never. Codex terminals and terminals on other machines
 show only the branch PR.
 
-Link the mod so a `git pull` updates it, then add the layout (Herdr's `main`
-with the panel and its button):
+Install from a checkout: `herdr-app/scripts/install.sh` links the mod into
+`~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, and adds the
+`main-sim` layout (Herdr's `main` with the panel and its button) unless one is
+already there. Then `herdr-app do layout.switch --name main-sim`.
 
-```sh
-ln -s "$PWD/herdr-app/mods/prs" ~/.config/herdr-app/mods/prs
-cp herdr-app/layouts/main-prs.json ~/.config/herdr-app/layouts/
-herdr-app do layout.switch --name main-prs
-```
-
-In a layout of your own, add `{ "id": "prs", "type": "block", "content": { "mod": "prs" } }`
-to the `panel-body` stack, and `{ "mod": "prs", "props": { "button": true } }` as a
-56px block beside `tabs`.
+In a layout of your own, add `{ "id": "sim-prs", "type": "block", "content": { "mod": "sim-prs" } }`
+to the `panel-body` stack, and `{ "mod": "sim-prs", "props": { "button": true } }` as a
+56px block beside `tabs`. How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
 
 ## Changes panel
 

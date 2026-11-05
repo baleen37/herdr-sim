@@ -1,7 +1,11 @@
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, panes, focused, exec, hc, run, layout, theme, home, shared, setShared, window } from "herdr";
-import * as fs from "fs/promises";
+import { agents, panes, focused, exec, run, layout, theme, props, shared, setShared, window } from "herdr";
+import { claudeSession, sessionPrs } from "./session.js";
+import { repoOf, stateOf } from "./links.js";
+
+// This folder's name: the layout's block id, the stack child and the tab bar's remembered panel.
+const MOD = "sim-prs";
 
 const FIELDS = "number,title,state,url,isDraft,additions,deletions,reviewDecision";
 const POLL = 10000;   // how often the shown panel looks at the focused agent again
@@ -26,8 +30,8 @@ function find(node, id) {
 // As one of the side panels beside Files and Changes, only the one shown works.
 function hidden() {
   const root = layout(), body = find(root, "panel-body");
-  if (!body?.children?.some((c) => c.content?.mod === "prs")) return false;
-  return find(root, "panel")?.hidden || find(body, body.active)?.content?.mod !== "prs";
+  if (!body?.children?.some((c) => c.content?.mod === MOD)) return false;
+  return find(root, "panel")?.hidden || find(body, body.active)?.content?.mod !== MOD;
 }
 
 function openUrl(url) {
@@ -35,42 +39,14 @@ function openUrl(url) {
   exec("sh", ["-c", 'xdg-open "$1" >/dev/null 2>&1 || open "$1"', "sh", url]).catch(() => null);
 }
 
-const readJson = (path) => fs.readFile(path, "utf8").then(JSON.parse).catch(() => null);
-
-// The session a Claude Code terminal shows, as herdr-sim finds it: the claude
-// process's ~/.claude/sessions/<pid>.json, followed to its job when the
-// conversation was parked with /background.
-async function claudeSession(terminal) {
-  const r = await hc(["get", terminal, "--json"]);
-  if (r.code !== 0) return null;
-  const pid = JSON.parse(r.stdout).foreground?.pid;
-  const s = pid ? await readJson(`${home()}/.claude/sessions/${pid}.json`) : null;
-  if (!s?.sessionId) return null;
-  const job = s.parkedJobId ? await readJson(`${home()}/.claude/jobs/${s.parkedJobId}/state.json`) : null;
-  return job?.sessionId ?? s.sessionId;
-}
-
-// The PRs a session touched: Claude Code writes a pr-link record to its
-// transcript when it creates, pushes to, edits or comments on one. Newest first.
-async function sessionPrs(session) {
-  const r = await exec("grep", ["-rhF", '"type":"pr-link"', "--include", `${session}.jsonl`, `${home()}/.claude/projects`]);
-  const urls = [];
-  for (const line of r.stdout.split("\n").reverse()) {
-    try {
-      const url = JSON.parse(line).prUrl;
-      if (url && !urls.includes(url)) urls.push(url);
-    } catch { /* a partly written line */ }
-  }
-  return urls;
-}
-
 // The panel (follows the focused terminal), or its PRs button beside the tab bar (props { button: true }).
 export default class Prs extends View {
-  init(props, cx) {
-    if (props?.button) {
+  init(_props, cx) {
+    // init's first argument isn't the block's props: props() is.
+    if (props()?.button) {
       // The tab bar restores each space's panel only if it's one of these.
       const panels = shared("workspace.panels") ?? ["files", "changes"];
-      if (!panels.includes("prs")) setShared("workspace.panels", [...panels, "prs"]);
+      if (!panels.includes(MOD)) setShared("workspace.panels", [...panels, MOD]);
       this.button = true;
       return;
     }
@@ -135,14 +111,14 @@ export default class Prs extends View {
   }
 
   toolbar(t) {
-    const root = layout(), panel = find(root, "panel"), on = panel && !panel.hidden && find(root, "panel-body")?.active === "prs";
+    const root = layout(), panel = find(root, "panel"), on = panel && !panel.hidden && find(root, "panel-body")?.active === MOD;
     return h_flex().size_full().pr(10).items_center().justify_end().bg(t.chrome).border_b(1).border_color(t.border)
-      .child(h_flex().id("panel-prs").h(26).px(10).flex_none().items_center().rounded(6)
+      .child(h_flex().id(`panel-${MOD}`).h(26).px(10).flex_none().items_center().rounded(6)
         .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
         .hover((s) => s.bg(t.hover)).on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
-          else { run("layout.select", { stack: "panel-body", child: "prs" }); run("layout.show", { id: "panel" }); }
+          else { run("layout.select", { stack: "panel-body", child: MOD }); run("layout.show", { id: "panel" }); }
         })
         .child("PRs"));
   }
@@ -152,8 +128,7 @@ export default class Prs extends View {
   }
 
   row(p, t) {
-    const state = STATES[p.isDraft && p.state === "OPEN" ? "DRAFT" : p.state] ?? { label: p.state, color: t.dim };
-    const repo = p.url.match(/github\.com\/([^/]+\/[^/]+)\/pull/)?.[1] ?? "";
+    const state = STATES[stateOf(p)] ?? { label: p.state, color: t.dim }, repo = repoOf(p.url);
     return v_flex().id(`pr-${p.url}`).flex_none().px(10).py(7).gap(4).rounded(7).cursor_pointer()
       .hover((s) => s.bg(t.hover)).on_click(() => openUrl(p.url))
       .child(h_flex().gap(8).items_start()
@@ -175,7 +150,7 @@ export default class Prs extends View {
     this.away = away;
 
     const v = this.view, empty = (text) => div().px(16).py(20).text_size(12).text_center().text_color(t.dim).child(text);
-    return v_flex().id("prs").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+    return v_flex().id(MOD).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .child(div().font_semibold().child("Pull requests"))
         .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).text_right().truncate().child(v?.branch ?? ""))

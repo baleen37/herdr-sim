@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400" font-family="system-ui,sans-serif">
+  <rect width="640" height="400" rx="12" fill="#17171b"/>
+  <!-- Sidebar: spaces and agents, as Herdr's main -->
+  <rect width="150" height="400" rx="12" fill="#1d1d22"/>
+  <path d="M150 0v400" stroke="#33333a"/>
+  <g fill="#3b3b40"><circle cx="18" cy="18" r="5"/><circle cx="34" cy="18" r="5"/><circle cx="50" cy="18" r="5"/></g>
+  <text x="14" y="54" font-size="10" fill="#8a8a96">Spaces</text>
+  <rect x="8" y="62" width="134" height="22" rx="6" fill="#2b2b31"/>
+  <text x="18" y="77" font-size="11" fill="#e6e6ea">herdr-sim</text>
+  <text x="18" y="101" font-size="11" fill="#a9a9b4">search</text>
+  <text x="14" y="210" font-size="10" fill="#8a8a96">Agents</text>
+  <text x="18" y="232" font-size="11" fill="#e6e6ea">Fix sidebar titles</text>
+  <text x="18" y="254" font-size="11" fill="#a9a9b4">Bump deps</text>
+  <!-- Tab bar with the PRs button beside Files and Changes -->
+  <rect x="158" y="8" width="70" height="20" rx="5" fill="#2b2b31"/>
+  <text x="168" y="22" font-size="11" fill="#e6e6ea">1</text>
+  <g font-size="10" fill="#a9a9b4"><text x="470" y="22">Files</text><text x="510" y="22">Changes</text></g>
+  <rect x="566" y="8" width="38" height="20" rx="5" fill="#33333a"/>
+  <text x="575" y="22" font-size="10" fill="#e6e6ea">PRs</text>
+  <!-- The agent's terminal -->
+  <rect x="158" y="38" width="262" height="340" rx="8" fill="#232328" stroke="#33333a"/>
+  <g font-family="monospace" font-size="10" fill="#a9a9b4"><text x="168" y="66">$ claude</text><text x="168" y="84">gh pr create --fill</text><text x="168" y="102">https://github.com/o/r/pull/61</text></g>
+  <!-- The PRs panel -->
+  <rect x="428" y="38" width="204" height="340" rx="8" fill="#232328" stroke="#33333a"/>
+  <text x="440" y="60" font-size="11" font-weight="600" fill="#e6e6ea">Pull requests</text>
+  <text x="620" y="60" font-size="9" fill="#8a8a96" text-anchor="end">fix/sidebar</text>
+  <path d="M428 70h204" stroke="#33333a"/>
+  <text x="440" y="88" font-size="9" font-weight="600" fill="#8a8a96">This branch</text>
+  <rect x="440" y="96" width="32" height="13" rx="6.5" fill="#238636"/><text x="456" y="106" font-size="8" fill="#fff" text-anchor="middle">Open</text>
+  <text x="478" y="106" font-size="10" fill="#e6e6ea">Clear stale titles</text>
+  <text x="440" y="122" font-size="9" fill="#8a8a96">o/r#61 <tspan fill="#4fd17a">+42</tspan> <tspan fill="#ff6b64">−7</tspan> <tspan fill="#4fd17a">✓ Approved</tspan></text>
+  <text x="440" y="148" font-size="9" font-weight="600" fill="#8a8a96">This session</text>
+  <rect x="440" y="156" width="40" height="13" rx="6.5" fill="#8957e5"/><text x="460" y="166" font-size="8" fill="#fff" text-anchor="middle">Merged</text>
+  <text x="486" y="166" font-size="10" fill="#e6e6ea">Release 0.38</text>
+  <text x="440" y="182" font-size="9" fill="#8a8a96">o/r#58 <tspan fill="#4fd17a">+3</tspan> <tspan fill="#ff6b64">−3</tspan></text>
+  <rect x="440" y="196" width="32" height="13" rx="6.5" fill="#6e7681"/><text x="456" y="206" font-size="8" fill="#fff" text-anchor="middle">Draft</text>
+  <text x="478" y="206" font-size="10" fill="#e6e6ea">Codex sessions</text>
+  <text x="440" y="222" font-size="9" fill="#8a8a96">o/other#12 <tspan fill="#4fd17a">+120</tspan> <tspan fill="#ff6b64">−18</tspan></text>
+</svg>
