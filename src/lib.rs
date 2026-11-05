@@ -753,6 +753,20 @@ pub fn resolve_claude_session(home: &Path, session_id: &str) -> String {
         .unwrap_or_else(|| session_id.to_string())
 }
 
+/// The session the `claude` process `pid` shows, from its
+/// `~/.claude/sessions/<pid>.json`, followed to a parked job's session as
+/// [`resolve_claude_session`] does. For callers that know the process but not
+/// Herdr's `agent_session`, such as the Herdr app's panel.
+pub fn claude_session_for_pid(home: &Path, pid: &str) -> Option<String> {
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let text =
+        fs::read_to_string(home.join(".claude/sessions").join(format!("{pid}.json"))).ok()?;
+    let id = parse(&text)?["sessionId"].as_str()?.to_string();
+    Some(resolve_claude_session(home, &id))
+}
+
 /// The name Claude Code gave a session in `~/.claude/sessions/<pid>.json`
 /// (such as `search-4b`): something to show before it has a title or a
 /// question.
@@ -1480,6 +1494,38 @@ mod tests {
                 .prs
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn session_for_pid_reads_the_process_file_and_follows_a_parked_job() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("7.json"),
+            json!({ "sessionId": "s7" }).to_string(),
+        )
+        .unwrap();
+        let parked = json!({ "sessionId": "pane", "parkedJobId": "job1" });
+        fs::write(sessions.join("8.json"), parked.to_string()).unwrap();
+        let job = home.path().join(".claude/jobs/job1");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(
+            job.join("state.json"),
+            json!({ "sessionId": "forked" }).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_session_for_pid(home.path(), "7").as_deref(),
+            Some("s7")
+        );
+        assert_eq!(
+            claude_session_for_pid(home.path(), "8").as_deref(),
+            Some("forked")
+        );
+        assert_eq!(claude_session_for_pid(home.path(), "9"), None);
+        assert_eq!(claude_session_for_pid(home.path(), "../7"), None);
     }
 
     #[test]

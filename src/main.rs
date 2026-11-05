@@ -94,6 +94,20 @@ fn main() -> Result<()> {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         return changes::run(&herdr_bin, &home, &state_dir);
     }
+    if env::args().any(|a| a == "--prs-json") {
+        // For the Herdr app's sim-prs panel: `--prs-json [--pid <claude pid>] [--cwd <dir>]`.
+        let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
+        let args: Vec<String> = env::args().collect();
+        let value = |flag: &str| {
+            let at = args.iter().position(|a| a == flag)?;
+            args.get(at + 1).map(String::as_str)
+        };
+        println!(
+            "{}",
+            changes::app_json(&home, &state_dir, value("--pid"), value("--cwd"))
+        );
+        return Ok(());
+    }
     if env::args().any(|a| a == "--edit-pane") {
         return diff::edit_pane();
     }

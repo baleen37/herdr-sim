@@ -1,0 +1,18 @@
+{
+  // src/*.ts build to mods/sim-prs/*.js, the files Herdr loads. Settings follow
+  // the jsconfig.json Herdr writes into a mod (ES2022, no DOM lib, no strict null checks).
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "strictNullChecks": false,
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": "src",
+    "outDir": "mods/sim-prs",
+    "removeComments": false,
+    "skipLibCheck": true
+  },
+  "include": ["src", "types"]
+}

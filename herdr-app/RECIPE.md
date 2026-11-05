@@ -18,32 +18,36 @@ A side panel beside Files and Changes that lists the pull requests of the focuse
 - The panel follows the focused terminal (`focused().terminal`, its pane's `cwd` and `branch`). A focused mod pane, such as this panel as a split, keeps the last terminal.
 - Clicking a row opens the PR in the browser (`xdg-open`, else `open`; `explorer` on Windows).
 - While it is the shown side panel it looks again every 10 seconds and whenever focus moves; hidden, it does nothing, and showing it looks at once.
-- Open PRs and a branch's PR are re-checked at most once a minute; merged and closed PRs never. What it fetched is kept in `localStorage`, so a reopened panel draws at once.
-- A Claude Code terminal (agent `app` `claude-code`) is followed to its session: the terminal's foreground pid (`terminals()[i].foreground.pid`) names `~/.claude/sessions/<pid>.json`, whose `sessionId` (or, when parked with `/background`, `~/.claude/jobs/<parkedJobId>/state.json`'s) names the transcript. Its `pr-link` records are the session's PRs.
+- Each look is one `herdr-sim --prs-json [--pid <claude pid>] [--cwd <folder>]`, which prints `{ session, branch, prs }`. herdr-sim keeps PR details between runs as its Changes pane does (open PRs 30 s, merged and closed 10 min, a folder's branch PR 1 min) in `$TMPDIR/herdr-sim/app-prs.json`, so most looks make no GitHub call; the PRs come in one GraphQL request.
+- A Claude Code terminal (agent `app` `claude-code`) passes its foreground pid (`terminals()[i].foreground.pid`). herdr-sim reads `~/.claude/sessions/<pid>.json`, follows a `/background` job to its session, and lists the transcript's `pr-link` records, newest first.
 - A terminal on another machine (`machine/t1`) shows nothing: its transcripts and checkout are there. A Codex terminal shows only the branch's PR (the app doesn't expose Codex's session id).
 - The button adds `sim-prs` to shared `workspace.panels`, so the tab bar remembers it per space like Files and Changes.
 
 ## Built from
 
 - **Layout** (`layouts/main-sim.json`): Herdr's `main` 0.1.13 with `tabs` moved into a 42px row `tab-bar` beside a 56px block `sim-prs-button` (`{ mod: "sim-prs", props: { button: true } }`, `window_drag`), and a third child `sim-prs` (`{ mod: "sim-prs" }`) in the `panel-body` stack. Root `preview` is `layouts/main-sim.svg`.
-- **Mod** `mods/sim-prs/`: `main.js` is the panel and the button; `session.js` finds a terminal's Claude Code session and its PR URLs; `links.js` holds the pure parsing (`prUrls`, `repoOf`, `stateOf`), tested under node in `tests/`.
-- **herdr**: `agents`, `panes`, `focused`, `layout`, `theme`, `terminals`, `exec`, `readTextFile`, `run` (`layout.select`, `layout.show`, `layout.hide`), `shared` / `setShared` (`workspace.panels`), `props`, `home`, `window`, `localStorage`.
-- **Programs**: `grep -rhF` over `~/.claude/projects`, `gh pr view` (`number,title,state,url,isDraft,additions,deletions,reviewDecision`), `xdg-open` / `open`.
+- **Mod** `mods/sim-prs/`, built by `tsc` from `src/` (the built `.js` is committed, since Herdr loads it): `main.ts` is the panel and the button; `links.ts` holds the `--prs-json` types and the pure helpers (`repoOf`, `stateOf`), tested under node (`--experimental-strip-types`) in `tests/`.
+- **herdr-sim** `--prs-json` (`changes::app_json`): `claude_session_for_pid`, then the Changes pane's `claude_session`, `fetch_all` and saved-details format.
+- **herdr**: `agents`, `panes`, `focused`, `layout`, `theme`, `terminals`, `exec`, `run` (`layout.select`, `layout.show`, `layout.hide`), `shared` / `setShared` (`workspace.panels`), `props` (`button`; `bin`, the herdr-sim to run, default `herdr-sim` on PATH), `window`.
+- **Programs**: `herdr-sim` (which runs `gh pr view --json url` and `gh api graphql`), `xdg-open` / `open`.
 
 ## Watch out
 
 - The mod folder is linked, not copied (`scripts/install.sh`). Herdr doesn't draw a mod's own SVGs or images through a link, so the mod ships none; the spinner is the shipped `mods/workspace-chrome/spinner.svg`. Herdr doesn't dock a linked mod either: `place` is `none` and the layout places it.
 - `hc get` run from a mod (`hc()` or `exec("hc")`) never returns, which left the panel on "Looking…": take the pid from `terminals()`, which carries `foreground`.
-- `fs/promises` may only touch the mod's own folder, and a linked mod's folder is the checkout; read `~/.claude/...` with `readTextFile`. A denied read throws, and `readJson` turns that into "no session" silently.
+- `fs/promises` may only touch the mod's own folder, and a linked mod's folder is the checkout: anything else goes through `readTextFile` or herdr-sim.
+- An older herdr-sim ignores `--prs-json` and runs its plugin pass instead, printing nothing; the panel says to update it, and `scripts/install.sh` checks for the JSON.
+- `theme()` is typed `Record<string, string>` while gpui-kit wants `` `#${string}` ``: `main.ts` casts it once. `npm run check` needs the app's own type files, copied by `npm run types`; CI builds with `--noCheck` and fails when the committed `.js` differs from `src/`'s build.
 - `init`'s first argument isn't the block's props: read `button` with `props()`.
 - Saving a file in the checkout doesn't reload a linked mod; switch layouts (`layout.switch` away and back) to load the new code.
 - Herdr writes `gpui-kit.d.ts` and `jsconfig.json` into every mod folder; `.gitignore` keeps them out.
-- `MOD` in `main.js` is the folder name, the layout's block id and the stack child. Renaming the folder means changing all three and the layout's `mod` values.
+- `MOD` in `main.ts` is the folder name, the layout's block id and the stack child. Renaming the folder means changing all three and the layout's `mod` values.
 - Claude Code's `pr-link` record is not a documented API and may change.
 
 ## Done when
 
-- `herdr-app check ~/.config/herdr-app/mods/sim-prs` passes and `npm test` passes in `herdr-app/`.
+- `npm run check`, `npm test` and `npm run build` (no diff) pass in `herdr-app/`, and `herdr-app check ~/.config/herdr-app/mods/sim-prs` passes.
+- `herdr-sim --prs-json --pid <a claude pid>` prints that session's PRs.
 - The tab bar shows Files, Changes and PRs; PRs opens and closes the panel.
 - In a Claude Code terminal whose session ran `gh pr create`, that PR is under "This session" within 10 seconds.
 - In a terminal on a branch with a PR, it is under "This branch"; a click opens it on github.com.

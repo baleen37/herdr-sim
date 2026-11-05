@@ -32,13 +32,21 @@ jobs:
       - run: cargo test --locked
 
   herdr-app:
-    name: Herdr app mod
+    name: Herdr app mod (TypeScript)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - run: node --test
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: herdr-app
+      - run: npm test
+        working-directory: herdr-app
+      # The committed mods/sim-prs/*.js are what Herdr loads: they must be src/'s build.
+      - run: npm run build && git diff --exit-code -- mods/
         working-directory: herdr-app
 
   nix-build:

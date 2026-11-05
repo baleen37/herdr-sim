@@ -819,26 +819,7 @@ fn load_prs(path: &Path) -> Prs {
     v.as_object()
         .into_iter()
         .flatten()
-        .map(|(url, p)| {
-            let pr = Pr {
-                url: url.clone(),
-                repo: p["repo"].as_str().unwrap_or("").to_string(),
-                number: p["number"].as_str().unwrap_or("").to_string(),
-                title: p["title"].as_str().unwrap_or("").to_string(),
-                state: p["state"].as_str().unwrap_or("").to_string(),
-                draft: p["draft"].as_bool().unwrap_or(false),
-                approved: p["approved"].as_bool().unwrap_or(false),
-                additions: p["additions"].as_u64().unwrap_or(0),
-                deletions: p["deletions"].as_u64().unwrap_or(0),
-                comments: p["comments"].as_u64().unwrap_or(0) as usize,
-                comment_url: p["comment_url"].as_str().map(String::from),
-                checks: p["checks"].as_array().and_then(|c| {
-                    let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
-                    Some((n(0)?, n(1)?, n(2)?))
-                }),
-            };
-            (url.clone(), (None, Some(pr)))
-        })
+        .map(|(url, p)| (url.clone(), (None, Some(pr_from_json(url, p)))))
         .collect()
 }
 
@@ -847,23 +828,130 @@ fn load_prs(path: &Path) -> Prs {
 fn save_prs(path: &Path, prs: &Prs) {
     let all: serde_json::Map<String, Value> = prs
         .iter()
-        .filter_map(|(url, (_, pr))| {
-            let p = pr.as_ref()?;
-            Some((
-                url.clone(),
-                json!({
-                    "repo": p.repo, "number": p.number, "title": p.title,
-                    "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
-                    "deletions": p.deletions, "comments": p.comments, "comment_url": p.comment_url,
-                    "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
-                }),
-            ))
-        })
+        .filter_map(|(url, (_, pr))| Some((url.clone(), pr_json(pr.as_ref()?))))
         .collect();
+    write_atomic(path, &Value::Object(all));
+}
+
+/// A PR's details as they are saved, keyed by URL elsewhere.
+fn pr_json(p: &Pr) -> Value {
+    json!({
+        "repo": p.repo, "number": p.number, "title": p.title,
+        "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
+        "deletions": p.deletions, "comments": p.comments, "comment_url": p.comment_url,
+        "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
+    })
+}
+
+fn pr_from_json(url: &str, p: &Value) -> Pr {
+    Pr {
+        url: url.to_string(),
+        repo: p["repo"].as_str().unwrap_or("").to_string(),
+        number: p["number"].as_str().unwrap_or("").to_string(),
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        state: p["state"].as_str().unwrap_or("").to_string(),
+        draft: p["draft"].as_bool().unwrap_or(false),
+        approved: p["approved"].as_bool().unwrap_or(false),
+        additions: p["additions"].as_u64().unwrap_or(0),
+        deletions: p["deletions"].as_u64().unwrap_or(0),
+        comments: p["comments"].as_u64().unwrap_or(0) as usize,
+        comment_url: p["comment_url"].as_str().map(String::from),
+        checks: p["checks"].as_array().and_then(|c| {
+            let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
+            Some((n(0)?, n(1)?, n(2)?))
+        }),
+    }
+}
+
+fn write_atomic(path: &Path, v: &Value) {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    if std::fs::write(&tmp, Value::Object(all).to_string()).is_ok() {
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// Where `--prs-json` keeps, between runs, each PR's saved details and each
+/// folder's branch PR, with when they were fetched (`at`, Unix seconds).
+const APP_CACHE: &str = "app-prs.json";
+/// How long a folder's branch PR (or its lack of one) stands.
+const BRANCH_TTL: u64 = 60;
+
+/// One run for the Herdr app's `sim-prs` panel: the PRs the Claude Code
+/// session in process `pid` touched, newest first, and the PR of the branch
+/// checked out in `cwd`, with the details this pane shows. Details are
+/// reused as long as here (`OPEN_TTL`, `DONE_TTL`), across runs.
+pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&str>) -> Value {
+    let path = state_dir.join(APP_CACHE);
+    let mut saved: serde_json::Map<String, Value> = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let now = crate::unix_now();
+    let age = |v: &Value| now.saturating_sub(v["at"].as_u64().unwrap_or(0));
+
+    let session = pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid));
+    // The main pass's scan cache, read and not written back, as `run` does.
+    let urls: Vec<String> = session
+        .as_deref()
+        .map(|id| {
+            let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
+            claude_session(home, id, &mut cache)
+                .prs
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let branch = cwd.and_then(|cwd| {
+        let key = format!("branch\u{1f}{cwd}");
+        if let Some(v) = saved.get(&key).filter(|v| age(v) < BRANCH_TTL) {
+            return v["url"].as_str().map(String::from);
+        }
+        let url = crate::gh(&["pr", "view", "--json", "url"], Some(Path::new(cwd)))
+            .filter(|out| out.status.success())
+            .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
+            .and_then(|v| v["url"].as_str().map(String::from));
+        saved.insert(key, json!({ "at": now, "url": url }));
+        url
+    });
+
+    let stale: Vec<String> = branch
+        .iter()
+        .chain(&urls)
+        .filter(|url| {
+            saved.get(url.as_str()).is_none_or(|v| {
+                let ttl = if v["state"] == "OPEN" {
+                    OPEN_TTL
+                } else {
+                    DONE_TTL
+                };
+                age(v) >= ttl.as_secs()
+            })
+        })
+        .cloned()
+        .collect();
+    // A failed request keeps the last details rather than blanking them.
+    for (url, pr) in fetch_all(&stale) {
+        let mut v = pr_json(&pr);
+        v["at"] = json!(now);
+        saved.insert(url, v);
+    }
+    let _ = std::fs::create_dir_all(state_dir);
+    write_atomic(&path, &Value::Object(saved.clone()));
+
+    let shown = |url: &String| {
+        let mut v = saved.get(url)?.clone();
+        let p = v.as_object_mut()?;
+        p.remove("at");
+        p.insert("url".into(), json!(url));
+        Some(v)
+    };
+    json!({
+        "session": session,
+        "branch": branch.as_ref().and_then(shown),
+        "prs": urls.iter().filter(|u| Some(*u) != branch.as_ref()).filter_map(shown).collect::<Vec<_>>(),
+    })
 }
 
 /// Every agent pane Herdr knows, or none when the call fails. Asked over the

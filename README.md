@@ -99,27 +99,32 @@ or opened.
 ## Herdr app panel
 
 The Herdr desktop app (`herdr-app`) has no plugin hooks, so herdr-sim's PR list
-comes to it as a mod instead: a **PRs** button beside the tab bar's Files and
-Changes that opens a side panel for the focused terminal.
+comes to it as a mod: a **PRs** button beside the tab bar's Files and Changes
+that opens a side panel for the focused terminal.
 
-- **This branch**: the PR `gh pr view` finds for the branch checked out there.
-- **This session**: for a Claude Code terminal, the PRs its session touched
-  (`pr-link` records, found through the claude process's
-  `~/.claude/sessions/<pid>.json`), newest first.
+- **This branch**: the PR of the branch checked out there.
+- **This session**: for a Claude Code terminal, the PRs its session touched,
+  newest first.
 
-Each row shows the state, title, `owner/repo#N`, lines changed and an approval
-check; a click opens the PR. Open PRs are re-checked at most once a minute,
-merged and closed ones never. Codex terminals and terminals on other machines
-show only the branch PR.
+The mod (TypeScript in `herdr-app/src/`, built to `herdr-app/mods/sim-prs/`)
+only draws: each look runs `herdr-sim --prs-json`, which finds the session
+from the claude process's pid and fetches the details the Changes panel shows,
+reusing them between runs. Codex terminals and terminals on other machines show
+only the branch PR, or nothing.
 
-Install from a checkout: `herdr-app/scripts/install.sh` links the mod into
-`~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, and adds the
-`main-sim` layout (Herdr's `main` with the panel and its button) unless one is
-already there. Then `herdr-app do layout.switch --name main-sim`.
+1. Put a herdr-sim with `--prs-json` on `PATH` (this checkout's
+   `cargo build --release`, linked into `~/.local/bin`).
+2. Run `herdr-app/scripts/install.sh`: it links the mod into
+   `~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, and adds the
+   `main-sim` layout (Herdr's `main` with the panel and its button) unless one
+   is already there.
+3. `herdr-app do layout.switch --name main-sim`.
 
 In a layout of your own, add `{ "id": "sim-prs", "type": "block", "content": { "mod": "sim-prs" } }`
 to the `panel-body` stack, and `{ "mod": "sim-prs", "props": { "button": true } }` as a
 56px block beside `tabs`. How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
+Working on it: `npm install`, `npm run types` (the app's type files), then
+`npm run check`, `npm test`, `npm run build`.
 
 ## Changes panel
 

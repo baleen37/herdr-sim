@@ -1,1 +1,13 @@
-{ "private": true, "type": "module", "scripts": { "test": "node --test" } }
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noCheck",
+    "types": "sh scripts/types.sh",
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test \"tests/*.test.ts\""
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  }
+}
