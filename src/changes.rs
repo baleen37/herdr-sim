@@ -323,10 +323,11 @@ fn fit_width(pane: &str, target: f64) {
     }
 }
 
-/// Makes `pane` half its tab wide.
-pub(crate) fn fit_half(pane: &str) {
+/// Makes `pane` two thirds of its tab wide: a diff wants the room, the
+/// agent beside it less.
+pub(crate) fn fit_wide(pane: &str) {
     if let Some(area) = layout(pane).and_then(|l| l["area"]["width"].as_f64()) {
-        fit_width(pane, area / 2.0);
+        fit_width(pane, area * 2.0 / 3.0);
     }
 }
 
@@ -1489,9 +1490,9 @@ fn diff_source(key: u8, item: &Item) -> Option<(String, Option<String>)> {
 }
 
 /// Opens the diff of `source` (see `diff::SOURCE`), run in `cwd`, on the
-/// right half of the tab: in place of `panel`, which closes and comes back
-/// for `agent` when the diff quits, or with no panel at the tab's right edge
-/// beside `agent`.
+/// right two thirds of the tab: in place of `panel`, which closes and comes
+/// back for `agent` when the diff quits, or with no panel at the tab's right
+/// edge beside `agent`.
 pub(crate) fn open_diff(source: &str, cwd: &str, agent: Option<&str>, panel: Option<&str>) {
     let mut open = json!({
         "plugin_id": PLUGIN, "entrypoint": "diff", "placement": "split",
