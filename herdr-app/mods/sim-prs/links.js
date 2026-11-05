@@ -7,3 +7,8 @@ export function repoOf(url) {
 export function stateOf(pr) {
     return pr.draft && pr.state === "OPEN" ? "DRAFT" : pr.state;
 }
+/** A change's "+12 -3" as its added and removed parts, either possibly "". */
+export function splitDiff(diff) {
+    const parts = diff.split(" ");
+    return [parts.find((p) => p.startsWith("+")) ?? "", parts.find((p) => p.startsWith("-")) ?? ""];
+}

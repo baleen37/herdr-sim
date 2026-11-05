@@ -1,53 +1,64 @@
-# herdr-sim PRs
+# herdr-sim Changes
 
-A side panel beside Files and Changes that lists the pull requests of the focused terminal: the PR of the branch checked out there, and, for a Claude Code terminal, every PR its session touched.
+herdr-sim's Changes panel in place of the Herdr app's own: beside the focused terminal, the checkouts its Claude Code session left uncommitted and the PRs it touched; a click opens a PR in the browser, and a diff opens wide beside the terminal in herdr-sim's keyboard-driven diff view.
 
-![herdr-sim PRs](layouts/main-sim.svg)
+![herdr-sim Changes](layouts/main-sim.svg)
 
 ## What you see
 
-- **The PRs button**, at the right end of the tab bar after Files and Changes: a 26px pill reading "PRs", `selected` while its panel shows, `chrome` otherwise, like the tab bar's own panel buttons. Its block is 56px wide.
+- **The tab bar's Changes button** (the shipped `tabs` mod's) opens this panel: it takes the `changes` child of the side panel stack. Files stays as it was. `cmd-shift-c` opens and closes it.
 - **The panel**, in the side panel column (368px by default) as a card: 10px radius, 1px `border`, `background`.
-  - A 42px header: "Pull requests" semibold, the focused terminal's branch (11px, `dim`, truncated, right-aligned) and a 12px spinner (`working`) while it looks.
-  - "This branch" (11px semibold `dim` heading) and one row, or "No PR for this branch" / "Not on a git branch".
-  - "This session" and its rows, newest first, without the branch's PR. When empty it says why: not a Claude Code terminal, no session found, or no PR yet.
-  - A row: a state pill in GitHub's fixed colours with white 10px text (Open `#238636`, Draft `#6e7681`, Merged `#8957e5`, Closed `#da3633`), the title wrapping beside it; below, `owner/repo#N` (`dim`), `+additions` (`ansi2`), `−deletions` (`ansi1`) and "✓ Approved" (`ansi2`) when the review decision is approved.
+  - A 42px header: "Changes" semibold, the focused terminal's branch (11px, `dim`, truncated, right-aligned) and a 12px spinner (`working`) while it looks.
+  - "Uncommitted" (11px semibold `dim` heading): a row per checkout with uncommitted changes: `±` (`dim`), the repo, a linked worktree's branch (11px `dim`), then `+a` (`ansi2`) and `−d` (`ansi1`) at the right. Or "No uncommitted changes".
+  - "This branch": the branch's PR row, or "No PR for this branch" / "Not on a git branch".
+  - "This session": the session's PR rows, newest first, without the branch's PR. When empty it says why: not a Claude Code terminal, no session found, or no PR yet.
+  - A PR row: a state pill in GitHub's fixed colours with white 10px text (Open `#238636`, Draft `#6e7681`, Merged `#8957e5`, Closed `#da3633`), the title wrapping beside it; below, `owner/repo#N` (`dim`), `+additions` (`ansi2`), `−deletions` (`ansi1`), "✓ Approved" (`ansi2`) when approved, and a "Diff" button at the right (`muted`, `raised` on hover).
+- **The diff**: herdr-sim's diff view in a terminal right of the focused one, while the panel is closed: the selected file's diff beside a tree of the changed files, keys at the bottom.
 
 ## How it behaves
 
-- The panel follows the focused terminal (`focused().terminal`, its pane's `cwd` and `branch`). A focused mod pane, such as this panel as a split, keeps the last terminal.
-- Clicking a row opens the PR in the browser (`xdg-open`, else `open`; `explorer` on Windows).
+- The panel follows the focused terminal (`focused().terminal`, its pane's `cwd` and `branch`). A focused mod pane keeps the last terminal.
 - While it is the shown side panel it looks again every 10 seconds and whenever focus moves; hidden, it does nothing, and showing it looks at once.
-- Each look is one `herdr-sim --prs-json [--pid <claude pid>] [--cwd <folder>]`, which prints `{ session, branch, prs }`. herdr-sim keeps PR details between runs by its Changes pane's rule (`fresh`: open PRs 30 s, merged and closed 10 min, a failed fetch 10 min) in `$TMPDIR/herdr-sim/app-prs.json`, and finds the branch PR as its sidebar does (`Cache::branch_state`, keyed `<checkout>#<branch>`: an open PR or none rechecked after a minute, a merged or closed one never) in `app-cache.json`, which also remembers how far each transcript was read. Most looks make no GitHub call; the PRs come in one GraphQL request.
-- A Claude Code terminal (agent `app` `claude-code`) passes its foreground pid (`terminals()[i].foreground.pid`). herdr-sim reads `~/.claude/sessions/<pid>.json`, follows a `/background` job to its session, and lists the transcript's `pr-link` records, newest first.
-- A terminal on another machine (`machine/t1`) shows nothing: its transcripts and checkout are there. A Codex terminal shows only the branch's PR (the app doesn't expose Codex's session id).
-- The button adds `sim-prs` to shared `workspace.panels`, so the tab bar remembers it per space like Files and Changes.
+- An Uncommitted row opens the diff of that checkout (`checkout:<top>`); a PR row opens the PR in the browser (`xdg-open`, else `open`; `explorer` on Windows); a PR row's Diff opens that PR's diff (`pr:<url>`).
+- Opening a diff hides the side panel and splits the focused terminal's pane right with `env HERDR_SIM_DIFF_SOURCE=<source> herdr-sim --diff-pane`, focused. Its keys are herdr-sim's: `j`/`k`, `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[`, `f`/`F`, `Tab`, `z`, `e`, `q`. `q` ends it and its pane closes; once that pane is gone the panel opens again on Changes. A diff whose pane never shows (herdr-sim missing) brings the panel back after 10 s.
+- `e` in the diff opens the file in `$VISUAL`/`$EDITOR` at the line, in a terminal right of the diff, zoomed (`herdr-app do terminal.open`, then `pane.zoom`); quitting the editor comes back to the diff.
+- `cmd-shift-c` (`sim-prs.toggle`, in `keys.json`'s `layout:main-sim`): open on Changes when the panel is closed or shows Files; close it when it shows Changes.
+- Each look is one `herdr-sim --prs-json [--pid <claude pid>] [--cwd <folder>]`, which prints `{ session, changes, branch, prs }`. `changes` covers the terminal's folder and every folder the session worked in, a row per checkout with uncommitted changes (new files' lines counted). herdr-sim keeps PR details between runs by its Changes pane's rule (`fresh`: open PRs 30 s, merged and closed 10 min, a failed fetch 10 min) in `$TMPDIR/herdr-sim/app-prs.json`, and finds the branch PR as its sidebar does (`Cache::branch_state`, keyed `<checkout>#<branch>`) in `app-cache.json`, which also remembers how far each transcript was read.
+- A Claude Code terminal (agent `app` `claude-code`) passes its foreground pid (`terminals()[i].foreground.pid`). herdr-sim reads `~/.claude/sessions/<pid>.json`, follows a `/background` job to its session, and lists the transcript's `pr-link` records and the folders its tools worked in.
+- A terminal on another machine (`machine/t1`) shows nothing. A Codex terminal shows its folder's changes and branch PR only.
+- The keys block removes the old PRs button's `sim-prs` from shared `workspace.panels` once.
 
 ## Built from
 
-- **Layout** (`layouts/main-sim.json`): Herdr's `main` 0.1.13 with `tabs` moved into a 42px row `tab-bar` beside a 56px block `sim-prs-button` (`{ mod: "sim-prs", props: { button: true } }`, `window_drag`), and a third child `sim-prs` (`{ mod: "sim-prs" }`) in the `panel-body` stack. Root `preview` is `layouts/main-sim.svg`.
-- **Mod** `mods/sim-prs/`, built by `tsc` from `src/` (the built `.js` is committed, since Herdr loads it): `main.ts` is the panel and the button; `links.ts` holds the `--prs-json` types and the pure helpers (`repoOf`, `stateOf`), tested under node (`--experimental-strip-types`) in `tests/`.
-- **herdr-sim** `--prs-json` (`changes::app_json`): `claude_session_for_pid`, then the Changes pane's `claude_session`, `fetch_all` and saved-details format.
-- **herdr**: `agents`, `panes`, `focused`, `layout`, `theme`, `terminals`, `exec`, `run` (`layout.select`, `layout.show`, `layout.hide`), `shared` / `setShared` (`workspace.panels`), `props` (`button`; `bin`, the herdr-sim to run, default `herdr-sim` on PATH), `window`.
-- **Programs**: `herdr-sim` (which runs `gh pr view --json url` and `gh api graphql`), `xdg-open` / `open`.
+- **Layout** (`layouts/main-sim.json`): Herdr's `main` 0.1.13, with the `panel-body` stack's `changes` child set to `{ mod: "sim-prs" }`, and `tabs` in a 42px row `tab-bar` beside a 0px block `sim-prs-keys` (`{ mod: "sim-prs", props: { keys: true } }`): it draws nothing but is always shown, so it receives `sim-prs.toggle` and watches for the diff closing. Root `preview` is `layouts/main-sim.svg`.
+- **Keys** (`keys.json`): `layout:main-sim` → `cmd-shift-c: sim-prs.toggle`, merged by `scripts/install.sh` without replacing a key the person bound.
+- **Mod** `mods/sim-prs/`, built by `tsc` from `src/` (the built `.js` is committed, since Herdr loads it): `main.ts` is the panel and the keys block; `links.ts` holds the `--prs-json` types and pure helpers (`repoOf`, `stateOf`, `splitDiff`), tested under node in `tests/`.
+- **herdr-sim**: `--prs-json` (`changes::app_json`, `app_changes`): `claude_session_for_pid`, the Changes pane's `claude_session`, `checkout_of`, `local_diff`, `worktree_branch`, `repo_name`, `fetch_all` and saved-details format. `--diff-pane` (`diff::run`), with `diff::edit_in_app` for `e` in the app.
+- **herdr**: `agents`, `panes`, `focused`, `layout`, `theme`, `terminals`, `exec`, `run` (`layout.select`, `layout.show`, `layout.hide`, `pane.split`), `shared` / `setShared` (`workspace.panels`, `sim-prs.diff`), `nextCommand`, `props` (`keys`; `bin`, the herdr-sim to run, default `herdr-sim` on PATH), `window`.
+- **Programs**: `herdr-sim` (which runs `git`, `gh pr view` and `gh api graphql`), `herdr-app` (from the diff, for `e`), `xdg-open` / `open`.
 
 ## Watch out
 
 - The mod folder is linked, not copied (`scripts/install.sh`). Herdr doesn't draw a mod's own SVGs or images through a link, so the mod ships none; the spinner is the shipped `mods/workspace-chrome/spinner.svg`. Herdr doesn't dock a linked mod either: `place` is `none` and the layout places it.
-- `hc get` run from a mod (`hc()` or `exec("hc")`) never returns, which left the panel on "Looking…": take the pid from `terminals()`, which carries `foreground`.
+- A `<mod>.<command>` reaches shown copies only, and a hidden panel's copy may never have started: that's why the 0px keys block exists. It also does the diff watching, since `run()` returns nothing and the diff's pane is only found later, in `terminals()` (argv with `--diff-pane`).
+- `pane.split` takes `argv` but no environment: the diff source goes through `env`.
+- `--diff-pane` sizes itself and returns to the panel on `q` only in the terminal Herdr (`HERDR_PANE_ID`); in the app the mod does both. `e` can't run the editor inline: the diff's input thread would take its keys.
+- `hc get` run from a mod (`hc()` or `exec("hc")`) never returns: take the pid from `terminals()`, which carries `foreground`.
 - `fs/promises` may only touch the mod's own folder, and a linked mod's folder is the checkout: anything else goes through `readTextFile` or herdr-sim.
 - herdr-sim fails on a flag it doesn't know, so a binary older than the panel says so. Builds from before that ignored unknown flags and printed nothing: the panel reports output it can't parse as "update it", and `scripts/install.sh` checks for the JSON.
 - `theme()` is typed `Record<string, string>` while gpui-kit wants `` `#${string}` ``: `main.ts` casts it once. `npm run check` needs the app's own type files, copied by `npm run types`; CI builds with `--noCheck` and fails when the committed `.js` differs from `src/`'s build.
-- `init`'s first argument isn't the block's props: read `button` with `props()`.
-- Saving a file in the checkout doesn't reload a linked mod; switch layouts (`layout.switch` away and back) to load the new code.
+- `init`'s first argument isn't the block's props: read `keys` with `props()`.
+- Saving a file in the checkout doesn't reload a linked mod; switch layouts (`layout.switch` away and back) to load the new code. `scripts/install.sh` replaces an installed `main-sim.json` only when it is a version this repo committed.
+- `herdr-app shot` returns the last drawn frame: with the window covered it can be minutes old. Compare two shots before trusting one.
 - Herdr writes `gpui-kit.d.ts` and `jsconfig.json` into every mod folder; `.gitignore` keeps them out.
-- `MOD` in `main.ts` is the folder name, the layout's block id and the stack child. Renaming the folder means changing all three and the layout's `mod` values.
+- Each look runs `git` in every folder the session worked in (about 0.4 s with two repos), every 10 s while shown.
 - Claude Code's `pr-link` record is not a documented API and may change.
 
 ## Done when
 
 - `npm run check`, `npm test` and `npm run build` (no diff) pass in `herdr-app/`, and `herdr-app check ~/.config/herdr-app/mods/sim-prs` passes.
-- `herdr-sim --prs-json --pid <a claude pid>` prints that session's PRs.
-- The tab bar shows Files, Changes and PRs; PRs opens and closes the panel.
-- In a Claude Code terminal whose session ran `gh pr create`, that PR is under "This session" within 10 seconds.
-- In a terminal on a branch with a PR, it is under "This branch"; a click opens it on github.com.
+- `herdr-sim --prs-json --pid <a claude pid> --cwd <dir>` prints that session's changes and PRs.
+- The tab bar's Changes opens this panel; `cmd-shift-c` toggles it.
+- An Uncommitted row opens the checkout's diff right of the terminal with the panel closed; `q` closes it and the panel comes back.
+- A PR row opens it on github.com; its Diff opens the PR's diff.
+- `e` in the diff opens the editor zoomed; quitting it shows the diff again.

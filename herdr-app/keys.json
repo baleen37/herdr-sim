@@ -1,0 +1,5 @@
+{
+  "layout:main-sim": {
+    "cmd-shift-c": "sim-prs.toggle"
+  }
+}

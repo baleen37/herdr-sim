@@ -98,31 +98,34 @@ or opened.
 
 ## Herdr app panel
 
-The Herdr desktop app (`herdr-app`) has no plugin hooks, so herdr-sim's PR list
-comes to it as a mod: a **PRs** button beside the tab bar's Files and Changes
-that opens a side panel for the focused terminal.
+The Herdr desktop app (`herdr-app`) has no plugin hooks, so this Changes panel
+comes to it as a mod and a layout, `main-sim`, where it takes the place of the
+app's own Changes (the tab bar's Changes button, or `cmd-shift-c`):
 
-- **This branch**: the PR of the branch checked out there.
-- **This session**: for a Claude Code terminal, the PRs its session touched,
-  newest first.
+- **Uncommitted**: a `± repo +12 −3` row per checkout the focused Claude Code
+  session worked in that has uncommitted changes.
+- **This branch** and **This session**: the branch's PR and the PRs the
+  session touched, newest first. A click opens one in the browser.
+- **Diff**: a checkout row, or a PR's Diff, opens this repo's diff view
+  (`--diff-pane`, with its keys) right of the terminal, the panel closed;
+  `q` brings the panel back.
 
 The mod (TypeScript in `herdr-app/src/`, built to `herdr-app/mods/sim-prs/`)
 only draws: each look runs `herdr-sim --prs-json`, which finds the session
-from the claude process's pid and fetches the details the Changes panel shows,
-reusing them between runs. Codex terminals and terminals on other machines show
-only the branch PR, or nothing.
+from the claude process's pid, the checkouts' changes and the PR details,
+reusing what it fetched between runs.
 
 1. Put a herdr-sim with `--prs-json` on `PATH` (this checkout's
    `cargo build --release`, linked into `~/.local/bin`).
 2. Run `herdr-app/scripts/install.sh`: it links the mod into
-   `~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, and adds the
-   `main-sim` layout (Herdr's `main` with the panel and its button) unless one
-   is already there.
+   `~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, adds (or
+   updates, if unedited) the `main-sim` layout, and adds `cmd-shift-c` to
+   `keys.json` unless that key is already yours.
 3. `herdr-app do layout.switch --name main-sim`.
 
-In a layout of your own, add `{ "id": "sim-prs", "type": "block", "content": { "mod": "sim-prs" } }`
-to the `panel-body` stack, and `{ "mod": "sim-prs", "props": { "button": true } }` as a
-56px block beside `tabs`. How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
+In a layout of your own, set the `panel-body` stack's `changes` child to
+`{ "mod": "sim-prs" }`, and add `{ "mod": "sim-prs", "props": { "keys": true } }` as a
+0px block beside `tabs` (it takes the toggle key and brings the panel back after a diff). How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
 Working on it: `npm install`, `npm run types` (the app's type files), then
 `npm run check`, `npm test`, `npm run build`. End-to-end checks, run by hand
 or by an agent: [herdr-app/scenarios/](herdr-app/scenarios/).

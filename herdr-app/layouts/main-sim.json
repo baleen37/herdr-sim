@@ -108,16 +108,15 @@
               }
             },
             {
-              "id": "sim-prs-button",
+              "id": "sim-prs-keys",
               "type": "block",
               "size": {
-                "px": 56
+                "px": 0
               },
-              "window_drag": true,
               "content": {
                 "mod": "sim-prs",
                 "props": {
-                  "button": true
+                  "keys": true
                 }
               }
             }
@@ -182,13 +181,6 @@
                     },
                     {
                       "id": "changes",
-                      "type": "block",
-                      "content": {
-                        "mod": "changes"
-                      }
-                    },
-                    {
-                      "id": "sim-prs",
                       "type": "block",
                       "content": {
                         "mod": "sim-prs"

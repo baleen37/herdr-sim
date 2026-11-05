@@ -881,7 +881,43 @@ fn fresh(state: &str, age: Duration) -> bool {
 const APP_CACHE: &str = "app-cache.json";
 const APP_PRS: &str = "app-prs.json";
 
-/// One run for the Herdr app's `sim-prs` panel: the PRs the Claude Code
+/// The checkouts holding `dirs` that have uncommitted changes, each once and
+/// in order, as the pane's `± repo +a -d` rows: `{ top, repo, branch, diff }`,
+/// `branch` only for a linked worktree.
+fn app_changes(dirs: &[String]) -> Vec<Value> {
+    let found: Vec<String> = std::thread::scope(|s| {
+        let running: Vec<_> = dirs.iter().map(|d| s.spawn(|| checkout_of(d))).collect();
+        running
+            .into_iter()
+            .filter_map(|t| t.join().ok().flatten())
+            .collect()
+    });
+    let mut tops: Vec<String> = Vec::new();
+    for top in found {
+        if !tops.contains(&top) {
+            tops.push(top);
+        }
+    }
+    let local: Vec<(Option<String>, Option<String>)> = std::thread::scope(|s| {
+        let running: Vec<_> = tops
+            .iter()
+            .map(|top| s.spawn(|| (local_diff(top), worktree_branch(top))))
+            .collect();
+        running
+            .into_iter()
+            .map(|t| t.join().unwrap_or_default())
+            .collect()
+    });
+    tops.iter()
+        .zip(local)
+        .filter_map(|(top, (diff, branch))| {
+            Some(json!({ "top": top, "repo": repo_name(top), "branch": branch, "diff": diff? }))
+        })
+        .collect()
+}
+
+/// One run for the Herdr app's `sim-prs` panel: the uncommitted changes in
+/// the checkouts it worked in (`changes`), the PRs the Claude Code
 /// session in process `pid` touched, newest first, and the PR of the branch
 /// checked out in `cwd`, with the details this pane shows.
 pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&str>) -> Value {
@@ -889,16 +925,20 @@ pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&s
     let cache_path = state_dir.join(APP_CACHE);
     let mut cache = Cache::load(&cache_path);
     let session = pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid));
-    let urls: Vec<String> = session
+    let scanned = session
         .as_deref()
-        .map(|id| {
-            claude_session(home, id, &mut cache)
-                .prs
-                .into_iter()
-                .rev()
-                .collect()
-        })
+        .map(|id| claude_session(home, id, &mut cache));
+    let urls: Vec<String> = scanned
+        .as_ref()
+        .map(|s| s.prs.iter().rev().cloned().collect())
         .unwrap_or_default();
+    // Every checkout the session worked in, where the terminal is first, as `run` lists them.
+    let dirs: Vec<String> = cwd
+        .map(String::from)
+        .into_iter()
+        .chain(scanned.into_iter().flat_map(|s| s.dirs))
+        .collect();
+    let changes = app_changes(&dirs);
     // As the main pass finds a Space's PR, under the same key and rules.
     let branch = cwd.and_then(crate::git_repo).and_then(|repo| {
         let name = repo.branch?;
@@ -953,6 +993,7 @@ pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&s
     };
     let out = json!({
         "session": session,
+        "changes": changes,
         "branch": branch.as_ref().and_then(shown),
         "prs": urls.iter().filter(|u| Some(*u) != branch.as_ref()).filter_map(shown).collect::<Vec<_>>(),
     });
@@ -2253,6 +2294,45 @@ mod tests {
         assert!(here(&a, None, Some("w1")));
         assert!(!here(&a, None, Some("w2")));
         assert!(here(&a, None, None));
+    }
+
+    #[test]
+    fn app_changes_lists_each_dirty_checkout_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let top = dir.path().join("repo");
+        let clean = dir.path().join("clean");
+        for repo in [&top, &clean] {
+            std::fs::create_dir_all(repo.join("sub")).unwrap();
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            git(&["init", "-q"]);
+            std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "init"]);
+        }
+        std::fs::write(top.join("a.txt"), "a\nb\n").unwrap();
+        let path = |p: &Path| p.to_str().unwrap().to_string();
+        // The repo twice (its top and a folder in it), a clean one, and a folder outside git.
+        let dirs = [
+            path(&top.join("sub")),
+            path(&top),
+            path(&clean),
+            path(dir.path()),
+        ];
+        let rows = app_changes(&dirs);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let top = checkout_of(&path(&top)).unwrap();
+        assert_eq!(rows[0]["top"], top.as_str());
+        assert_eq!(rows[0]["repo"], "repo");
+        assert_eq!(rows[0]["diff"], "+1");
+        assert_eq!(rows[0]["branch"], Value::Null);
     }
 
     #[test]
