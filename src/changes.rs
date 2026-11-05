@@ -1736,6 +1736,15 @@ pub(crate) enum Event {
     Release,
 }
 
+/// The key an up or down arrow stands for: `k` or `j`, in either cursor mode.
+fn arrow(seq: &[u8]) -> Option<u8> {
+    match seq {
+        b"\x1b[A" | b"\x1bOA" => Some(b'k'),
+        b"\x1b[B" | b"\x1bOB" => Some(b'j'),
+        _ => None,
+    }
+}
+
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
 /// 1-based column and row, and each wheel notch to `events`.
 pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
@@ -1772,14 +1781,23 @@ pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
                 match buf.len() {
                     1 => {}
                     // A bare Esc: the byte after it is a key of its own.
-                    2 if buf[1] != b'[' => {
+                    2 if buf[1] != b'[' && buf[1] != b'O' => {
                         buf.clear();
                         if events.send(Event::Key(byte[0])).is_err() {
                             return;
                         }
                     }
                     2 => {}
-                    _ if (0x40..=0x7e).contains(&byte[0]) => buf.clear(),
+                    // Up and down move as k and j do.
+                    _ if (0x40..=0x7e).contains(&byte[0]) => {
+                        let key = arrow(&buf);
+                        buf.clear();
+                        if let Some(key) = key
+                            && events.send(Event::Key(key)).is_err()
+                        {
+                            return;
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -2077,6 +2095,17 @@ mod tests {
             checks: Some(checks),
         };
         HashMap::from([(url, (None, Some(pr)))])
+    }
+
+    #[test]
+    fn arrow_keys_read_as_j_and_k() {
+        assert_eq!(arrow(b"\x1b[A"), Some(b'k'));
+        assert_eq!(arrow(b"\x1b[B"), Some(b'j'));
+        // Application cursor mode sends ESC O instead of ESC [.
+        assert_eq!(arrow(b"\x1bOA"), Some(b'k'));
+        assert_eq!(arrow(b"\x1bOB"), Some(b'j'));
+        assert_eq!(arrow(b"\x1b[C"), None);
+        assert_eq!(arrow(b"\x1b[1;5A"), None);
     }
 
     #[test]
