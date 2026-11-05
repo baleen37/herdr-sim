@@ -518,10 +518,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         .iter()
                         .filter(|url| {
                             !prs.get(*url).is_some_and(|(at, pr)| {
-                                let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
-                                at.is_some_and(|at| {
-                                    at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
-                                })
+                                let state = pr.as_ref().map_or("OPEN", |p| p.state.as_str());
+                                at.is_some_and(|at| fresh(state, at.elapsed()))
                             })
                         })
                         .cloned()
@@ -870,31 +868,30 @@ fn write_atomic(path: &Path, v: &Value) {
     }
 }
 
-/// Where `--prs-json` keeps, between runs, each PR's saved details and each
-/// folder's branch PR, with when they were fetched (`at`, Unix seconds).
-const APP_CACHE: &str = "app-prs.json";
-/// How long a folder's branch PR (or its lack of one) stands.
-const BRANCH_TTL: u64 = 60;
+/// Fetched details stand this long: open PRs change (checks, comments);
+/// merged and closed ones barely do. The pane and `--prs-json` both ask.
+fn fresh(state: &str, age: Duration) -> bool {
+    age < if state == "OPEN" { OPEN_TTL } else { DONE_TTL }
+}
+
+/// `--prs-json`'s own files in the state directory: the scan and branch cache
+/// (a [`Cache`] like the main pass's, so a transcript is read only past where
+/// it was last read), and each PR's details with when they were fetched
+/// (`at`, Unix seconds).
+const APP_CACHE: &str = "app-cache.json";
+const APP_PRS: &str = "app-prs.json";
 
 /// One run for the Herdr app's `sim-prs` panel: the PRs the Claude Code
 /// session in process `pid` touched, newest first, and the PR of the branch
-/// checked out in `cwd`, with the details this pane shows. Details are
-/// reused as long as here (`OPEN_TTL`, `DONE_TTL`), across runs.
+/// checked out in `cwd`, with the details this pane shows.
 pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&str>) -> Value {
-    let path = state_dir.join(APP_CACHE);
-    let mut saved: serde_json::Map<String, Value> = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
     let now = crate::unix_now();
-    let age = |v: &Value| now.saturating_sub(v["at"].as_u64().unwrap_or(0));
-
+    let cache_path = state_dir.join(APP_CACHE);
+    let mut cache = Cache::load(&cache_path);
     let session = pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid));
-    // The main pass's scan cache, read and not written back, as `run` does.
     let urls: Vec<String> = session
         .as_deref()
         .map(|id| {
-            let mut cache = Cache::load(&state_dir.join("pr-cache.json"));
             claude_session(home, id, &mut cache)
                 .prs
                 .into_iter()
@@ -902,56 +899,67 @@ pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&s
                 .collect()
         })
         .unwrap_or_default();
-
-    let branch = cwd.and_then(|cwd| {
-        let key = format!("branch\u{1f}{cwd}");
-        if let Some(v) = saved.get(&key).filter(|v| age(v) < BRANCH_TTL) {
-            return v["url"].as_str().map(String::from);
-        }
-        let url = crate::gh(&["pr", "view", "--json", "url"], Some(Path::new(cwd)))
-            .filter(|out| out.status.success())
-            .and_then(|out| serde_json::from_slice::<Value>(&out.stdout).ok())
-            .and_then(|v| v["url"].as_str().map(String::from));
-        saved.insert(key, json!({ "at": now, "url": url }));
-        url
+    // As the main pass finds a Space's PR, under the same key and rules.
+    let branch = cwd.and_then(crate::git_repo).and_then(|repo| {
+        let name = repo.branch?;
+        let key = format!("{}#{name}", repo.top);
+        let pr = cache.branch_state(&key, now, || crate::gh_branch_pr(&repo.top, &name));
+        Some(format!(
+            "https://github.com/{}/pull/{}",
+            github_slug(&repo.top)?,
+            pr.number?
+        ))
     });
+    let _ = cache.save(&cache_path);
 
+    let prs_path = state_dir.join(APP_PRS);
+    let mut saved: serde_json::Map<String, Value> = std::fs::read(&prs_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
     let stale: Vec<String> = branch
         .iter()
         .chain(&urls)
         .filter(|url| {
             saved.get(url.as_str()).is_none_or(|v| {
-                let ttl = if v["state"] == "OPEN" {
-                    OPEN_TTL
-                } else {
-                    DONE_TTL
-                };
-                age(v) >= ttl.as_secs()
+                let age = now.saturating_sub(v["at"].as_u64().unwrap_or(0));
+                !fresh(v["state"].as_str().unwrap_or(""), Duration::from_secs(age))
             })
         })
         .cloned()
         .collect();
-    // A failed request keeps the last details rather than blanking them.
-    for (url, pr) in fetch_all(&stale) {
-        let mut v = pr_json(&pr);
-        v["at"] = json!(now);
-        saved.insert(url, v);
+    let fetched = !stale.is_empty();
+    if fetched {
+        let mut got = fetch_all(&stale);
+        for url in stale {
+            // A failed request keeps the last details, or none, until the
+            // next try is due: a PR the token can't read isn't asked every run.
+            let mut entry = got
+                .remove(&url)
+                .map(|pr| pr_json(&pr))
+                .or_else(|| saved.remove(&url))
+                .unwrap_or_else(|| json!({}));
+            entry["at"] = json!(now);
+            saved.insert(url, entry);
+        }
     }
-    let _ = std::fs::create_dir_all(state_dir);
-    write_atomic(&path, &Value::Object(saved.clone()));
 
     let shown = |url: &String| {
-        let mut v = saved.get(url)?.clone();
+        let mut v = saved.get(url).filter(|v| v.get("title").is_some())?.clone();
         let p = v.as_object_mut()?;
         p.remove("at");
         p.insert("url".into(), json!(url));
         Some(v)
     };
-    json!({
+    let out = json!({
         "session": session,
         "branch": branch.as_ref().and_then(shown),
         "prs": urls.iter().filter(|u| Some(*u) != branch.as_ref()).filter_map(shown).collect::<Vec<_>>(),
-    })
+    });
+    if fetched {
+        write_atomic(&prs_path, &Value::Object(saved));
+    }
+    out
 }
 
 /// Every agent pane Herdr knows, or none when the call fails. Asked over the
@@ -2030,6 +2038,16 @@ mod tests {
         HashMap::from([(url, (None, Some(pr)))])
     }
 
+    #[test]
+    fn fresh_keeps_open_prs_briefly_and_finished_ones_longer() {
+        assert!(fresh("OPEN", Duration::from_secs(29)));
+        assert!(!fresh("OPEN", Duration::from_secs(30)));
+        assert!(fresh("MERGED", Duration::from_secs(599)));
+        assert!(!fresh("CLOSED", Duration::from_secs(600)));
+        // A failed fetch leaves no state: the next try waits as long as for a finished PR.
+        assert!(fresh("", Duration::from_secs(599)));
+        assert!(!fresh("", Duration::from_secs(600)));
+    }
     #[test]
     fn highlight_marks_only_its_columns() {
         let line = format!("  {DIM}repo #7{RESET}  x");

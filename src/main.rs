@@ -64,6 +64,17 @@ struct Run {
     cache: Cache,
 }
 
+/// The modes the manifest and the Herdr app's panel start this binary in.
+const FLAGS: [&str; 7] = [
+    "--changes-pane",
+    "--edit-pane",
+    "--diff-pane",
+    "--animate",
+    "--toggle-changes",
+    "--toggle-order",
+    "--prs-json",
+];
+
 fn main() -> Result<()> {
     // Every git this plugin runs only reads: never take the index lock an
     // agent's own git may want (git status's --no-optional-locks).
@@ -90,6 +101,14 @@ fn main() -> Result<()> {
     // Herdr's own sort); the toggle action flips it.
     let order_on = state_dir.join("order-on");
     let herdr_bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    // A flag this build doesn't know fails instead of running a plugin pass, so a
+    // caller newer than the binary (the Herdr app's panel) gets an error back.
+    if let Some(flag) = env::args()
+        .nth(1)
+        .filter(|a| a.starts_with("--") && !FLAGS.contains(&a.as_str()))
+    {
+        bail!("unknown flag {flag}");
+    }
     if env::args().any(|a| a == "--changes-pane") {
         let home = PathBuf::from(env::var("HOME").context("HOME is not set")?);
         return changes::run(&herdr_bin, &home, &state_dir);
@@ -981,7 +1000,13 @@ fn dir_name(cwd: &str, home: &Path) -> String {
 /// when `gh` fails otherwise.
 fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
     let out = gh(
-        &["pr", "view", branch, "--json", "state,statusCheckRollup"],
+        &[
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "number,state,statusCheckRollup",
+        ],
         Some(Path::new(repo)),
     )?;
     if !out.status.success() {
@@ -1000,6 +1025,7 @@ fn gh_branch_pr(repo: &str, branch: &str) -> Option<BranchPr> {
     Some(BranchPr {
         state: Some(state),
         ci,
+        number: v["number"].as_u64(),
     })
 }
 

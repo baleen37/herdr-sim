@@ -735,22 +735,26 @@ enum Hit {
 /// `~/.claude/sessions/<pid>.json` then names the job, whose
 /// `~/.claude/jobs/<job>/state.json` holds the session the user is in.
 pub fn resolve_claude_session(home: &Path, session_id: &str) -> String {
-    let parked = entries(&home.join(".claude/sessions")).find_map(|path| {
-        if path.extension().is_none_or(|e| e != "json") {
-            return None;
-        }
-        let v = parse(&fs::read_to_string(&path).ok()?)?;
-        if v["sessionId"].as_str() != Some(session_id) {
-            return None;
-        }
-        v["parkedJobId"].as_str().map(String::from)
-    });
-    parked
-        .and_then(|job| {
-            let state = fs::read_to_string(home.join(".claude/jobs").join(job).join("state.json"));
-            parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
+    entries(&home.join(".claude/sessions"))
+        .find_map(|path| {
+            if path.extension().is_none_or(|e| e != "json") {
+                return None;
+            }
+            let v = parse(&fs::read_to_string(&path).ok()?)?;
+            if v["sessionId"].as_str() != Some(session_id) {
+                return None;
+            }
+            parked_session(home, &v)
         })
         .unwrap_or_else(|| session_id.to_string())
+}
+
+/// The session of the job a `~/.claude/sessions/<pid>.json` entry parked its
+/// conversation as, if it did.
+fn parked_session(home: &Path, entry: &Value) -> Option<String> {
+    let job = entry["parkedJobId"].as_str()?;
+    let state = fs::read_to_string(home.join(".claude/jobs").join(job).join("state.json"));
+    parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
 }
 
 /// The session the `claude` process `pid` shows, from its
@@ -763,8 +767,8 @@ pub fn claude_session_for_pid(home: &Path, pid: &str) -> Option<String> {
     }
     let text =
         fs::read_to_string(home.join(".claude/sessions").join(format!("{pid}.json"))).ok()?;
-    let id = parse(&text)?["sessionId"].as_str()?.to_string();
-    Some(resolve_claude_session(home, &id))
+    let entry = parse(&text)?;
+    parked_session(home, &entry).or_else(|| entry["sessionId"].as_str().map(String::from))
 }
 
 /// The name Claude Code gave a session in `~/.claude/sessions/<pid>.json`
@@ -1063,6 +1067,8 @@ pub struct Cache {
 pub struct BranchPr {
     pub state: Option<PrState>,
     pub ci: Option<Ci>,
+    /// The PR's number, for a link to it (the Herdr app's panel).
+    pub number: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1104,6 +1110,7 @@ impl Cache {
                 let pr = BranchPr {
                     state: v["state"].as_str().and_then(PrState::parse),
                     ci: v["ci"].as_str().and_then(Ci::parse),
+                    number: v["number"].as_u64(),
                 };
                 Some((key.clone(), (pr, v["at"].as_u64()?)))
             })
@@ -1186,6 +1193,7 @@ impl Cache {
                 let entry = json!({
                     "state": pr.state.map(PrState::name),
                     "ci": pr.ci.map(Ci::name),
+                    "number": pr.number,
                     "at": at,
                 });
                 (key.clone(), entry)
@@ -2064,7 +2072,11 @@ mod tests {
 
     #[test]
     fn branch_state_rechecks_missing_and_open_prs_only() {
-        let pr = |state, ci| BranchPr { state, ci };
+        let pr = |state, ci| BranchPr {
+            state,
+            ci,
+            number: None,
+        };
         let open = pr(Some(PrState::Open), Some(Ci::Pending));
         let merged = pr(Some(PrState::Merged), Some(Ci::Pass));
         let mut cache = Cache::default();
@@ -2120,6 +2132,7 @@ mod tests {
         let merged = BranchPr {
             state: Some(PrState::Merged),
             ci: Some(Ci::Fail),
+            number: Some(7),
         };
         cache.branch_state("r#b", 5, || Some(merged));
         cache.save(&path).unwrap();

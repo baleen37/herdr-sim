@@ -24,12 +24,25 @@ function find(node, id) {
     }
     return null;
 }
+// The side panel is open on this mod (the button's lit state).
+function showing() {
+    const root = layout(), panel = find(root, "panel");
+    return Boolean(panel) && !panel.hidden && find(root, "panel-body")?.active === MOD;
+}
 // As one of the side panels beside Files and Changes, only the one shown works.
+// Anywhere else (a pane of its own) it always works.
 function hidden() {
-    const root = layout(), body = find(root, "panel-body");
-    if (!body?.children?.some((c) => c.content?.mod === MOD))
-        return false;
-    return Boolean(find(root, "panel")?.hidden) || find(body, body.active)?.content?.mod !== MOD;
+    const body = find(layout(), "panel-body");
+    return Boolean(body?.children?.some((c) => c.id === MOD)) && !showing();
+}
+// herdr-sim before --prs-json fails on the flag; one older still prints nothing.
+function parse(stdout) {
+    try {
+        return JSON.parse(stdout);
+    }
+    catch {
+        throw new Error("herdr-sim doesn't know --prs-json: update it");
+    }
 }
 function openUrl(url) {
     if (window()?.platform === "windows") {
@@ -49,7 +62,6 @@ export default class SimPrs extends View {
     error;
     busy;
     again;
-    away;
     init(_props, cx) {
         // init's first argument isn't the block's props: props() is.
         if (props()?.button) {
@@ -72,14 +84,13 @@ export default class SimPrs extends View {
             this.last = { terminal: f.terminal, cwd: pane?.cwd ?? f.cwd, branch: pane?.branch ?? null };
         return this.last ?? {};
     }
-    context() { return JSON.stringify(this.target()); }
     refresh(cx) {
         if (this.busy) {
             this.again = true;
             return;
         }
         this.busy = true;
-        const { terminal, cwd, branch } = this.target(), context = this.context();
+        const target = this.target(), { terminal, cwd, branch } = target, context = JSON.stringify(target);
         cx.spawn(async (cx) => {
             try {
                 // A remote terminal (machine/t1) has its transcripts and checkout on that machine: not read.
@@ -91,12 +102,9 @@ export default class SimPrs extends View {
                 const r = await exec(props()?.bin ?? "herdr-sim", args);
                 if (r.code !== 0)
                     throw new Error((r.stderr || r.stdout).trim() || `herdr-sim exited ${r.code}`);
-                // An older herdr-sim ignores --prs-json and prints nothing.
-                if (!r.stdout.trim())
-                    throw new Error("herdr-sim doesn't know --prs-json: update it");
-                if (this.context() !== context)
+                if (JSON.stringify(this.target()) !== context)
                     return;
-                this.view = { claude, branch, data: JSON.parse(r.stdout) };
+                this.view = { claude, branch, data: parse(r.stdout) };
                 this.error = null;
             }
             catch (e) {
@@ -113,7 +121,7 @@ export default class SimPrs extends View {
         });
     }
     toolbar(t) {
-        const root = layout(), panel = find(root, "panel"), on = panel && !panel.hidden && find(root, "panel-body")?.active === MOD;
+        const on = showing();
         return h_flex().size_full().pr(10).items_center().justify_end().bg(t.chrome).border_b(1).border_color(t.border)
             .child(h_flex().id(`panel-${MOD}`).h(26).px(10).flex_none().items_center().rounded(6)
             .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
@@ -149,12 +157,11 @@ export default class SimPrs extends View {
         const t = theme();
         if (this.button)
             return this.toolbar(t);
-        const away = hidden();
-        if ((this.away && !away) || (!away && this.context() !== this.shownContext)) {
-            this.shownContext = this.context();
+        // Ask again when the panel comes back into view or the focused terminal changes.
+        const context = hidden() ? null : JSON.stringify(this.target());
+        if (context && context !== this.shownContext)
             this.refresh(cx);
-        }
-        this.away = away;
+        this.shownContext = context;
         const v = this.view, empty = (text) => div().px(16).py(20).text_size(12).text_center().text_color(t.dim).child(text);
         return v_flex().id(MOD).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
             .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
