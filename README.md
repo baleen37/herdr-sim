@@ -154,11 +154,16 @@ Claude Code's "Changes" panel as a right-hand split.
   comments, or checks. The wheel scrolls. A drag across rows copies their
   text.
 - **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
-  out like reviewr: the selected file's diff (line numbers, changed lines
-  barred and tinted, highlighted for the file's language, CSV columns in
-  colour) beside a tree of the changed files. Vim keys move (`j`/`k` or `↓`/`↑`,
-  `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
-  switches box, `z` hides the tree (and shows it again, focused), `e` opens
+  out like Claude Code desktop's: every file's diff in one scroll under its
+  own header, which stays at the top while its lines scroll (line numbers,
+  changed lines barred and tinted, highlighted for the file's language, CSV
+  columns in colour), beside a tree of the changed files. Vim keys move a
+  cursor (`j`/`k` or `↓`/`↑`, `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for runs of
+  changed lines, `f`/`F` for files); `o`, or `Enter` or a click on a header,
+  folds a file; `c` writes a comment on the cursor's line and types it into
+  the agent's prompt as `path:line — comment`, unsent, so more can join it
+  (`Enter` sends it there, `Backspace` on an empty one cancels); `Tab`
+  switches side, `z` hides the tree (and shows it again, focused), `e` opens
   the file in `$EDITOR` at the line (quitting it brings the diff back), `q`
   brings the panel back. A PR's diff opened before draws at once from its
   saved copy, then refreshes from GitHub.
