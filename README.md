@@ -153,7 +153,7 @@ Claude Code's "Changes" panel as a right-hand split.
 - **Mouse.** A click opens what it is on: the repo, the PR, its files,
   comments, or checks. The wheel scrolls. A drag across rows copies their
   text.
-- **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
+- **Diff.** `d` swaps the panel for a diff on the right two thirds of the tab, laid
   out like Claude Code desktop's: every file's diff in one scroll under its
   own header, which stays at the top while its lines scroll (line numbers,
   changed lines barred and tinted, highlighted for the file's language, CSV
