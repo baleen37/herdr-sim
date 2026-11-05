@@ -8,6 +8,9 @@ const MOD = "sim-prs";
 const PANEL = "changes";
 // The diff a row opened: the tab it opened in, when, and whether its pane has shown yet.
 const DIFF = "sim-prs.diff";
+// A request for the panel to take the keyboard (cmd-shift-c opening it, a diff closing):
+// the keys block can't focus another copy, so it leaves the time here.
+const FOCUS = "sim-prs.focus";
 // How often the shown panel asks again. herdr-sim keeps PR details between runs
 // (open ones 30 s, merged and closed 10 min), so most asks cost no GitHub call.
 const POLL = 10000;
@@ -41,9 +44,11 @@ function hidden() {
     const body = find(layout(), "panel-body");
     return Boolean(body?.children?.some((c) => c.content?.mod === MOD)) && !showing();
 }
+// Opens the panel on Changes with the keyboard in it.
 function open() {
     run("layout.select", { stack: "panel-body", child: PANEL });
     run("layout.show", { id: "panel" });
+    setShared(FOCUS, Date.now());
 }
 // herdr-sim's diff view, in a terminal of its own.
 const isDiff = (t) => [...(t.argv ?? []), ...(t.foreground?.argv ?? [])].includes("--diff-pane");
@@ -75,6 +80,10 @@ export default class SimPrs extends View {
     error;
     busy;
     again;
+    handle;
+    selected;
+    pendingG;
+    focusedAt;
     init(_props, cx) {
         // init's first argument isn't the block's props: props() is.
         if (props()?.keys) {
@@ -97,6 +106,17 @@ export default class SimPrs extends View {
             return;
         }
         this.view = null;
+        // pane.go (cmd-alt-arrows) hands the panel the keyboard with "focus" (mod.json focusable).
+        this.handle = cx.focus_handle();
+        this.focusedAt = Date.now();
+        cx.spawn(async (cx) => {
+            for (;;) {
+                if ((await nextCommand()) === "focus") {
+                    this.handle.focus();
+                    cx.notify();
+                }
+            }
+        });
         this.refresh(cx);
         cx.timer.every(POLL, (cx) => { if (!hidden())
             this.refresh(cx); });
@@ -168,13 +188,66 @@ export default class SimPrs extends View {
             open();
         }
     }
+    // The rows in the order they're drawn, for the keys.
+    items() {
+        const d = this.view?.data;
+        if (!d)
+            return [];
+        const pr = (p) => ({ key: p.url, open: () => openUrl(p.url), pr: () => openUrl(p.url), diff: () => this.openDiff(`pr:${p.url}`) });
+        return [
+            ...d.changes.map((c) => ({ key: c.top, open: () => this.openDiff(`checkout:${c.top}`), diff: () => this.openDiff(`checkout:${c.top}`) })),
+            ...(d.branch ? [pr(d.branch)] : []),
+            ...d.prs.map(pr),
+        ];
+    }
+    // Herdr-sim's Changes keys: j/k, gg/G, Enter, p, d; Escape back to the terminal.
+    key(e, cx) {
+        const items = this.items(), at = Math.max(0, items.findIndex((i) => i.key === this.selected));
+        const select = (i) => { this.selected = items[Math.min(Math.max(i, 0), items.length - 1)]?.key ?? null; };
+        const g = this.pendingG;
+        this.pendingG = false;
+        switch (e.keystroke) {
+            case "j":
+            case "down":
+                select(at + 1);
+                break;
+            case "k":
+            case "up":
+                select(at - 1);
+                break;
+            case "g":
+                if (g)
+                    select(0);
+                else
+                    this.pendingG = true;
+                break;
+            case "shift-g":
+                select(items.length - 1);
+                break;
+            case "enter":
+                items[at]?.open();
+                break;
+            case "p":
+                items[at]?.pr?.();
+                break;
+            case "d":
+                items[at]?.diff?.();
+                break;
+            case "escape":
+                run("pane.go", { direction: "left" });
+                break;
+            default: return;
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
     heading(label, t) {
         return div().flex_none().px(10).pt(10).pb(4).text_size(11).font_semibold().text_color(t.dim).child(label);
     }
     change(c, t) {
         const [added, removed] = splitDiff(c.diff);
         return h_flex().id(`change-${c.top}`).flex_none().px(10).py(7).gap(8).items_center().rounded(7).cursor_pointer()
-            .hover((s) => s.bg(t.hover)).on_click(() => this.openDiff(`checkout:${c.top}`))
+            .when(this.marked(c.top), (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click(() => this.openDiff(`checkout:${c.top}`))
             .child(div().flex_none().text_color(t.dim).child("±"))
             .child(div().min_w(0).truncate().text_color(t.foreground).child(c.repo ?? c.top))
             .when(Boolean(c.branch), (e) => e.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(c.branch)))
@@ -185,7 +258,7 @@ export default class SimPrs extends View {
     row(p, t) {
         const state = STATES[stateOf(p)] ?? { label: p.state, color: t.dim };
         return v_flex().id(`pr-${p.url}`).flex_none().px(10).py(7).gap(4).rounded(7).cursor_pointer()
-            .hover((s) => s.bg(t.hover)).on_click(() => openUrl(p.url))
+            .when(this.marked(p.url), (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click(() => openUrl(p.url))
             .child(h_flex().gap(8).items_start()
             .child(div().flex_none().h(18).px(7).flex().items_center().rounded(9).bg(state.color)
             .text_size(10).font_semibold().text_color("#ffffff").child(state.label))
@@ -201,19 +274,33 @@ export default class SimPrs extends View {
             .on_click((_e, cx) => { cx.stop_propagation(); this.openDiff(`pr:${p.url}`); })
             .child("Diff")));
     }
+    // The selected row shows while the panel has the keyboard (the first row until one is chosen).
+    marked(key) {
+        if (!this.handle?.is_focused())
+            return false;
+        return key === (this.selected ?? this.items()[0]?.key);
+    }
     render(cx) {
         if (this.keys) {
             this.watchDiff();
             return div();
         }
         const t = theme();
+        const asked = shared(FOCUS) ?? 0;
+        // Not from render: the keyboard moves in a task, once this frame is drawn.
+        if (asked > this.focusedAt && showing()) {
+            this.focusedAt = asked;
+            cx.spawn(async () => { this.handle.focus(); });
+        }
         // Ask again when the panel comes back into view or the focused terminal changes.
         const context = hidden() ? null : JSON.stringify(this.target());
         if (context && context !== this.shownContext)
             this.refresh(cx);
         this.shownContext = context;
         const v = this.view, empty = (text) => div().px(16).py(14).text_size(12).text_center().text_color(t.dim).child(text);
-        return v_flex().id(MOD).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+        return v_flex().id(MOD).size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1()
+            .border_color(this.handle.is_focused() ? t.accent : t.border).text_color(t.foreground).text_size(13)
+            .track_focus(this.handle).on_key_down((e, cx) => this.key(e, cx))
             .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
             .child(div().font_semibold().child("Changes"))
             .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).text_right().truncate().child(v?.branch ?? ""))
