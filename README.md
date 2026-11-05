@@ -124,7 +124,8 @@ In a layout of your own, add `{ "id": "sim-prs", "type": "block", "content": { "
 to the `panel-body` stack, and `{ "mod": "sim-prs", "props": { "button": true } }` as a
 56px block beside `tabs`. How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
 Working on it: `npm install`, `npm run types` (the app's type files), then
-`npm run check`, `npm test`, `npm run build`.
+`npm run check`, `npm test`, `npm run build`. End-to-end checks, run by hand
+or by an agent: [herdr-app/scenarios/](herdr-app/scenarios/).
 
 ## Changes panel
 
