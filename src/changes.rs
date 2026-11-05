@@ -518,10 +518,8 @@ pub fn run(herdr: &str, home: &Path, state_dir: &Path) -> anyhow::Result<()> {
                         .iter()
                         .filter(|url| {
                             !prs.get(*url).is_some_and(|(at, pr)| {
-                                let open = pr.as_ref().is_none_or(|p| p.state == "OPEN");
-                                at.is_some_and(|at| {
-                                    at.elapsed() < if open { OPEN_TTL } else { DONE_TTL }
-                                })
+                                let state = pr.as_ref().map_or("OPEN", |p| p.state.as_str());
+                                at.is_some_and(|at| fresh(state, at.elapsed()))
                             })
                         })
                         .cloned()
@@ -819,26 +817,7 @@ fn load_prs(path: &Path) -> Prs {
     v.as_object()
         .into_iter()
         .flatten()
-        .map(|(url, p)| {
-            let pr = Pr {
-                url: url.clone(),
-                repo: p["repo"].as_str().unwrap_or("").to_string(),
-                number: p["number"].as_str().unwrap_or("").to_string(),
-                title: p["title"].as_str().unwrap_or("").to_string(),
-                state: p["state"].as_str().unwrap_or("").to_string(),
-                draft: p["draft"].as_bool().unwrap_or(false),
-                approved: p["approved"].as_bool().unwrap_or(false),
-                additions: p["additions"].as_u64().unwrap_or(0),
-                deletions: p["deletions"].as_u64().unwrap_or(0),
-                comments: p["comments"].as_u64().unwrap_or(0) as usize,
-                comment_url: p["comment_url"].as_str().map(String::from),
-                checks: p["checks"].as_array().and_then(|c| {
-                    let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
-                    Some((n(0)?, n(1)?, n(2)?))
-                }),
-            };
-            (url.clone(), (None, Some(pr)))
-        })
+        .map(|(url, p)| (url.clone(), (None, Some(pr_from_json(url, p)))))
         .collect()
 }
 
@@ -847,23 +826,181 @@ fn load_prs(path: &Path) -> Prs {
 fn save_prs(path: &Path, prs: &Prs) {
     let all: serde_json::Map<String, Value> = prs
         .iter()
-        .filter_map(|(url, (_, pr))| {
-            let p = pr.as_ref()?;
-            Some((
-                url.clone(),
-                json!({
-                    "repo": p.repo, "number": p.number, "title": p.title,
-                    "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
-                    "deletions": p.deletions, "comments": p.comments, "comment_url": p.comment_url,
-                    "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
-                }),
-            ))
-        })
+        .filter_map(|(url, (_, pr))| Some((url.clone(), pr_json(pr.as_ref()?))))
         .collect();
+    write_atomic(path, &Value::Object(all));
+}
+
+/// A PR's details as they are saved, keyed by URL elsewhere.
+fn pr_json(p: &Pr) -> Value {
+    json!({
+        "repo": p.repo, "number": p.number, "title": p.title,
+        "state": p.state, "draft": p.draft, "approved": p.approved, "additions": p.additions,
+        "deletions": p.deletions, "comments": p.comments, "comment_url": p.comment_url,
+        "checks": p.checks.map(|(ok, failed, total)| [ok, failed, total]),
+    })
+}
+
+fn pr_from_json(url: &str, p: &Value) -> Pr {
+    Pr {
+        url: url.to_string(),
+        repo: p["repo"].as_str().unwrap_or("").to_string(),
+        number: p["number"].as_str().unwrap_or("").to_string(),
+        title: p["title"].as_str().unwrap_or("").to_string(),
+        state: p["state"].as_str().unwrap_or("").to_string(),
+        draft: p["draft"].as_bool().unwrap_or(false),
+        approved: p["approved"].as_bool().unwrap_or(false),
+        additions: p["additions"].as_u64().unwrap_or(0),
+        deletions: p["deletions"].as_u64().unwrap_or(0),
+        comments: p["comments"].as_u64().unwrap_or(0) as usize,
+        comment_url: p["comment_url"].as_str().map(String::from),
+        checks: p["checks"].as_array().and_then(|c| {
+            let n = |i: usize| c.get(i)?.as_u64().map(|n| n as usize);
+            Some((n(0)?, n(1)?, n(2)?))
+        }),
+    }
+}
+
+fn write_atomic(path: &Path, v: &Value) {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    if std::fs::write(&tmp, Value::Object(all).to_string()).is_ok() {
+    if std::fs::write(&tmp, v.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
     }
+}
+
+/// Fetched details stand this long: open PRs change (checks, comments);
+/// merged and closed ones barely do. The pane and `--prs-json` both ask.
+fn fresh(state: &str, age: Duration) -> bool {
+    age < if state == "OPEN" { OPEN_TTL } else { DONE_TTL }
+}
+
+/// `--prs-json`'s own files in the state directory: the scan and branch cache
+/// (a [`Cache`] like the main pass's, so a transcript is read only past where
+/// it was last read), and each PR's details with when they were fetched
+/// (`at`, Unix seconds).
+const APP_CACHE: &str = "app-cache.json";
+const APP_PRS: &str = "app-prs.json";
+
+/// The checkouts holding `dirs` that have uncommitted changes, each once and
+/// in order, as the pane's `± repo +a -d` rows: `{ top, repo, branch, diff }`,
+/// `branch` only for a linked worktree.
+fn app_changes(dirs: &[String]) -> Vec<Value> {
+    let found: Vec<String> = std::thread::scope(|s| {
+        let running: Vec<_> = dirs.iter().map(|d| s.spawn(|| checkout_of(d))).collect();
+        running
+            .into_iter()
+            .filter_map(|t| t.join().ok().flatten())
+            .collect()
+    });
+    let mut tops: Vec<String> = Vec::new();
+    for top in found {
+        if !tops.contains(&top) {
+            tops.push(top);
+        }
+    }
+    let local: Vec<(Option<String>, Option<String>)> = std::thread::scope(|s| {
+        let running: Vec<_> = tops
+            .iter()
+            .map(|top| s.spawn(|| (local_diff(top), worktree_branch(top))))
+            .collect();
+        running
+            .into_iter()
+            .map(|t| t.join().unwrap_or_default())
+            .collect()
+    });
+    tops.iter()
+        .zip(local)
+        .filter_map(|(top, (diff, branch))| {
+            Some(json!({ "top": top, "repo": repo_name(top), "branch": branch, "diff": diff? }))
+        })
+        .collect()
+}
+
+/// One run for the Herdr app's `sim-prs` panel: the uncommitted changes in
+/// the checkouts it worked in (`changes`), the PRs the Claude Code
+/// session in process `pid` touched, newest first, and the PR of the branch
+/// checked out in `cwd`, with the details this pane shows.
+pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&str>) -> Value {
+    let now = crate::unix_now();
+    let cache_path = state_dir.join(APP_CACHE);
+    let mut cache = Cache::load(&cache_path);
+    let session = pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid));
+    let scanned = session
+        .as_deref()
+        .map(|id| claude_session(home, id, &mut cache));
+    let urls: Vec<String> = scanned
+        .as_ref()
+        .map(|s| s.prs.iter().rev().cloned().collect())
+        .unwrap_or_default();
+    // Every checkout the session worked in, where the terminal is first, as `run` lists them.
+    let dirs: Vec<String> = cwd
+        .map(String::from)
+        .into_iter()
+        .chain(scanned.into_iter().flat_map(|s| s.dirs))
+        .collect();
+    let changes = app_changes(&dirs);
+    // As the main pass finds a Space's PR, under the same key and rules.
+    let branch = cwd.and_then(crate::git_repo).and_then(|repo| {
+        let name = repo.branch?;
+        let key = format!("{}#{name}", repo.top);
+        let pr = cache.branch_state(&key, now, || crate::gh_branch_pr(&repo.top, &name));
+        Some(format!(
+            "https://github.com/{}/pull/{}",
+            github_slug(&repo.top)?,
+            pr.number?
+        ))
+    });
+    let _ = cache.save(&cache_path);
+
+    let prs_path = state_dir.join(APP_PRS);
+    let mut saved: serde_json::Map<String, Value> = std::fs::read(&prs_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let stale: Vec<String> = branch
+        .iter()
+        .chain(&urls)
+        .filter(|url| {
+            saved.get(url.as_str()).is_none_or(|v| {
+                let age = now.saturating_sub(v["at"].as_u64().unwrap_or(0));
+                !fresh(v["state"].as_str().unwrap_or(""), Duration::from_secs(age))
+            })
+        })
+        .cloned()
+        .collect();
+    let fetched = !stale.is_empty();
+    if fetched {
+        let mut got = fetch_all(&stale);
+        for url in stale {
+            // A failed request keeps the last details, or none, until the
+            // next try is due: a PR the token can't read isn't asked every run.
+            let mut entry = got
+                .remove(&url)
+                .map(|pr| pr_json(&pr))
+                .or_else(|| saved.remove(&url))
+                .unwrap_or_else(|| json!({}));
+            entry["at"] = json!(now);
+            saved.insert(url, entry);
+        }
+    }
+
+    let shown = |url: &String| {
+        let mut v = saved.get(url).filter(|v| v.get("title").is_some())?.clone();
+        let p = v.as_object_mut()?;
+        p.remove("at");
+        p.insert("url".into(), json!(url));
+        Some(v)
+    };
+    let out = json!({
+        "session": session,
+        "changes": changes,
+        "branch": branch.as_ref().and_then(shown),
+        "prs": urls.iter().filter(|u| Some(*u) != branch.as_ref()).filter_map(shown).collect::<Vec<_>>(),
+    });
+    if fetched {
+        write_atomic(&prs_path, &Value::Object(saved));
+    }
+    out
 }
 
 /// Every agent pane Herdr knows, or none when the call fails. Asked over the
@@ -1599,6 +1736,15 @@ pub(crate) enum Event {
     Release,
 }
 
+/// The key an up or down arrow stands for: `k` or `j`, in either cursor mode.
+fn arrow(seq: &[u8]) -> Option<u8> {
+    match seq {
+        b"\x1b[A" | b"\x1bOA" => Some(b'k'),
+        b"\x1b[B" | b"\x1bOB" => Some(b'j'),
+        _ => None,
+    }
+}
+
 /// Turns on mouse reporting in the pane and sends each Ctrl+left click, as
 /// 1-based column and row, and each wheel notch to `events`.
 pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
@@ -1635,14 +1781,23 @@ pub(crate) fn listen_for_clicks(events: mpsc::Sender<Event>) {
                 match buf.len() {
                     1 => {}
                     // A bare Esc: the byte after it is a key of its own.
-                    2 if buf[1] != b'[' => {
+                    2 if buf[1] != b'[' && buf[1] != b'O' => {
                         buf.clear();
                         if events.send(Event::Key(byte[0])).is_err() {
                             return;
                         }
                     }
                     2 => {}
-                    _ if (0x40..=0x7e).contains(&byte[0]) => buf.clear(),
+                    // Up and down move as k and j do.
+                    _ if (0x40..=0x7e).contains(&byte[0]) => {
+                        let key = arrow(&buf);
+                        buf.clear();
+                        if let Some(key) = key
+                            && events.send(Event::Key(key)).is_err()
+                        {
+                            return;
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -1943,6 +2098,27 @@ mod tests {
     }
 
     #[test]
+    fn arrow_keys_read_as_j_and_k() {
+        assert_eq!(arrow(b"\x1b[A"), Some(b'k'));
+        assert_eq!(arrow(b"\x1b[B"), Some(b'j'));
+        // Application cursor mode sends ESC O instead of ESC [.
+        assert_eq!(arrow(b"\x1bOA"), Some(b'k'));
+        assert_eq!(arrow(b"\x1bOB"), Some(b'j'));
+        assert_eq!(arrow(b"\x1b[C"), None);
+        assert_eq!(arrow(b"\x1b[1;5A"), None);
+    }
+
+    #[test]
+    fn fresh_keeps_open_prs_briefly_and_finished_ones_longer() {
+        assert!(fresh("OPEN", Duration::from_secs(29)));
+        assert!(!fresh("OPEN", Duration::from_secs(30)));
+        assert!(fresh("MERGED", Duration::from_secs(599)));
+        assert!(!fresh("CLOSED", Duration::from_secs(600)));
+        // A failed fetch leaves no state: the next try waits as long as for a finished PR.
+        assert!(fresh("", Duration::from_secs(599)));
+        assert!(!fresh("", Duration::from_secs(600)));
+    }
+    #[test]
     fn highlight_marks_only_its_columns() {
         let line = format!("  {DIM}repo #7{RESET}  x");
         assert_eq!(
@@ -2147,6 +2323,45 @@ mod tests {
         assert!(here(&a, None, Some("w1")));
         assert!(!here(&a, None, Some("w2")));
         assert!(here(&a, None, None));
+    }
+
+    #[test]
+    fn app_changes_lists_each_dirty_checkout_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let top = dir.path().join("repo");
+        let clean = dir.path().join("clean");
+        for repo in [&top, &clean] {
+            std::fs::create_dir_all(repo.join("sub")).unwrap();
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            git(&["init", "-q"]);
+            std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "init"]);
+        }
+        std::fs::write(top.join("a.txt"), "a\nb\n").unwrap();
+        let path = |p: &Path| p.to_str().unwrap().to_string();
+        // The repo twice (its top and a folder in it), a clean one, and a folder outside git.
+        let dirs = [
+            path(&top.join("sub")),
+            path(&top),
+            path(&clean),
+            path(dir.path()),
+        ];
+        let rows = app_changes(&dirs);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let top = checkout_of(&path(&top)).unwrap();
+        assert_eq!(rows[0]["top"], top.as_str());
+        assert_eq!(rows[0]["repo"], "repo");
+        assert_eq!(rows[0]["diff"], "+1");
+        assert_eq!(rows[0]["branch"], Value::Null);
     }
 
     #[test]

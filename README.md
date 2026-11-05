@@ -96,6 +96,40 @@ Herdr runs the plugin at server startup, whenever an agent's status changes,
 when a pane is focused or closed, and when a workspace or worktree is created
 or opened.
 
+## Herdr app panel
+
+The Herdr desktop app (`herdr-app`) has no plugin hooks, so this Changes panel
+comes to it as a mod and a layout, `main-sim`, where it takes the place of the
+app's own Changes (the tab bar's Changes button, or `cmd-shift-c`):
+
+- **Uncommitted**: a `± repo +12 −3` row per checkout the focused Claude Code
+  session worked in that has uncommitted changes.
+- **This branch** and **This session**: the branch's PR and the PRs the
+  session touched, newest first. A click opens one in the browser.
+- **Diff**: a checkout row, or a PR's Diff, opens this repo's diff view
+  (`--diff-pane`, with its keys) right of the terminal, the panel closed;
+  `q` brings the panel back.
+
+The mod (TypeScript in `herdr-app/src/`, built to `herdr-app/mods/sim-prs/`)
+only draws: each look runs `herdr-sim --prs-json`, which finds the session
+from the claude process's pid, the checkouts' changes and the PR details,
+reusing what it fetched between runs.
+
+1. Put a herdr-sim with `--prs-json` on `PATH` (this checkout's
+   `cargo build --release`, linked into `~/.local/bin`).
+2. Run `herdr-app/scripts/install.sh`: it links the mod into
+   `~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, adds (or
+   updates, if unedited) the `main-sim` layout, and adds `cmd-shift-c` to
+   `keys.json` unless that key is already yours.
+3. `herdr-app do layout.switch --name main-sim`.
+
+In a layout of your own, set the `panel-body` stack's `changes` child to
+`{ "mod": "sim-prs" }`, and add `{ "mod": "sim-prs", "props": { "keys": true } }` as a
+0px block beside `tabs` (it takes the toggle key and brings the panel back after a diff). How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
+Working on it: `npm install`, `npm run types` (the app's type files), then
+`npm run check`, `npm test`, `npm run build`. End-to-end checks, run by hand
+or by an agent: [herdr-app/scenarios/](herdr-app/scenarios/).
+
 ## Changes panel
 
 Claude Code's "Changes" panel as a right-hand split.
@@ -113,7 +147,7 @@ Claude Code's "Changes" panel as a right-hand split.
   once, focused or not. When the agent pane it shows closes,
   it shows another agent in its tab (one stacked above or below), or closes
   when none is left.
-- **Keys.** `j`/`k` move between rows, `gg`/`G` to the ends. `Enter` opens
+- **Keys.** `j`/`k` (or `↓`/`↑`) move between rows, `gg`/`G` to the ends. `Enter` opens
   the row, `p` its PR, `c` its latest comment, `d` its diff, `q` closes the
   panel.
 - **Mouse.** A click opens what it is on: the repo, the PR, its files,
@@ -122,7 +156,7 @@ Claude Code's "Changes" panel as a right-hand split.
 - **Diff.** `d` swaps the panel for a diff on the right half of the tab, laid
   out like reviewr: the selected file's diff (line numbers, changed lines
   barred and tinted, highlighted for the file's language, CSV columns in
-  colour) beside a tree of the changed files. Vim keys move (`j`/`k`,
+  colour) beside a tree of the changed files. Vim keys move (`j`/`k` or `↓`/`↑`,
   `Ctrl-d`/`Ctrl-u`, `gg`/`G`, `]`/`[` for hunks, `f`/`F` for files); `Tab`
   switches box, `z` hides the tree (and shows it again, focused), `e` opens
   the file in `$EDITOR` at the line (quitting it brings the diff back), `q`

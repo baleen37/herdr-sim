@@ -577,6 +577,12 @@ fn start(range: Option<&str>) -> usize {
 /// pane; quitting the editor comes back here, the diff already re-read.
 fn edit(dir: &str, path: &str, line: usize) {
     let Ok(me) = std::env::var("HERDR_PANE_ID") else {
+        // In the Herdr desktop app (its terminals carry HC_TERMINAL_ID), the
+        // same `--edit-pane` opens beside this one, zoomed, through herdr-app.
+        // Not inline: this pane's input thread would take the editor's keys.
+        if std::env::var("HC_TERMINAL_ID").is_ok() {
+            edit_in_app(dir, path, line);
+        }
         return;
     };
     call(
@@ -587,6 +593,38 @@ fn edit(dir: &str, path: &str, line: usize) {
             "env": { "HERDR_SIM_EDIT_FILE": path, "HERDR_SIM_EDIT_LINE": line.to_string() },
         }),
     );
+}
+
+fn edit_in_app(dir: &str, path: &str, line: usize) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let open = serde_json::json!({
+        "argv": [
+            "env",
+            format!("HERDR_SIM_EDIT_FILE={path}"),
+            format!("HERDR_SIM_EDIT_LINE={line}"),
+            exe,
+            "--edit-pane",
+        ],
+        "folder": dir,
+        "place": "right",
+    });
+    std::thread::spawn(move || {
+        let opened = Command::new("herdr-app")
+            .args(["do", "terminal.open", &open.to_string()])
+            .output();
+        let pane = opened
+            .ok()
+            .and_then(|o| serde_json::from_slice::<serde_json::Value>(&o.stdout).ok())
+            .and_then(|v| v["pane"].as_str().map(String::from));
+        if let Some(pane) = pane {
+            let zoom = serde_json::json!({ "pane": pane });
+            let _ = Command::new("herdr-app")
+                .args(["do", "pane.zoom", &zoom.to_string()])
+                .output();
+        }
+    });
 }
 
 /// The `edit` pane: the file in the user's editor at the line. The login

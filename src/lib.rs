@@ -735,22 +735,40 @@ enum Hit {
 /// `~/.claude/sessions/<pid>.json` then names the job, whose
 /// `~/.claude/jobs/<job>/state.json` holds the session the user is in.
 pub fn resolve_claude_session(home: &Path, session_id: &str) -> String {
-    let parked = entries(&home.join(".claude/sessions")).find_map(|path| {
-        if path.extension().is_none_or(|e| e != "json") {
-            return None;
-        }
-        let v = parse(&fs::read_to_string(&path).ok()?)?;
-        if v["sessionId"].as_str() != Some(session_id) {
-            return None;
-        }
-        v["parkedJobId"].as_str().map(String::from)
-    });
-    parked
-        .and_then(|job| {
-            let state = fs::read_to_string(home.join(".claude/jobs").join(job).join("state.json"));
-            parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
+    entries(&home.join(".claude/sessions"))
+        .find_map(|path| {
+            if path.extension().is_none_or(|e| e != "json") {
+                return None;
+            }
+            let v = parse(&fs::read_to_string(&path).ok()?)?;
+            if v["sessionId"].as_str() != Some(session_id) {
+                return None;
+            }
+            parked_session(home, &v)
         })
         .unwrap_or_else(|| session_id.to_string())
+}
+
+/// The session of the job a `~/.claude/sessions/<pid>.json` entry parked its
+/// conversation as, if it did.
+fn parked_session(home: &Path, entry: &Value) -> Option<String> {
+    let job = entry["parkedJobId"].as_str()?;
+    let state = fs::read_to_string(home.join(".claude/jobs").join(job).join("state.json"));
+    parse(&state.ok()?)?["sessionId"].as_str().map(String::from)
+}
+
+/// The session the `claude` process `pid` shows, from its
+/// `~/.claude/sessions/<pid>.json`, followed to a parked job's session as
+/// [`resolve_claude_session`] does. For callers that know the process but not
+/// Herdr's `agent_session`, such as the Herdr app's panel.
+pub fn claude_session_for_pid(home: &Path, pid: &str) -> Option<String> {
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let text =
+        fs::read_to_string(home.join(".claude/sessions").join(format!("{pid}.json"))).ok()?;
+    let entry = parse(&text)?;
+    parked_session(home, &entry).or_else(|| entry["sessionId"].as_str().map(String::from))
 }
 
 /// The name Claude Code gave a session in `~/.claude/sessions/<pid>.json`
@@ -1049,6 +1067,8 @@ pub struct Cache {
 pub struct BranchPr {
     pub state: Option<PrState>,
     pub ci: Option<Ci>,
+    /// The PR's number, for a link to it (the Herdr app's panel).
+    pub number: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1090,6 +1110,7 @@ impl Cache {
                 let pr = BranchPr {
                     state: v["state"].as_str().and_then(PrState::parse),
                     ci: v["ci"].as_str().and_then(Ci::parse),
+                    number: v["number"].as_u64(),
                 };
                 Some((key.clone(), (pr, v["at"].as_u64()?)))
             })
@@ -1172,6 +1193,7 @@ impl Cache {
                 let entry = json!({
                     "state": pr.state.map(PrState::name),
                     "ci": pr.ci.map(Ci::name),
+                    "number": pr.number,
                     "at": at,
                 });
                 (key.clone(), entry)
@@ -1480,6 +1502,38 @@ mod tests {
                 .prs
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn session_for_pid_reads_the_process_file_and_follows_a_parked_job() {
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".claude/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("7.json"),
+            json!({ "sessionId": "s7" }).to_string(),
+        )
+        .unwrap();
+        let parked = json!({ "sessionId": "pane", "parkedJobId": "job1" });
+        fs::write(sessions.join("8.json"), parked.to_string()).unwrap();
+        let job = home.path().join(".claude/jobs/job1");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(
+            job.join("state.json"),
+            json!({ "sessionId": "forked" }).to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_session_for_pid(home.path(), "7").as_deref(),
+            Some("s7")
+        );
+        assert_eq!(
+            claude_session_for_pid(home.path(), "8").as_deref(),
+            Some("forked")
+        );
+        assert_eq!(claude_session_for_pid(home.path(), "9"), None);
+        assert_eq!(claude_session_for_pid(home.path(), "../7"), None);
     }
 
     #[test]
@@ -2018,7 +2072,11 @@ mod tests {
 
     #[test]
     fn branch_state_rechecks_missing_and_open_prs_only() {
-        let pr = |state, ci| BranchPr { state, ci };
+        let pr = |state, ci| BranchPr {
+            state,
+            ci,
+            number: None,
+        };
         let open = pr(Some(PrState::Open), Some(Ci::Pending));
         let merged = pr(Some(PrState::Merged), Some(Ci::Pass));
         let mut cache = Cache::default();
@@ -2074,6 +2132,7 @@ mod tests {
         let merged = BranchPr {
             state: Some(PrState::Merged),
             ci: Some(Ci::Fail),
+            number: Some(7),
         };
         cache.branch_state("r#b", 5, || Some(merged));
         cache.save(&path).unwrap();

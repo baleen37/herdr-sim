@@ -1,0 +1,6 @@
+# Written by the Herdr app into every mod folder
+mods/*/gpui-kit.d.ts
+mods/*/jsconfig.json
+# The app's type files, copied by `npm run types`
+types/
+node_modules/
