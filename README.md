@@ -96,6 +96,35 @@ Herdr runs the plugin at server startup, whenever an agent's status changes,
 when a pane is focused or closed, and when a workspace or worktree is created
 or opened.
 
+## Herdr app panel
+
+The Herdr desktop app (`herdr-app`) has no plugin hooks, so herdr-sim's PR list
+comes to it as a mod instead: a **PRs** button beside the tab bar's Files and
+Changes that opens a side panel for the focused terminal.
+
+- **This branch**: the PR `gh pr view` finds for the branch checked out there.
+- **This session**: for a Claude Code terminal, the PRs its session touched
+  (`pr-link` records, found through the claude process's
+  `~/.claude/sessions/<pid>.json`), newest first.
+
+Each row shows the state, title, `owner/repo#N`, lines changed and an approval
+check; a click opens the PR. Open PRs are re-checked at most once a minute,
+merged and closed ones never. Codex terminals and terminals on other machines
+show only the branch PR.
+
+Link the mod so a `git pull` updates it, then add the layout (Herdr's `main`
+with the panel and its button):
+
+```sh
+ln -s "$PWD/herdr-app/mods/prs" ~/.config/herdr-app/mods/prs
+cp herdr-app/layouts/main-prs.json ~/.config/herdr-app/layouts/
+herdr-app do layout.switch --name main-prs
+```
+
+In a layout of your own, add `{ "id": "prs", "type": "block", "content": { "mod": "prs" } }`
+to the `panel-body` stack, and `{ "mod": "prs", "props": { "button": true } }` as a
+56px block beside `tabs`.
+
 ## Changes panel
 
 Claude Code's "Changes" panel as a right-hand split.
