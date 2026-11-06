@@ -1,22 +1,24 @@
 #!/bin/sh
-# Links the sim-prs mod (built from src/ by `npm run build`) into the Herdr
+# Links the sim-prs mod (built from src/ by `npm run build`) and sim-agents into the Herdr
 # app's home, so a `git pull` here updates it, and adds the main-sim layout. Never overwrites: a layout already there is
 # left as it is (it may hold your edits), and a sim-prs folder that isn't this
 # link stops the install.
 set -eu
 src=$(cd "$(dirname "$0")/.." && pwd)
 app=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
-mod="$app/mods/sim-prs"
-
-if [ -L "$mod" ] && [ "$(readlink "$mod")" = "$src/mods/sim-prs" ]; then
-  echo "mod: already linked"
-elif [ -e "$mod" ] || [ -L "$mod" ]; then
-  echo "mod: $mod exists and isn't a link to this checkout; move it away first" >&2
-  exit 1
-else
-  ln -s "$src/mods/sim-prs" "$mod"
-  echo "mod: linked $mod"
-fi
+# sim-prs: the Changes panel. sim-agents: Herdr's Agents list with each row's PR icons.
+for name in sim-prs sim-agents; do
+  mod="$app/mods/$name"
+  if [ -L "$mod" ] && [ "$(readlink "$mod")" = "$src/mods/$name" ]; then
+    echo "mod: $name already linked"
+  elif [ -e "$mod" ] || [ -L "$mod" ]; then
+    echo "mod: $mod exists and isn't a link to this checkout; move it away first" >&2
+    exit 1
+  else
+    ln -s "$src/mods/$name" "$mod"
+    echo "mod: linked $mod"
+  fi
+done
 
 # A layout already there is replaced only when it is a version this repo
 # committed (an earlier install, unedited); one with the person's edits stays.
@@ -61,7 +63,7 @@ if added:
     print("keys: added " + ", ".join(added))
 PY
 
-herdr-app check "$mod"
+for name in sim-prs sim-agents; do herdr-app check "$app/mods/$name"; done
 
 # The panel runs `herdr-sim --prs-json`. An older herdr-sim ignores the flag and
 # prints nothing, so look for the JSON rather than the exit code.
