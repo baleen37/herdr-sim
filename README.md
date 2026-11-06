@@ -123,6 +123,13 @@ reusing what it fetched between runs.
    `keys.json` unless that key is already yours.
 3. `herdr-app do layout.switch --name main-sim`.
 
+`main-sim` also swaps the Agents list for `sim-agents`: Herdr's own `agents` mod
+(cloned from 0.1.13) with each row's PRs as icons on the right, as `$pr` does in
+the terminal Herdr. They are the session's PRs and its branch's, coloured by
+state (open, draft, merged, closed); a click opens one, hover shows its title.
+Every 30 s it runs `herdr-sim --prs-json` per local agent. Being a clone, it
+does not follow Herdr's updates to `agents`.
+
 In a layout of your own, set the `panel-body` stack's `changes` child to
 `{ "mod": "sim-prs" }`, and add `{ "mod": "sim-prs", "props": { "keys": true } }` as a
 0px block beside `tabs` (it takes the toggle key and brings the panel back after a diff). How it looks and behaves: [herdr-app/RECIPE.md](herdr-app/RECIPE.md).
