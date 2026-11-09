@@ -3,7 +3,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, exec, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { agents, terminals, panes, focused, spaces, run, exec, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, nextCommand } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -100,6 +100,15 @@ export default class Agents extends View {
     this.prs = new Map();
     this.refreshPrs(cx);
     cx.timer.every(PR_POLL, (cx) => this.refreshPrs(cx));
+    // alt-1..9, alt-0 for 10 (keys.json): show the list's nth agent, counted as drawn (pinned first).
+    this.order = [];
+    cx.spawn(async () => {
+      for (;;) {
+        const n = /^agent-(\d+)$/.exec(await nextCommand())?.[1];
+        const addr = n && this.order[n - 1];
+        if (addr) run("agent.focus", { terminal: addr });
+      }
+    });
   }
 
   // One `herdr-sim --prs-json` per local agent: the Claude session by its pid, the branch by its folder.
@@ -316,7 +325,8 @@ export default class Agents extends View {
     const pinned = list.filter((a) => a.pinned);
     const rest = list.filter((a) => !a.pinned);
     list = [...pinned, ...rest];
-    setAgentOrder(list.map((a) => a.address));
+    this.order = list.map((a) => a.address);
+    setAgentOrder(this.order);
 
     const withKids = (a, i) => {
       const subs = collapsed ? [] : this.tree(all, a.address);
