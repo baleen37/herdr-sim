@@ -1,5 +1,5 @@
 {
-  "layout:main-sim": {
+  "layout:herdr-sim": {
     "cmd-shift-c": "sim-prs.toggle",
     "alt-1": "sim-agents.agent-1",
     "alt-2": "sim-agents.agent-2",
@@ -10,6 +10,10 @@
     "alt-7": "sim-agents.agent-7",
     "alt-8": "sim-agents.agent-8",
     "alt-9": "sim-agents.agent-9",
-    "alt-0": "sim-agents.agent-10"
+    "alt-0": "sim-agents.agent-10",
+    "alt-down": "sim-folders.next",
+    "alt-up": "sim-folders.prev",
+    "ctrl-shift-pagedown": "sim-folders.next",
+    "ctrl-shift-pageup": "sim-folders.prev"
   }
 }
