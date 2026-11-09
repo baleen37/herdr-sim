@@ -1,5 +1,15 @@
 {
   "layout:main-sim": {
-    "cmd-shift-c": "sim-prs.toggle"
+    "cmd-shift-c": "sim-prs.toggle",
+    "alt-1": "sim-agents.agent-1",
+    "alt-2": "sim-agents.agent-2",
+    "alt-3": "sim-agents.agent-3",
+    "alt-4": "sim-agents.agent-4",
+    "alt-5": "sim-agents.agent-5",
+    "alt-6": "sim-agents.agent-6",
+    "alt-7": "sim-agents.agent-7",
+    "alt-8": "sim-agents.agent-8",
+    "alt-9": "sim-agents.agent-9",
+    "alt-0": "sim-agents.agent-10"
   }
 }
