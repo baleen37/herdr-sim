@@ -1,6 +1,6 @@
 # app-panel: the Changes panel follows focus, opens diffs wide and comes back
 
-**What this covers**: `src/main.ts` as Herdr runs it in `main-sim`: the panel
+**What this covers**: `src/main.ts` as Herdr runs it in `herdr-sim`: the panel
 in the `changes` child (`showing`), the 0px keys block (`sim-prs.toggle`,
 `watchDiff`), refreshing on focus change and on coming back into view,
 staying idle while hidden, the Uncommitted rows, opening a diff
@@ -8,7 +8,7 @@ staying idle while hidden, the Uncommitted rows, opening a diff
 too-old herdr-sim. The data itself is `cli-prs-json.md`'s.
 
 ## Pre-state
-- Herdr running with `main-sim` shown and its window drawing (not covered:
+- Herdr running with `herdr-sim` shown and its window drawing (not covered:
   `herdr-app shot` returns the last drawn frame; take two and compare).
 - `herdr-app check ~/.config/herdr-app/mods/sim-prs` passes; `herdr-sim` on
   `PATH` is this checkout's release build.
@@ -16,7 +16,7 @@ too-old herdr-sim. The data itself is `cli-prs-json.md`'s.
   `$W`, with one uncommitted edit (`echo x >> $W/README.md`).
 - Note the focused terminal (`herdr-app status` → `agent`) to come back to.
 - Layout state, the ground truth for open/closed:
-  `layouts/.state/main-sim.json` → `nodes.panel.hidden`, `nodes.panel-body.active`.
+  `layouts/.state/herdr-sim.json` → `nodes.panel.hidden`, `nodes.panel-body.active`.
 
 ## Steps
 1. Toggle: `herdr-app do sim-prs.toggle` three times, from open on Changes; then

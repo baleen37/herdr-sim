@@ -1,13 +1,15 @@
 #!/bin/sh
-# Links the sim-prs mod (built from src/ by `npm run build`) and sim-agents into the Herdr
-# app's home, so a `git pull` here updates it, and adds the main-sim layout. Never overwrites: a layout already there is
+# Links the sim-prs mod (built from src/ by `npm run build`), sim-agents and sim-folders into the Herdr
+# app's home, so a `git pull` here updates it, and adds the herdr-sim layout. Never overwrites: a layout already there is
 # left as it is (it may hold your edits), and a sim-prs folder that isn't this
 # link stops the install.
 set -eu
 src=$(cd "$(dirname "$0")/.." && pwd)
 app=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
 # sim-prs: the Changes panel. sim-agents: Herdr's Agents list with each row's PR icons.
-for name in sim-prs sim-agents; do
+# sim-folders: Herdr's Spaces list with folders.
+mods="sim-prs sim-agents sim-folders"
+for name in $mods; do
   mod="$app/mods/$name"
   if [ -L "$mod" ] && [ "$(readlink "$mod")" = "$src/mods/$name" ]; then
     echo "mod: $name already linked"
@@ -22,7 +24,7 @@ done
 
 # A layout already there is replaced only when it is a version this repo
 # committed (an earlier install, unedited); one with the person's edits stays.
-for f in main-sim.json main-sim.svg; do
+for f in herdr-sim.json herdr-sim.svg; do
   dest="$app/layouts/$f"
   if [ ! -e "$dest" ]; then
     cp "$src/layouts/$f" "$dest"
@@ -48,6 +50,10 @@ try:
 except FileNotFoundError:
     keys = {}
 added = []
+# The layout was main-sim before it was herdr-sim: carry the person's keys over.
+if "layout:main-sim" in keys and "layout:herdr-sim" not in keys:
+    keys["layout:herdr-sim"] = keys.pop("layout:main-sim")
+    added.append("layout:main-sim renamed to layout:herdr-sim")
 for section, binds in ours.items():
     have = keys.setdefault(section, {})
     for key, action in binds.items():
@@ -63,7 +69,7 @@ if added:
     print("keys: added " + ", ".join(added))
 PY
 
-for name in sim-prs sim-agents; do herdr-app check "$app/mods/$name"; done
+for name in $mods; do herdr-app check "$app/mods/$name"; done
 
 # The panel runs `herdr-sim --prs-json`. An older herdr-sim ignores the flag and
 # prints nothing, so look for the JSON rather than the exit code.
@@ -73,4 +79,7 @@ if ! command -v herdr-sim >/dev/null 2>&1; then
 elif ! herdr-sim --prs-json 2>/dev/null | grep -q '"prs"'; then
   echo "herdr-sim on PATH ($(command -v herdr-sim)) doesn't know --prs-json: update it" >&2
 fi
-echo "Switch to it with: herdr-app do layout.switch --name main-sim"
+if [ -e "$app/layouts/main-sim.json" ]; then
+  echo "layout: main-sim is now herdr-sim; switch to herdr-sim, then delete $app/layouts/main-sim.json and .svg" >&2
+fi
+echo "Switch to it with: herdr-app do layout.switch --name herdr-sim"

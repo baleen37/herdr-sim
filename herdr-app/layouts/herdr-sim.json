@@ -4,7 +4,7 @@
     "name": "main",
     "version": "0.1.13"
   },
-  "preview": "layouts/main-sim.svg",
+  "preview": "layouts/herdr-sim.svg",
   "type": "row",
   "titlebar": "none",
   "traffic_lights": [
@@ -55,7 +55,7 @@
               },
               "min": 90,
               "content": {
-                "mod": "spaces"
+                "mod": "sim-folders"
               }
             },
             {

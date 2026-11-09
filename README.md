@@ -99,7 +99,7 @@ or opened.
 ## Herdr app panel
 
 The Herdr desktop app (`herdr-app`) has no plugin hooks, so this Changes panel
-comes to it as a mod and a layout, `main-sim`, where it takes the place of the
+comes to it as a mod and a layout, `herdr-sim`, where it takes the place of the
 app's own Changes (the tab bar's Changes button, or `cmd-shift-c`):
 
 - **Uncommitted**: a `± repo +12 −3` row per checkout the focused Claude Code
@@ -119,11 +119,11 @@ reusing what it fetched between runs.
    `cargo build --release`, linked into `~/.local/bin`).
 2. Run `herdr-app/scripts/install.sh`: it links the mod into
    `~/.config/herdr-app/mods/sim-prs`, so a `git pull` updates it, adds (or
-   updates, if unedited) the `main-sim` layout, and adds `cmd-shift-c` to
+   updates, if unedited) the `herdr-sim` layout, and adds `cmd-shift-c` to
    `keys.json` unless that key is already yours.
-3. `herdr-app do layout.switch --name main-sim`.
+3. `herdr-app do layout.switch --name herdr-sim`.
 
-`main-sim` also swaps the Agents list for `sim-agents`: Herdr's own `agents` mod
+`herdr-sim` also swaps the Agents list for `sim-agents`: Herdr's own `agents` mod
 (cloned from 0.1.13) with each row's PRs as icons on the right, as `$pr` does in
 the terminal Herdr. They are the session's PRs and its branch's, coloured by
 state (open, draft, merged, closed); a click opens one, hover shows its title.
