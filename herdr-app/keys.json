@@ -1,6 +1,8 @@
 {
   "layout:herdr-sim": {
     "cmd-shift-c": "sim-prs.toggle",
+    "cmd-w": "sim-tabs.close",
+    "cmd-shift-w": "sim-tabs.reopen",
     "alt-1": "sim-agents.agent-1",
     "alt-2": "sim-agents.agent-2",
     "alt-3": "sim-agents.agent-3",

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Links the sim-prs mod (built from src/ by `npm run build`), sim-agents and sim-folders into the Herdr
+# Links the sim-prs mod (built from src/ by `npm run build`), sim-agents, sim-folders and sim-tabs into the Herdr
 # app's home, so a `git pull` here updates it, and adds the herdr-sim layout. Never overwrites: a layout already there is
 # left as it is (it may hold your edits), and a sim-prs folder that isn't this
 # link stops the install.
@@ -8,7 +8,8 @@ src=$(cd "$(dirname "$0")/.." && pwd)
 app=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
 # sim-prs: the Changes panel. sim-agents: Herdr's Agents list with each row's PR icons.
 # sim-folders: Herdr's Spaces list with folders.
-mods="sim-prs sim-agents sim-folders"
+# sim-tabs: cmd-w keeps the closed tab's terminals running so cmd-shift-w can reopen it.
+mods="sim-prs sim-agents sim-folders sim-tabs"
 for name in $mods; do
   mod="$app/mods/$name"
   if [ -L "$mod" ] && [ "$(readlink "$mod")" = "$src/mods/$name" ]; then

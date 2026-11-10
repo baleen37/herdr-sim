@@ -108,6 +108,16 @@
               }
             },
             {
+              "id": "sim-tabs-keys",
+              "type": "block",
+              "size": {
+                "px": 0
+              },
+              "content": {
+                "mod": "sim-tabs"
+              }
+            },
+            {
               "id": "sim-prs-keys",
               "type": "block",
               "size": {
