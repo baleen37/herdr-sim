@@ -72,3 +72,11 @@ herdr-sim's Changes panel in place of the Herdr app's own: beside the focused te
 - The Spaces block is `sim-folders`, a copy of [jankeesvw/herdr-space-folders](https://github.com/jankeesvw/herdr-space-folders) renamed for this repo: colored, foldable folders of spaces, filled by dragging or by "Collect spaces from" rules, kept per machine in `~/.config/herdr-space-folders.json`. Worktree spaces still sit under their repo's space, as in Herdr's own list.
 - `alt-down` / `alt-up` (and `ctrl-shift-pagedown` / `pageup`) in `layout:herdr-sim` run `sim-folders.next` / `.prev`: the next space as the list shows it, skipping folded folders. They reach only a shown copy, so with the sidebar hidden they do nothing.
 - Linked, not copied (`scripts/install.sh`): like the others, so the reload note above applies. It draws only Herdr's shipped icons, so the link is safe.
+
+## Reopen closed tabs (`sim-tabs`)
+
+- `cmd-w` (`sim-tabs.close`) closes the focused tab by parking its terminals (`terminal.park`): the tab goes, its programs keep running. A tab of mod panes only is closed as before (`tab.close`); mod panes beside the terminals close once the terminals are out. Commands run one at a time: a quick second `cmd-w` waits for the first tab to go, then closes the next one.
+- `cmd-shift-w` (`sim-tabs.reopen`) brings back the last closed tab: its terminals get panes again (`terminal.keep`, the first as a tab, the rest split right), in its space, under its name (an unnamed one by its number again), at its position. One whose pane doesn't show within 3 s stays on the list. Repeat for older ones; tabs whose programs all ended since are skipped.
+- The last 10 closed tabs are kept in shared `sim-tabs.closed`; an older one's terminals end (`terminal.kill`), as `tab.close` would have done.
+- `cmd-shift-w` was the global `pane.close`; in `layout:herdr-sim` it now reopens. The tab bar's × still ends the tab's terminals.
+- A 0px block `sim-tabs-keys` (`{ mod: "sim-tabs" }`) beside `sim-prs-keys` in the tab bar row receives the commands, since a `<mod>.<command>` only reaches shown copies. A split's direction isn't kept: every pane after the first comes back to the right.
