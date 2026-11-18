@@ -838,6 +838,34 @@ pub fn claude_session(home: &Path, session_id: &str, cache: &mut Cache) -> Sessi
     session
 }
 
+/// Resolve a Codex terminal title only when exactly one session matches.
+/// Herdr appends ` | <folder>` to the reported title. Never guess among sessions
+/// with the same name: doing so would show another conversation's changes.
+pub fn codex_session_for_title(home: &Path, title: &str) -> Option<String> {
+    let title = title
+        .strip_prefix('[')
+        .and_then(|s| s.split_once("] Action Required | "))
+        .map(|(_, title)| title)
+        .unwrap_or(title);
+    let mut names = HashMap::new();
+    for_each_line(&home.join(".codex/session_index.jsonl"), |line| {
+        if let Some(v) = parse(line)
+            && let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str())
+        {
+            names.insert(id.to_string(), name.to_string());
+        }
+    });
+    let mut matches = names.into_iter().filter(|(_, name)| {
+        !name.is_empty()
+            && (title == name
+                || title
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|s| s.starts_with(" | ")))
+    });
+    let (id, _) = matches.next()?;
+    matches.next().is_none().then_some(id)
+}
+
 /// A Codex session: PRs printed by `gh pr ...` commands in its rollout, and
 /// its title from the latest `thread_name` in `~/.codex/session_index.jsonl`.
 pub fn codex_session(home: &Path, session_id: &str, cache: &mut Cache) -> Session {
@@ -1580,6 +1608,42 @@ mod tests {
         .unwrap();
         writeln!(f, "{}", ai("later guess")).unwrap();
         assert_eq!(title(&mut cache).as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn codex_terminal_title_resolves_only_unique_current_names() {
+        let home = TempDir::new().unwrap();
+        let index = home.path().join(".codex/session_index.jsonl");
+        write(
+            &index,
+            &[
+                json!({"id":"a", "thread_name":"old"}),
+                json!({"id":"a", "thread_name":"fix changes"}),
+            ],
+        );
+        assert_eq!(
+            codex_session_for_title(home.path(), "fix changes | repo").as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            codex_session_for_title(home.path(), "[ ! ] Action Required | fix changes | repo")
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            codex_session_for_title(home.path(), "[ . ] Action Required | fix changes | repo")
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(codex_session_for_title(home.path(), "old | repo"), None);
+        write(
+            &index,
+            &[
+                json!({"id":"a", "thread_name":"same"}),
+                json!({"id":"b", "thread_name":"same"}),
+            ],
+        );
+        assert_eq!(codex_session_for_title(home.path(), "same | repo"), None);
     }
 
     #[test]

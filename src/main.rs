@@ -123,7 +123,13 @@ fn main() -> Result<()> {
         };
         println!(
             "{}",
-            changes::app_json(&home, &state_dir, value("--pid"), value("--cwd"))
+            changes::app_json(
+                &home,
+                &state_dir,
+                value("--pid"),
+                value("--cwd"),
+                value("--codex-title")
+            )
         );
         return Ok(());
     }

@@ -918,17 +918,30 @@ fn app_changes(dirs: &[String]) -> Vec<Value> {
 }
 
 /// One run for the Herdr app's `sim-prs` panel: the uncommitted changes in
-/// the checkouts it worked in (`changes`), the PRs the Claude Code
-/// session in process `pid` touched, newest first, and the PR of the branch
+/// the checkouts it worked in (`changes`), the PRs the Claude Code session
+/// in process `pid` or Codex session named by `codex_title` touched, newest first, and the PR of the branch
 /// checked out in `cwd`, with the details this pane shows.
-pub fn app_json(home: &Path, state_dir: &Path, pid: Option<&str>, cwd: Option<&str>) -> Value {
+pub fn app_json(
+    home: &Path,
+    state_dir: &Path,
+    pid: Option<&str>,
+    cwd: Option<&str>,
+    codex_title: Option<&str>,
+) -> Value {
     let now = crate::unix_now();
     let cache_path = state_dir.join(APP_CACHE);
     let mut cache = Cache::load(&cache_path);
-    let session = pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid));
-    let scanned = session
-        .as_deref()
-        .map(|id| claude_session(home, id, &mut cache));
+    let session = match codex_title {
+        Some(title) => herdr_sim::codex_session_for_title(home, title),
+        None => pid.and_then(|pid| herdr_sim::claude_session_for_pid(home, pid)),
+    };
+    let scanned = session.as_deref().map(|id| {
+        if codex_title.is_some() {
+            codex_session(home, id, &mut cache)
+        } else {
+            claude_session(home, id, &mut cache)
+        }
+    });
     let urls: Vec<String> = scanned
         .as_ref()
         .map(|s| s.prs.iter().rev().cloned().collect())
@@ -1903,7 +1916,14 @@ fn local_diff(top: &str) -> Option<String> {
         .filter(|f| !f.is_empty())
         .map(|f| text_lines(&Path::new(top).join(f)))
         .sum();
-    diff_text(added + new, removed)
+    diff_text(added + new, removed).or_else(|| {
+        // Binary, empty, renamed and mode-only files still make this checkout dirty.
+        git_in(
+            top,
+            &["status", "--porcelain=v1", "--untracked-files=normal"],
+        )
+        .map(|_| "changed".into())
+    })
 }
 
 /// Lines in the text file at `path`, as git counts them; none for a binary
@@ -2324,6 +2344,67 @@ mod tests {
         assert!(here(&a, None, Some("w1")));
         assert!(!here(&a, None, Some("w2")));
         assert!(here(&a, None, None));
+    }
+
+    #[test]
+    fn app_changes_keeps_changes_without_text_lines() {
+        for kind in ["empty", "binary", "rename", "mode"] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let top = dir.path().to_str().unwrap();
+            let git = |args: &[&str]| {
+                assert!(
+                    Command::new("git")
+                        .args(["-C", top, "-c", "user.name=t", "-c", "user.email=t@t"])
+                        .args(args)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            };
+            git(&["init", "-q"]);
+            std::fs::write(dir.path().join("a"), "hello\n").unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", "init"]);
+            match kind {
+                "empty" => std::fs::write(dir.path().join("empty"), "").unwrap(),
+                "binary" => std::fs::write(dir.path().join("image"), b"x\0y").unwrap(),
+                "rename" => git(&["mv", "a", "b"]),
+                "mode" => git(&["update-index", "--chmod=+x", "a"]),
+                _ => unreachable!(),
+            }
+            let rows = app_changes(&[top.to_string()]);
+            assert_eq!(rows.len(), 1, "missing {kind}: {rows:?}");
+            if kind == "binary" {
+                let home = tempfile::TempDir::new().unwrap();
+                let state = tempfile::TempDir::new().unwrap();
+                let codex = home.path().join(".codex");
+                std::fs::create_dir_all(codex.join("sessions/2026/11/16")).unwrap();
+                std::fs::write(
+                    codex.join("session_index.jsonl"),
+                    format!("{}\n", json!({"id":"c1", "thread_name":"fix changes"})),
+                )
+                .unwrap();
+                std::fs::write(
+                    codex.join("sessions/2026/11/16/rollout-c1.jsonl"),
+                    format!(
+                        "{}\n",
+                        json!({"type":"event_msg", "payload":{"item":{
+                            "type":"CommandExecution", "cwd":format!("file://{top}")
+                        }}})
+                    ),
+                )
+                .unwrap();
+                let out = app_json(
+                    home.path(),
+                    state.path(),
+                    None,
+                    None,
+                    Some("fix changes | repo"),
+                );
+                assert_eq!(out["session"], "c1");
+                assert_eq!(out["changes"][0]["top"], rows[0]["top"]);
+            }
+        }
     }
 
     #[test]
