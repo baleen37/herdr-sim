@@ -29,7 +29,7 @@ const STATES: Record<string, { label: string; color: Color }> = {
 type Theme = Record<string, Color>;
 interface Node { id?: string; hidden?: boolean; active?: string; content?: { mod?: string }; children?: Node[] }
 interface Target { terminal?: string; pane?: string; cwd?: string | null; branch?: string | null }
-interface Shown { claude: boolean; branch: string | null; data: Prs }
+interface Shown { agent: boolean; branch: string | null; data: Prs }
 interface Diff { tab: string | null; at: number; seen: boolean }
 // A row the keys move between: Enter does `open`; `p` and `d` what the row offers.
 interface Item { key: string; open: () => void; pr?: () => void; diff?: () => void }
@@ -64,7 +64,7 @@ function open() {
 }
 
 // herdr-sim's diff view, in a terminal of its own.
-const isDiff = (t: { argv?: string[]; foreground?: { argv?: string[] } }) =>
+const isDiff = (t: ReturnType<typeof terminals>[number]) =>
   [...(t.argv ?? []), ...(t.foreground?.argv ?? [])].includes("--diff-pane");
 
 // herdr-sim before --prs-json fails on the flag; one older still prints nothing.
@@ -138,14 +138,16 @@ export default class SimPrs extends View {
       try {
         // A remote terminal (machine/t1) has its transcripts and checkout on that machine: not read.
         const local = Boolean(terminal) && !terminal.includes("/");
-        const claude = local && agents().find((a) => a.address === terminal)?.app === "claude-code";
+        const app = local ? agents().find((a) => a.address === terminal)?.app : null;
+        const claude = app === "claude-code", codex = app === "codex";
+        const title = codex ? terminals().find((t) => t.address === terminal)?.title : null;
         // The claude process; `hc get` run from a mod never returns, terminals() has it.
         const pid = claude ? terminals().find((t) => t.address === terminal)?.foreground?.pid : null;
-        const args = ["--prs-json", ...(pid ? ["--pid", String(pid)] : []), ...(local && cwd ? ["--cwd", cwd] : [])];
+        const args = ["--prs-json", ...(title ? ["--codex-title", title] : []), ...(pid ? ["--pid", String(pid)] : []), ...(local && cwd ? ["--cwd", cwd] : [])];
         const r = await exec(props()?.bin ?? "herdr-sim", args);
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `herdr-sim exited ${r.code}`);
         if (JSON.stringify(this.target()) !== context) return;
-        this.view = { claude, branch, data: parse(r.stdout) };
+        this.view = { agent: claude || codex, branch, data: parse(r.stdout) };
         this.error = null;
       } catch (e) { this.error = e instanceof Error ? e.message : String(e); }
       finally {
@@ -221,6 +223,7 @@ export default class SimPrs extends View {
       .child(div().min_w(0).truncate().text_color(t.foreground).child(c.repo ?? c.top))
       .when(Boolean(c.branch), (e) => e.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(c.branch)))
       .child(div().flex_1())
+      .when(!added && !removed, (e) => e.child(div().text_size(11).text_color(t.dim).child("Changed")))
       .when(Boolean(added), (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child(added)))
       .when(Boolean(removed), (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child(removed.replace("-", "−"))));
   }
@@ -282,8 +285,8 @@ export default class SimPrs extends View {
           .child(this.heading("This session", t))
           .when(v.data.prs.length > 0, (e) => e.children(v.data.prs.map((p) => this.row(p, t))))
           .when(!v.data.prs.length, (e) => e.child(empty(
-            !v.claude ? "Focus a Claude Code terminal to see the PRs its session touched"
-              : !v.data.session ? "No Claude Code session found for this terminal"
+            !v.agent ? "Focus a Claude Code or Codex terminal to see the PRs its session touched"
+              : !v.data.session ? "No unique session found for this terminal"
               : v.data.branch ? "No other PRs in this session" : "This session hasn't touched a PR yet")))));
   }
 }

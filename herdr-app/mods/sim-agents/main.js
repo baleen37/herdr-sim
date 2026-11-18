@@ -125,10 +125,11 @@ export default class Agents extends View {
           // A remote agent (machine/t1) has its transcripts on that machine: not read.
           if (a.address.includes("/")) continue;
           const pid = a.app === "claude-code" ? procs.get(a.address)?.foreground?.pid : null;
+          const title = a.app === "codex" ? procs.get(a.address)?.title : null;
           const cwd = folders.get(a.address);
           if (!pid && !cwd) continue;
           try {
-            const r = await exec("herdr-sim", ["--prs-json", ...(pid ? ["--pid", String(pid)] : []), ...(cwd ? ["--cwd", cwd] : [])]);
+            const r = await exec(props()?.bin ?? "herdr-sim", ["--prs-json", ...(title ? ["--codex-title", title] : []), ...(pid ? ["--pid", String(pid)] : []), ...(cwd ? ["--cwd", cwd] : [])]);
             if (r.code !== 0) throw new Error(r.stderr);
             const d = JSON.parse(r.stdout);
             const seen = new Set();

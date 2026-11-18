@@ -102,7 +102,7 @@ The Herdr desktop app (`herdr-app`) has no plugin hooks, so this Changes panel
 comes to it as a mod and a layout, `herdr-sim`, where it takes the place of the
 app's own Changes (the tab bar's Changes button, or `cmd-shift-c`):
 
-- **Uncommitted**: a `± repo +12 −3` row per checkout the focused Claude Code
+- **Uncommitted**: a `± repo +12 −3` row per checkout the focused Claude Code or Codex
   session worked in that has uncommitted changes.
 - **This branch** and **This session**: the branch's PR and the PRs the
   session touched, newest first. A click opens one in the browser.
@@ -112,8 +112,14 @@ app's own Changes (the tab bar's Changes button, or `cmd-shift-c`):
 
 The mod (TypeScript in `herdr-app/src/`, built to `herdr-app/mods/sim-prs/`)
 only draws: each look runs `herdr-sim --prs-json`, which finds the session
-from the claude process's pid, the checkouts' changes and the PR details,
+from the Claude process's pid or Codex terminal's title, the checkouts' changes and the PR details,
 reusing what it fetched between runs.
+
+Codex terminals are matched by their current title in
+`~/.codex/session_index.jsonl`, including Herdr's ` | folder` suffix. A duplicate
+or missing name is left unmatched instead of showing another session's PRs.
+The focused checkout still appears. Binary, empty and mode-only changes also
+keep a checkout in Uncommitted, even when there are no added or removed lines.
 
 1. Put a herdr-sim with `--prs-json` on `PATH` (this checkout's
    `cargo build --release`, linked into `~/.local/bin`).
