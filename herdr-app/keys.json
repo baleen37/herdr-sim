@@ -1,4 +1,7 @@
 {
+  "global": {
+    "cmd-shift-c": "sim-prs.toggle"
+  },
   "layout:herdr-sim": {
     "cmd-shift-c": "sim-prs.toggle",
     "cmd-w": "sim-tabs.close",
